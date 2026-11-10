@@ -10,7 +10,7 @@ pub const qk8_0 = 32
 
 pub struct BlockQ40 {
 pub:
-	d  u16 // f16 bits
+	d  u16    // f16 bits
 	qs [16]u8 // 32 nibbles packed
 }
 
@@ -48,6 +48,7 @@ fn f16bits_to_f32(bits u16) f32 {
 }
 
 // dequant_q4_0_row decodes one 32-elem block into out[0..32].
+@[direct_array_access]
 pub fn dequant_q4_0_row(block BlockQ40, mut out []f32) {
 	scale := f16bits_to_f32(block.d)
 	for i in 0 .. 16 {
@@ -60,6 +61,7 @@ pub fn dequant_q4_0_row(block BlockQ40, mut out []f32) {
 }
 
 // dequant_q8_0_row decodes one 32-elem block into out[0..32].
+@[direct_array_access]
 pub fn dequant_q8_0_row(block BlockQ80, mut out []f32) {
 	scale := f16bits_to_f32(block.d)
 	for i in 0 .. 32 {
@@ -67,7 +69,21 @@ pub fn dequant_q8_0_row(block BlockQ80, mut out []f32) {
 	}
 }
 
+// q8_0_dot_row computes dot(q_row_int8, x_f32) * scale without
+// materializing the dequantized row: the forward pass never needs the
+// intermediate f32 vector, saving a full hidden-size store per row.
+@[direct_array_access]
+pub fn q8_0_dot_row(block BlockQ80, x []f32, x_off int) f32 {
+	scale := f16bits_to_f32(block.d)
+	mut s := f32(0)
+	for i in 0 .. 32 {
+		s += f32(block.qs[i]) * x[x_off + i]
+	}
+	return s * scale
+}
+
 // dequant_f16_row converts n f16 lanes (as u16 bits) to f32.
+@[direct_array_access]
 pub fn dequant_f16_row(src []u16, mut out []f32) {
 	for i in 0 .. src.len {
 		out[i] = f16bits_to_f32(src[i])

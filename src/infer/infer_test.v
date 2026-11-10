@@ -53,7 +53,7 @@ fn test_rmsnorm_unit_scale() {
 
 fn test_dequant_q8_0_scale() {
 	b := BlockQ80{
-		d: u16(0x3c00) // 1.0 in f16
+		d:  u16(0x3c00) // 1.0 in f16
 		qs: [32]i8{init: 2}
 	}
 	mut out := []f32{len: 32}

@@ -40,6 +40,7 @@ pub fn (mut r Rng) next_f32() f32 {
 }
 
 // sample_greedy returns the argmax index.
+@[direct_array_access]
 pub fn sample_greedy(logits []f32) int {
 	mut best := 0
 	mut best_v := logits[0]
@@ -52,62 +53,71 @@ pub fn sample_greedy(logits []f32) int {
 	return best
 }
 
-// sample applies temp / top-k / top-p then multinomial sampling.
+// sample is the allocating convenience wrapper. The token loop must use
+// sample_into with reused scratch buffers (zero alloc per token).
 pub fn sample(logits []f32, p SampleParams) int {
-	mut rng := new_rng(p.seed)
 	mut work := logits.clone()
+	mut idx := []int{len: logits.len}
+	return sample_into(mut work, mut idx, p)
+}
+
+// sample_into runs temp / top-k / top-p then multinomial sampling.
+// work is logits on entry, probabilities on exit; idx is scratch space.
+// No allocation: safe for the bare-metal token loop.
+@[direct_array_access]
+pub fn sample_into(mut work []f32, mut idx []int, p SampleParams) int {
+	assert work.len == idx.len
+	assert work.len > 0
+	mut rng := new_rng(p.seed)
 	if p.temp <= 0.0 {
 		return sample_greedy(work)
 	}
+	inv_temp := 1.0 / p.temp
 	for i in 0 .. work.len {
-		work[i] /= p.temp
+		work[i] *= inv_temp
 	}
 	softmax_in_place(mut work)
-	mut idx := []int{cap: work.len}
 	for i in 0 .. work.len {
-		idx << i
+		idx[i] = i
 	}
-	idx.sort_with_compare(fn (a &int, b &int) int {
-		return 0
-	})
 	// Partial selection sort for top-k (vocab 151k: full sort is wasteful).
 	k := if p.top_k > 0 && p.top_k < work.len { p.top_k } else { work.len }
 	for i in 0 .. k {
 		mut m := i
+		mut wm := work[idx[m]]
 		for j in i + 1 .. work.len {
-			if work[idx[j]] > work[idx[m]] {
+			if work[idx[j]] > wm {
 				m = j
+				wm = work[idx[m]]
 			}
 		}
 		t := idx[i]
 		idx[i] = idx[m]
 		idx[m] = t
 	}
-	mut cands := idx[..k].clone()
+	mut n_cands := k
 	if p.top_p < 1.0 {
 		mut cum := f32(0)
-		mut cut := cands.len
-		for i, ci in cands {
-			cum += work[ci]
+		for i in 0 .. k {
+			cum += work[idx[i]]
 			if cum >= p.top_p {
-				cut = i + 1
+				n_cands = i + 1
 				break
 			}
 		}
-		cands = cands[..cut]
 	}
 	mut mass := f32(0)
-	for ci in cands {
-		mass += work[ci]
+	for i in 0 .. n_cands {
+		mass += work[idx[i]]
 	}
 	mut roll := rng.next_f32() * mass
-	for ci in cands {
-		roll -= work[ci]
+	for i in 0 .. n_cands {
+		roll -= work[idx[i]]
 		if roll <= 0 {
-			return ci
+			return idx[i]
 		}
 	}
-	return cands[cands.len - 1]
+	return idx[n_cands - 1]
 }
 
 pub fn sample_top_k(logits []f32, k int) int {
@@ -119,6 +129,7 @@ pub fn sample_top_k(logits []f32, k int) int {
 	})
 }
 
+@[direct_array_access]
 pub fn softmax_in_place(mut xs []f32) {
 	mut m := xs[0]
 	for v in xs {
@@ -131,7 +142,8 @@ pub fn softmax_in_place(mut xs []f32) {
 		xs[i] = f32(math.exp(f64(xs[i] - m)))
 		s += xs[i]
 	}
+	inv := 1.0 / s
 	for i in 0 .. xs.len {
-		xs[i] /= s
+		xs[i] *= inv
 	}
 }

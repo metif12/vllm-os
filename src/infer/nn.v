@@ -4,21 +4,25 @@ import math
 
 // Core NN ops for the Qwen3 forward pass. All f32, caller-owned buffers,
 // no allocation inside the hot path (bare-metal: arenas, never GC).
+// Hot loops carry [direct_array_access]: bounds are guaranteed by the
+// caller (shapes validated once at model load, not per token).
 
 // rmsnorm_in_place normalizes x with weight w and eps.
+@[direct_array_access]
 pub fn rmsnorm_in_place(mut x []f32, w []f32, eps f64) {
 	mut ss := f64(0)
-	for v in x {
-		ss += f64(v) * f64(v)
+	for i in 0 .. x.len {
+		v := f64(x[i])
+		ss += v * v
 	}
-	mean := ss / f64(x.len)
-	scale := f32(1.0 / math.sqrt(mean + eps))
+	scale := f32(1.0 / math.sqrt(ss / f64(x.len) + eps))
 	for i in 0 .. x.len {
 		x[i] = x[i] * scale * w[i]
 	}
 }
 
 // silu_in_place applies x * sigmoid(x) elementwise (SwiGLU gate half).
+@[direct_array_access]
 pub fn silu_in_place(mut x []f32) {
 	for i in 0 .. x.len {
 		v := x[i]
@@ -26,22 +30,24 @@ pub fn silu_in_place(mut x []f32) {
 	}
 }
 
-// rope_applies rotary embedding to q/k heads in place.
+// rope_in_place applies rotary embedding to q/k head slices in place.
 // head_dim must be even; freq base = cfg.rope_theta.
-pub fn rope_in_place(mut q []f32, mut k []f32, pos int, head_dim int, theta f64) {
-	for h in 0 .. head_dim / 2 {
-		freq := 1.0 / math.pow(theta, f64(h * 2) / f64(head_dim))
-		ang := f64(pos) * freq
-		c := f32(math.cos(ang))
-		s := f32(math.sin(ang))
+// cos_sin is a precomputed [2 * (head_dim/2)] table for this position:
+// caller builds it once per position and reuses it across all heads.
+@[direct_array_access]
+pub fn rope_in_place(mut q []f32, mut k []f32, cos_sin []f32, head_dim int) {
+	half := head_dim / 2
+	for h in 0 .. half {
+		c := cos_sin[h]
+		s := cos_sin[half + h]
 		qi := h * 2
-		ki := h * 2
 		if qi + 1 < q.len {
 			a := q[qi]
 			b := q[qi + 1]
 			q[qi] = a * c - b * s
 			q[qi + 1] = a * s + b * c
 		}
+		ki := h * 2
 		if ki + 1 < k.len {
 			a := k[ki]
 			b := k[ki + 1]
@@ -51,7 +57,19 @@ pub fn rope_in_place(mut q []f32, mut k []f32, pos int, head_dim int, theta f64)
 	}
 }
 
-// matvec adds W*x into out where W is row-major [rows x cols] f32.
+// rope_table fills cos_sin for position pos (see rope_in_place).
+pub fn rope_table(mut cos_sin []f32, pos int, head_dim int, theta f64) {
+	half := head_dim / 2
+	for h in 0 .. half {
+		freq := 1.0 / math.pow(theta, f64(h * 2) / f64(head_dim))
+		ang := f64(pos) * freq
+		cos_sin[h] = f32(math.cos(ang))
+		cos_sin[half + h] = f32(math.sin(ang))
+	}
+}
+
+// matvec computes out = W*x where W is row-major [rows x cols] f32.
+@[direct_array_access]
 pub fn matvec(w []f32, x []f32, rows int, cols int, mut out []f32) {
 	for r in 0 .. rows {
 		mut s := f32(0)
@@ -60,5 +78,29 @@ pub fn matvec(w []f32, x []f32, rows int, cols int, mut out []f32) {
 			s += w[base + c] * x[c]
 		}
 		out[r] = s
+	}
+}
+
+// matvec_blocked is the cache-tiled variant for wide layers
+// (vocab projection 2048x151936, FFN up/gate). Tile 32 keeps a
+// panel of x in registers across row blocks.
+@[direct_array_access]
+pub fn matvec_blocked(w []f32, x []f32, rows int, cols int, mut out []f32) {
+	for r in 0 .. rows {
+		out[r] = 0
+	}
+	tile := 32
+	mut c0 := 0
+	for c0 < cols {
+		c1 := if c0 + tile < cols { c0 + tile } else { cols }
+		for r in 0 .. rows {
+			mut s := out[r]
+			base := r * cols
+			for c in c0 .. c1 {
+				s += w[base + c] * x[c]
+			}
+			out[r] = s
+		}
+		c0 = c1
 	}
 }

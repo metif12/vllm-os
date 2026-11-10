@@ -97,16 +97,19 @@ pub fn (m Model) generate(prompt string, max_tokens int, sp SampleParams) string
 	for id in ids {
 		seed = seed * 1315423911 + u64(id)
 	}
+	// Reused across tokens: zero alloc inside the loop (bare-metal arena style).
+	mut logits := []f32{len: 64}
+	mut idx := []int{len: 64}
 	n := if max_tokens < 64 { max_tokens } else { 64 }
 	for i in 0 .. n {
 		// Deterministic pseudo-logits: peak walks with (seed+i), so output
 		// is stable per prompt but varies across prompts. Replaced by the
 		// transformer forward in phase 1b without changing this signature.
-		mut logits := []f32{len: 64}
+		base := int(seed % 64) + i
 		for j in 0 .. 64 {
-			logits[j] = -f32((j + i + int(seed % 64)) % 64)
+			logits[j] = -f32((j + base) % 64)
 		}
-		next := sample(logits, SampleParams{
+		next := sample_into(mut logits, mut idx, SampleParams{
 			temp:  sp.temp
 			top_k: sp.top_k
 			top_p: sp.top_p
