@@ -1,5 +1,6 @@
 module infer
 
+import formats
 import os
 
 // Qwen3-1.7B arch defaults. Values are overridden from the GGUF KV store
@@ -22,9 +23,20 @@ pub mut:
 
 pub struct Model {
 pub:
-	cfg  Qwen3Config
-	gguf GgufModel
-	tok  Bpe
+	cfg    Qwen3Config
+	format formats.WeightFormat
+	gguf   GgufModel         // valid when format == .gguf
+	st     formats.ModelFile // valid when format == .safetensors
+	tok    Bpe
+}
+
+// n_tensors is the unified tensor count across containers.
+pub fn (m Model) n_tensors() int {
+	return match m.format {
+		.gguf { int(m.gguf.meta.n_tensors) }
+		.safetensors { m.st.count() }
+		else { 0 }
+	}
 }
 
 // config_from_kv overrides arch fields from GGUF metadata when present.
@@ -57,20 +69,42 @@ pub fn config_from_kv(base Qwen3Config, kv map[string]string) Qwen3Config {
 	return c
 }
 
-// Boot path: open weights, parse table, load tokenizer sidecar. No Python.
+// Boot path: detect container, parse index, load tokenizer sidecar. No Python.
 pub fn load_model(weights_path string, cfg Qwen3Config) !Model {
-	gguf := load_gguf_table(weights_path)!
-	final_cfg := config_from_kv(cfg, gguf.kv)
+	format := formats.detect(weights_path)!
+	if format == .gguf {
+		gguf := load_gguf_table(weights_path)!
+		final_cfg := config_from_kv(cfg, gguf.kv)
+		tok := load_sidecar_tokenizer(weights_path)!
+		return Model{
+			cfg:    final_cfg
+			format: .gguf
+			gguf:   gguf
+			tok:    tok
+		}
+	}
+	if format == .safetensors {
+		st := formats.load_safetensors(weights_path)!
+		tok := load_sidecar_tokenizer(weights_path)!
+		return Model{
+			cfg:    cfg
+			format: .safetensors
+			st:     st
+			tok:    tok
+		}
+	}
+	if format == .pytorch_bin {
+		return error('pytorch .bin is detected but not loadable: convert to safetensors or GGUF first (scripts/fetch_model.sh)')
+	}
+	return error('unknown weight format: ${weights_path} (want .gguf or .safetensors)')
+}
+
+fn load_sidecar_tokenizer(weights_path string) !Bpe {
 	tok_path := weights_dir(weights_path) + '/tokenizer.json'
-	mut tok := Bpe{}
 	if os.exists(tok_path) {
-		tok = load_bpe(tok_path)!
+		return load_bpe(tok_path)!
 	}
-	return Model{
-		cfg:  final_cfg
-		gguf: gguf
-		tok:  tok
-	}
+	return Bpe{}
 }
 
 // load_model_stub keeps the no-weights dev loop alive (HTTP surface w/o GBs).
@@ -117,7 +151,7 @@ pub fn (m Model) generate(prompt string, max_tokens int, sp SampleParams) string
 		})
 		out << next
 	}
-	return 'qwen3-1.7b tok_in=${ids.len} tok_out=${out.len} ids=${out} :: ${prompt}'
+	return 'qwen3-1.7b fmt=${m.format} tok_in=${ids.len} tok_out=${out.len} ids=${out} :: ${prompt}'
 }
 
 // generate_stub keeps the old HTTP text shape during the transition.

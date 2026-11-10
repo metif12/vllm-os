@@ -19,7 +19,9 @@ in the image. Host-side Python exists only for one-off weight conversion
 ## Layout
 
 ```
-src/main.v            # boot entry: load weights -> serve API
+src/main.v            # boot entry: config -> detect format -> serve API
+src/config/           # vllm.json loader: server/model/api knobs + validation
+src/formats/          # weight containers: detect + SafeTensors index + shared meta
 src/infer/gguf.v      # GGUF header + KV + tensor table (no blob load)
 src/infer/cfile.v     # tiny C file probe (header only, 1 GB-safe)
 src/infer/model.v     # Qwen3 arch config + KV override + generate path
@@ -29,8 +31,9 @@ src/infer/quant.v     # Q4_0/Q8_0/F16 dequant kernels
 src/infer/nn.v        # rmsnorm/rope/swiglu/matvec
 src/api/server.v      # raw-socket HTTP, no veb (bare-metal portable)
 src/api/types.v       # OpenAI JSON shapes
-kernel/               # vinix-mini fork plan
-scripts/              # host tooling only (fetch/convert/qmp test)
+src/infer/backend.v   # Backend interface + registry (cpu/cpu-blocked/auto)
+kernel/               # vinix-mini fork plan + mini.md trim spec
+scripts/              # host tooling only (fetch/convert/build profiles/qemu test)
 qemu/                 # QEMU harness docs
 ROADMAP.md            # phased plan with exit criteria
 ```
@@ -46,6 +49,49 @@ curl -N localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
 
 No weights file yet? The server still boots in stub mode so you can
 test the HTTP surface before downloading gigabytes.
+
+## Configuration
+
+Copy `vllm.example.json` to `vllm.json` and pass `--config`:
+
+```sh
+v -prod -o server src
+./server --config vllm.json
+./server --config vllm.json --port 9000   # CLI wins over the file
+```
+
+Knobs: `server.host/port`, `model.weights/format/backend/ctx_cap`,
+`api.max_tokens`. Partial files are fine — missing fields fall back to
+defaults, then validate. `model.format` is `auto` (sniffed), `gguf`, or
+`safetensors`. `model.backend` is `cpu`, `cpu-blocked`, or (phase 1b
+forward) `auto`.
+
+## Weight formats
+
+| container | status | loader |
+|---|---|---|
+| GGUF (`.gguf`, incl. Q4_K_M) | full index parse | `src/infer/gguf.v` |
+| SafeTensors (`.safetensors`) | header-only index parse | `src/formats/` |
+| PyTorch `.bin`/`.pt` | detected, converts via `fetch_model.sh` | error with guidance |
+
+New containers land in `src/formats/` behind `WeightFormat` + `TensorMeta`;
+`infer.load_model` dispatches on `formats.detect()` — inference code never
+sniffs bytes.
+
+## Build profiles
+
+```powershell
+.\scripts\build.ps1 -Profile host-release   # windows daily driver
+```
+
+```sh
+sh scripts/build.sh host-release   # linux/mac
+sh scripts/build.sh bare-metal     # experimental freestanding kernel-port elf
+```
+
+Profiles: `host-debug` (`v -o server src`), `host-release`
+(`v -prod -o server src`), `qemu` (release + guest test next),
+`bare-metal` (`-gc none -freestanding`, kernel-port only).
 
 ## QEMU test
 

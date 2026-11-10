@@ -13,19 +13,19 @@ fn test_bench_sample_64() {
 	}
 	mut idx := []int{len: 64}
 	p := SampleParams{
-		temp: 0.8
+		temp:  0.8
 		top_k: 40
 		top_p: 0.9
-		seed: 1234
+		seed:  1234
 	}
 	sw := time.new_stopwatch()
 	for i in 0 .. 20000 {
 		logits[i % 64] = -f32((i + 7) % 64)
 		sample_into(mut logits, mut idx, SampleParams{
-			temp: p.temp
+			temp:  p.temp
 			top_k: p.top_k
 			top_p: p.top_p
-			seed: p.seed + u64(i)
+			seed:  p.seed + u64(i)
 		})
 	}
 	ms := sw.elapsed().milliseconds()
