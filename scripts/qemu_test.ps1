@@ -16,6 +16,13 @@ $log = "$root/qemu/test.log"
 $proc = Start-Process -FilePath "$root/server.exe" -ArgumentList "--port $Port" -NoNewWindow -PassThru -RedirectStandardOutput $log
 Start-Sleep -Seconds 2
 try {
+  # Phase 2 SLIRP path: if $env:GUEST_IMG points at a guest disk image, boot it
+  # with hostfwd so the guest reaches the host server at 10.0.2.2:$Port.
+  if ($env:GUEST_IMG -and (Test-Path $env:GUEST_IMG)) {
+    Write-Output "booting guest $env:GUEST_IMG with hostfwd tcp::$Port-:8000 ..."
+    $guest = Start-Process -FilePath qemu-system-x86_64 -ArgumentList "-m 1G -display none -serial stdio -drive file=`"$env:GUEST_IMG`",format=qcow2 -netdev user,id=n0,hostfwd=tcp::$($Port)-:8000 -device virtio-net-pci,netdev=n0" -NoNewWindow -PassThru
+    Write-Output 'guest booted (assert 10.0.2.2:8000 from inside the guest; see qemu/README.md)'
+  }
   $models = Invoke-RestMethod -Uri "http://localhost:$Port/v1/models" -TimeoutSec 5
   Write-Output "models: $($models.data[0].id)"
   $body = @{ model='qwen3-1.7b'; messages=@(@{ role='user'; content='hi from qemu path' }) } | ConvertTo-Json -Depth 5

@@ -20,11 +20,13 @@ in the image. Host-side Python exists only for one-off weight conversion
 
 ```
 src/main.v            # boot entry: load weights -> serve API
-src/infer/gguf.v      # GGUF header parser (no full-file read)
+src/infer/gguf.v      # GGUF header + KV + tensor table (no blob load)
 src/infer/cfile.v     # tiny C file probe (header only, 1 GB-safe)
-src/infer/model.v     # Qwen3 arch config + weights handle
-src/infer/sampler.v   # greedy / top-k / top-p sampler (pure V)
-src/infer/tokenizer.v # stub + Qwen ChatML template (BPE port = phase 2)
+src/infer/model.v     # Qwen3 arch config + KV override + generate path
+src/infer/sampler.v   # greedy / top-k / top-p + xorshift RNG (pure V)
+src/infer/tokenizer.v # BPE loader (tokenizer.json) + Qwen ChatML template
+src/infer/quant.v     # Q4_0/Q8_0/F16 dequant kernels
+src/infer/nn.v        # rmsnorm/rope/swiglu/matvec
 src/api/server.v      # raw-socket HTTP, no veb (bare-metal portable)
 src/api/types.v       # OpenAI JSON shapes
 kernel/               # vinix-mini fork plan

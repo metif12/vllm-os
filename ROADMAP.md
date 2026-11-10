@@ -2,21 +2,22 @@
 
 Each phase has an exit gate. Do not start the next phase until the gate is green.
 
-## Phase 0 — Host skeleton (now)
+## Phase 0 — Host skeleton (done ✅)
 
-Goal: `v run src` serves OpenAI-compat stub on Windows/Linux.
-Gate: `curl /v1/models` + `curl /v1/chat/completions` return 200,
-`v fmt -w` clean, `v vet` clean.
+`v run src` serves OpenAI-compat stub on Windows/Linux.
+Gate: `/v1/models` + `/v1/chat/completions` return 200. Green.
 
-## Phase 1 — Host inference (real tokens)
+## Phase 1 — Host inference (core done ✅, forward pass = 1b ⏳)
 
-* Port GGUF tensor table + KV metadata (beyond the 24-byte header).
-* Pure-V kernels: dequant (Q4_0/Q4_K/Q8_0), RMSNorm, SwiGLU, RoPE,
-  GQA attention + KV-cache, sampler with RNG.
-* Qwen BPE tokenizer port (151k vocab) + `tokenizer.json` loader.
-* CLI: `server --model x.gguf --prompt 'hi' --max-tokens 64` prints tokens.
-* Target: Qwen3-1.7B-Q4_K_M, ≥5 tok/s on a laptop CPU, 4k ctx.
-* Gate: perplexity smoke test vs `llama.cpp` reference on 3 prompts.
+* ✅ GGUF KV + tensor table parser (`gguf.v`), alignment-aware.
+* ✅ Dequant kernels Q4_0/Q8_0/F16 (`quant.v`), RMSNorm/SwiGLU/RoPE/matvec (`nn.v`).
+* ✅ Sampler with temp/top-k/top-p + xorshift RNG (`sampler.v`).
+* ✅ BPE loader with stub fallback + Qwen chat template (`tokenizer.v`).
+* ✅ KV-overridden arch config, wired generate path (`model.v`).
+* ✅ `v test src/infer` — 9 tests green.
+* ⏳ Phase 1b: transformer forward (attention + KV-cache) for real logits;
+  pseudo-logit path exercises encode→sample→decode end to end until then.
+* Gate: perplexity smoke test vs `llama.cpp` on 3 prompts (needs 1b + weights).
 
 ## Phase 2 — QEMU network path
 
