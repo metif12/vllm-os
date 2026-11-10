@@ -16,6 +16,7 @@ mut:
 }
 
 const max_body = 1 << 20 // 1 MB cap: rejects absurd Content-Length before alloc
+const max_conns = 64 // backpressure: accept blocks past this, no unbounded spawn
 
 // serve starts the OpenAI-compatible HTTP API on the given port.
 pub fn serve(port int, model &infer.Model) ! {
@@ -26,10 +27,17 @@ pub fn serve(port int, model &infer.Model) ! {
 	})
 	mut ln := net.listen_tcp(.ip6, ':${port}')!
 	eprintln('[vllm-os] openai-compat api on :${port} model=${model.cfg.model_id} quant=${model.cfg.quant}')
+	mut sema := chan int{cap: max_conns}
 	for {
 		mut conn := ln.accept()!
-		spawn handle(mut conn, model, models_json)
+		sema <- 1
+		spawn handle(mut conn, model, models_json, sema)
 	}
+}
+
+fn sema_release(s chan int) {
+	token := <-s
+	_ = token
 }
 
 // read_request reads headers + exactly Content-Length body bytes.
@@ -75,8 +83,9 @@ fn content_length(head string) int {
 	return 0
 }
 
-fn handle(mut conn net.TcpConn, model &infer.Model, models_json string) {
+fn handle(mut conn net.TcpConn, model &infer.Model, models_json string, sema chan int) {
 	defer {
+		sema_release(sema)
 		conn.close() or {}
 	}
 	head, body := read_request(mut conn) or { return }

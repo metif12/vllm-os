@@ -69,15 +69,29 @@ pub fn rope_table(mut cos_sin []f32, pos int, head_dim int, theta f64) {
 }
 
 // matvec computes out = W*x where W is row-major [rows x cols] f32.
+// Four accumulators keep independent dependency chains so scalar backends
+// and the C compiler's autovectorizer stay fed.
 @[direct_array_access]
 pub fn matvec(w []f32, x []f32, rows int, cols int, mut out []f32) {
 	for r in 0 .. rows {
-		mut s := f32(0)
+		mut s0 := f32(0)
+		mut s1 := f32(0)
+		mut s2 := f32(0)
+		mut s3 := f32(0)
 		base := r * cols
-		for c in 0 .. cols {
-			s += w[base + c] * x[c]
+		mut c := 0
+		for c + 4 <= cols {
+			s0 += w[base + c] * x[c]
+			s1 += w[base + c + 1] * x[c + 1]
+			s2 += w[base + c + 2] * x[c + 2]
+			s3 += w[base + c + 3] * x[c + 3]
+			c += 4
 		}
-		out[r] = s
+		for c < cols {
+			s0 += w[base + c] * x[c]
+			c++
+		}
+		out[r] = s0 + s1 + s2 + s3
 	}
 }
 

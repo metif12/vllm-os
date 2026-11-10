@@ -1,0 +1,11 @@
+# vinix-mini boot cmdline. Static IP by default (no DHCP wait);
+# override per deployment by editing this line before `build_image.sh`.
+# Keys read by the kernel at boot, never by the model runner.
+model=/models/model.gguf
+port=8000
+ctx=4096
+ip=10.0.2.15
+gw=10.0.2.2
+netmask=255.255.255.0
+workers=auto
+log=serial

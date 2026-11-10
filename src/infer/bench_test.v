@@ -29,6 +29,7 @@ fn test_bench_sample_64() {
 		})
 	}
 	ms := sw.elapsed().milliseconds()
+	eprintln('[bench] sample_into 64-logit x20k: ${ms} ms')
 	assert ms < 8000, 'sample_into regressed: 20k iters took ${ms} ms'
 }
 
@@ -56,6 +57,7 @@ fn test_bench_matvec_blocked_matches() {
 		matvec_blocked(w, x, rows, cols, mut b)
 	}
 	t2 := sw2.elapsed().microseconds()
+	eprintln('[bench] matvec 256x512 x20: naive=${t1}us blocked=${t2}us')
 	for i in 0 .. rows {
 		d := a[i] - b[i]
 		assert d < 0.01 && d > -0.01

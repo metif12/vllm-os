@@ -17,8 +17,12 @@ STAGE="$ROOT/.imgstage"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/boot" "$STAGE/models"
 cp "$ROOT/kernel/vinix-mini.elf" "$STAGE/boot/"
+# Strip debug info from the kernel copy: keeps the image lean, symbols stay
+# in kernel/vinix-mini.elf for crash triage.
+strip --strip-debug "$STAGE/boot/vinix-mini.elf" 2>/dev/null || true
 cp "$GGUF" "$STAGE/models/model.gguf"
 cp "$ROOT/models/tokenizer.json" "$STAGE/models/" 2>/dev/null || echo '{"warn":"tokenizer.json missing, BPE falls back to stub"}'
+du -sh "$STAGE" | awk '{print "stage size: " $1}'
 # limine.cfg boots straight into inference: no menu timeout, serial console.
 cat > "$STAGE/limine.cfg" <<'EOF'
 TIMEOUT=0

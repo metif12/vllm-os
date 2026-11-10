@@ -73,10 +73,7 @@ pub fn sample_into(mut work []f32, mut idx []int, p SampleParams) int {
 		return sample_greedy(work)
 	}
 	inv_temp := 1.0 / p.temp
-	for i in 0 .. work.len {
-		work[i] *= inv_temp
-	}
-	softmax_in_place(mut work)
+	softmax_scaled_in_place(mut work, inv_temp)
 	for i in 0 .. work.len {
 		idx[i] = i
 	}
@@ -127,6 +124,29 @@ pub fn sample_top_k(logits []f32, k int) int {
 		top_p: 1.0
 		seed:  0
 	})
+}
+
+// softmax_scaled_in_place applies softmax(x * scale) in two passes with no
+// intermediate store: one full vocabulary-sized memory write saved per token.
+@[direct_array_access]
+pub fn softmax_scaled_in_place(mut xs []f32, scale f32) {
+	mut m := xs[0] * scale
+	for i in 1 .. xs.len {
+		v := xs[i] * scale
+		if v > m {
+			m = v
+		}
+	}
+	mut s := f32(0)
+	for i in 0 .. xs.len {
+		e := f32(math.exp(f64(xs[i] * scale - m)))
+		xs[i] = e
+		s += e
+	}
+	inv := 1.0 / s
+	for i in 0 .. xs.len {
+		xs[i] *= inv
+	}
 }
 
 @[direct_array_access]

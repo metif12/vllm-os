@@ -53,4 +53,7 @@ budget by ~2 GB. Raise only on ≥16 GB guests.
 
 * `qemu -m 4G -display none -serial stdio`: `boot ok` line < 2 s after SeaBIOS.
 * First `/v1/chat/completions` byte < 5 s after boot line (stub weights).
-* `v test src/infer` stays green; `scripts/bench.sh` (matvec + sample) must not regress >5%.
+* `v test src/infer` stays green, including the `[bench]` gates
+  (`sample_into` throughput floor, blocked-vs-naive matvec equivalence + speed).
+* Server holds max 64 concurrent connections (`max_conns` semaphore);
+  excess load waits at accept instead of spawning unbounded threads.
