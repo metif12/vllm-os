@@ -5,6 +5,19 @@ Boot straight into a model. No Python, no console/GUI in production.
 
 Target v1 model: [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) → GGUF `Q4_K_M` (~1.1 GB).
 
+## Docs
+
+| guide | answers |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | boot flow, request flow, module map, constraints |
+| [docs/api.md](docs/api.md) | endpoints, SSE, errors, limits |
+| [docs/configuration.md](docs/configuration.md) | every knob, precedence, validation |
+| [docs/formats.md](docs/formats.md) | GGUF/SafeTensors/PyTorch, conversion, adding a format |
+| [docs/building.md](docs/building.md) | profiles, host run, QEMU test, ISO build |
+| [docs/development.md](docs/development.md) | test suite, conventions, where to extend |
+| [ROADMAP.md](ROADMAP.md) | phased plan with exit gates |
+| [kernel/mini.md](kernel/mini.md) | vinix-mini trim spec, memory budget, boot gates |
+
 ## What this is
 
 A trimmed OS (Vinix fork: net + block + minimal scheduling only) that
@@ -25,16 +38,18 @@ src/formats/          # weight containers: detect + SafeTensors index + shared m
 src/infer/gguf.v      # GGUF header + KV + tensor table (no blob load)
 src/infer/cfile.v     # tiny C file probe (header only, 1 GB-safe)
 src/infer/model.v     # Qwen3 arch config + KV override + generate path
-src/infer/sampler.v   # greedy / top-k / top-p + xorshift RNG (pure V)
+src/infer/sampler.v   # fused softmax-scale, zero-alloc top-k/top-p + xorshift RNG
 src/infer/tokenizer.v # BPE loader (tokenizer.json) + Qwen ChatML template
-src/infer/quant.v     # Q4_0/Q8_0/F16 dequant kernels
-src/infer/nn.v        # rmsnorm/rope/swiglu/matvec
-src/api/server.v      # raw-socket HTTP, no veb (bare-metal portable)
-src/api/types.v       # OpenAI JSON shapes
+src/infer/quant.v     # Q4_0/Q8_0/F16 dequant + fused Q8 dot (no materialize)
+src/infer/nn.v        # rmsnorm/rope-tables/swiglu/unrolled+blocked matvec
 src/infer/backend.v   # Backend interface + registry (cpu/cpu-blocked/auto)
-kernel/               # vinix-mini fork plan + mini.md trim spec
-scripts/              # host tooling only (fetch/convert/build profiles/qemu test)
+src/api/server.v      # raw-socket HTTP + backpressure, no veb (bare-metal portable)
+src/api/types.v       # OpenAI JSON shapes
+docs/                 # architecture/api/configuration/formats/building/development
+kernel/               # vinix-mini fork plan, mini.md spec, mini.ld, cmdline.txt
+scripts/              # fetch/build profiles (ps1+sh)/qemu test (host-only tooling)
 qemu/                 # QEMU harness docs
+vllm.example.json     # config starting point
 ROADMAP.md            # phased plan with exit criteria
 ```
 
@@ -52,31 +67,22 @@ test the HTTP surface before downloading gigabytes.
 
 ## Configuration
 
-Copy `vllm.example.json` to `vllm.json` and pass `--config`:
+Copy `vllm.example.json` to `vllm.json` and pass `--config`
+(CLI flags win over the file; partial files valid; BOM tolerated):
 
 ```sh
 v -prod -o server src
 ./server --config vllm.json
-./server --config vllm.json --port 9000   # CLI wins over the file
+./server --config vllm.json --port 9000
 ```
 
-Knobs: `server.host/port`, `model.weights/format/backend/ctx_cap`,
-`api.max_tokens`. Partial files are fine — missing fields fall back to
-defaults, then validate. `model.format` is `auto` (sniffed), `gguf`, or
-`safetensors`. `model.backend` is `cpu`, `cpu-blocked`, or (phase 1b
-forward) `auto`.
+Full knob reference: [docs/configuration.md](docs/configuration.md).
 
 ## Weight formats
 
-| container | status | loader |
-|---|---|---|
-| GGUF (`.gguf`, incl. Q4_K_M) | full index parse | `src/infer/gguf.v` |
-| SafeTensors (`.safetensors`) | header-only index parse | `src/formats/` |
-| PyTorch `.bin`/`.pt` | detected, converts via `fetch_model.sh` | error with guidance |
-
-New containers land in `src/formats/` behind `WeightFormat` + `TensorMeta`;
-`infer.load_model` dispatches on `formats.detect()` — inference code never
-sniffs bytes.
+GGUF (full index parse), SafeTensors (header-only index), PyTorch
+(detected, convert-first error). Details + conversion + the 5-step
+new-format checklist: [docs/formats.md](docs/formats.md).
 
 ## Build profiles
 
@@ -89,9 +95,8 @@ sh scripts/build.sh host-release   # linux/mac
 sh scripts/build.sh bare-metal     # experimental freestanding kernel-port elf
 ```
 
-Profiles: `host-debug` (`v -o server src`), `host-release`
-(`v -prod -o server src`), `qemu` (release + guest test next),
-`bare-metal` (`-gc none -freestanding`, kernel-port only).
+Profiles: `host-debug` / `host-release` / `qemu` / `bare-metal`.
+Full matrix: [docs/building.md](docs/building.md).
 
 ## QEMU test
 
@@ -125,6 +130,18 @@ into the boot partition.
 * `POST /v1/completions` → legacy completion
 
 Qwen3 chat template (`<|im_start|>…`) is applied server-side.
+Full reference with streaming framing and error table:
+[docs/api.md](docs/api.md).
+
+## Status
+
+| area | state |
+|---|---|
+| Host API (stub + config + formats) | done, tested |
+| Inference kernels (dequant/nn/sampler/BPE/backend) | done, bench-gated |
+| QEMU network path | harness green (loopback); guest SLIRP via `$GUEST_IMG` |
+| Transformer forward (real logits) | next — phase 1b, signatures frozen |
+| vinix-mini fork / bare-metal port / ISO | scaffolded (`kernel/`, `scripts/build_image.sh`) |
 
 ## Design constraints
 
