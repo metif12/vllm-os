@@ -1,0 +1,9 @@
+*.exe
+server
+server.exe
+models/
+*.gguf
+*.safetensors
+qemu/*.iso
+qemu/*.img
+.v_cache/
