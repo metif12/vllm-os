@@ -1,6 +1,8 @@
 *.exe
 server
 server.exe
+__pycache__/
+*.pyc
 models/
 *.gguf
 *.safetensors

@@ -15,6 +15,7 @@ Target v1 model: [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) → G
 | [docs/formats.md](docs/formats.md) | GGUF/SafeTensors/PyTorch, conversion, adding a format |
 | [docs/building.md](docs/building.md) | profiles, host run, QEMU test, ISO build |
 | [docs/development.md](docs/development.md) | test suite, conventions, where to extend |
+| [docs/perf.md](docs/perf.md) | V vs Python benchmarks on identical hardware |
 | [ROADMAP.md](ROADMAP.md) | phased plan with exit gates |
 | [kernel/mini.md](kernel/mini.md) | vinix-mini trim spec, memory budget, boot gates |
 
