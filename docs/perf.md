@@ -59,3 +59,59 @@ why the reported numbers use 20 warmup requests.
 3. **Sampler is fine.** V beats NumPy 18× on small logits and trails 4.5×
    at vocab scale — acceptable for a per-token tail operation, and the
    fused softmax + zero-alloc path keeps it GC-clean.
+
+## Token throughput (sampling + serving path)
+
+End-to-end model tok/s is not measurable yet (no weights on disk, V
+forward still pseudo-logits — see scope limits). What *is* measured is
+the throughput of every stage the V runner owns today:
+
+| stage | V | Python/NumPy | how measured |
+|---|---|---|---|
+| 64-logit sample | **526k tok/s** (38 ms / 20k iters) | 28k tok/s (707 ms) | `sample_into` vs equivalent NumPy sampler, warmed up |
+| vocab-scale sample (151936) | ~140 tok/s (141 ms / 20 iters) | ~640 tok/s (31 ms) | same, incl. full softmax + top-k/p |
+| stub chat round trip (64 tokens/response) | ~16–30k tok/s served (~2–4 ms/resp) | ~40k tok/s served (~1.6 ms/resp) | `POST /v1/chat/completions`, n=200, 20 warmups |
+
+The 64-logit rate is the V sampler ceiling (~1.9 µs/token); the
+vocab-scale rate (~7 ms/token) is the softmax+top-k floor the real
+forward will add to every token before matmuls even start.
+
+## Per-token resource budget, Qwen3-1.7B (analytic, exact math)
+
+Decode is memory-bound: each token re-reads all weights once.
+
+| resource | Q8_0 (1.8 GB) | Q4_K_M (1.1 GB) |
+|---|---|---|
+| weight traffic / token | 1.8 GB | 1.1 GB |
+| floor on this box (~35 GB/s DDR4) | ~50 ms → **~20 tok/s ceiling** | ~30 ms → **~33 tok/s ceiling** |
+| KV-cache / token (28 layers × 2 × 8 KV heads × 128 dim) | 229 KB f32 (115 KB f16) | same |
+| KV-cache @ 4k ctx | ~917 MB f32 | ~917 MB f32 |
+| FLOPs / token (decode) | ~3.5 GFLOP | ~3.5 GFLOP |
+
+Consequences already baked into the design: the 4k ctx cap
+(`kernel/mini.md`) — full 32k ctx needs ~7 GB KV alone; the fused
+`q8_0_dot_row` (never materializes dequantized rows); the 4 GB guest
+minimum (1.8 GB weights + ~1 GB KV + page cache headroom).
+
+## How to reproduce
+
+```sh
+python scripts/perf_baseline.py --kernels
+v -prod -o server.exe src
+python scripts/perf_baseline.py --api --v-exe .\server.exe
+```
+
+Kernel probe sources: throwaway copy of `src/infer` hot loops (gated
+copies in `bench_test.v`); NumPy side in `scripts/perf_baseline.py`.
+Same shapes, equivalent work, warmed up, back-to-back on the machine in
+`docs/perf.md` header. Re-run on your hardware and replace the tables —
+do not quote these numbers for other machines.
+
+## Missing for end-to-end tok/s
+
+1. Weights: `Qwen3-1.7B-Q8_0.gguf` (~1.8 GB) — same file both sides.
+2. Python side: `llama-cpp-python`, 6 threads → prefill tok/s, decode
+   tok/s, peak RSS.
+3. V side: phase-1b forward (embed gather → 28× GQA + QK-norm + RoPE +
+   SwiGLU → vocab head, Q8 rows streaming, real BPE merges), gated by
+   text parity with llama.cpp output.
