@@ -6,4 +6,6 @@ models/
 *.safetensors
 qemu/*.iso
 qemu/*.img
+qemu/test.log
+qemu_boot.log
 .v_cache/
