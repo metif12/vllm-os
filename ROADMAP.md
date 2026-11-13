@@ -11,10 +11,14 @@ Gate: `/v1/models` + `/v1/chat/completions` return 200. Green.
 
 * ✅ GGUF KV + tensor table parser (`gguf.v`), alignment-aware.
 * ✅ Dequant kernels Q4_0/Q8_0/F16 (`quant.v`), RMSNorm/SwiGLU/RoPE/matvec (`nn.v`).
+* ✅ C AVX2 layer (`vllm_kernels.{h,c}` + `simd_c.v`), runtime-dispatched,
+  removable; heap top-k + opt-in fast sampler (`sampler.v`).
+* ✅ VTL-aligned zero-copy view (`tensor_view.v`); VTL/VSL parity tests green.
 * ✅ Sampler with temp/top-k/top-p + xorshift RNG (`sampler.v`).
 * ✅ BPE loader with stub fallback + Qwen chat template (`tokenizer.v`).
 * ✅ KV-overridden arch config, wired generate path (`model.v`).
-* ✅ `v test src/infer` — 9 tests green.
+* ✅ `v -prod -cc gcc test src` — 10 files green (api, cfg, formats, infer).
+* ✅ Kernels beat NumPy 4/5 rows, tie 5th at DRAM wall (`docs/perf.md`).
 * ⏳ Phase 1b: transformer forward (attention + KV-cache) for real logits;
   pseudo-logit path exercises encode→sample→decode end to end until then.
 * Gate: perplexity smoke test vs `llama.cpp` on 3 prompts (needs 1b + weights).
@@ -28,7 +32,8 @@ Gate: `/v1/models` + `/v1/chat/completions` return 200. Green.
 
 ## Phase 3 — vinix-mini fork
 
-Fork Vinix, keep only:
+Fork Vinix, keep only (compile-time selected via `kernel/features.conf`,
+every extra default OFF; NVMe/AHCI/e1000/ramfs/DHCP-UDP deleted, not flagged):
 
 ```
 boot / GDT / IDT / paging / pmm / vmm / kheap

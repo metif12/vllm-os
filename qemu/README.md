@@ -7,7 +7,7 @@ guest→host network path that the later bootable image will rely on.
 
 * `qemu-system-x86_64` on PATH.
   Windows: `winget install -e --id SoftwareFreedomConservancy.QEMU`
-* Host server built: `v -o server.exe src` then running on `:8000`.
+* Host server built: `v -prod -cc gcc -o server.exe src` then running on `:8000`.
 
 ## What `scripts/qemu_test.ps1` does
 
@@ -20,7 +20,7 @@ guest→host network path that the later bootable image will rely on.
 ## Run
 
 ```powershell
-v -o server.exe src
+v -prod -cc gcc -o server.exe src
 .\scripts\qemu_test.ps1 -Port 8000
 ```
 

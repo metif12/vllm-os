@@ -16,6 +16,19 @@ fi
 STAGE="$ROOT/.imgstage"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/boot" "$STAGE/models"
+# features.conf <-> cmdline.txt consistency: a static-IP image must not
+# carry dhcp=on (and vice versa). The fork build asserts the same flags.
+FEAT="$ROOT/kernel/features.conf"
+CMDLINE="$ROOT/kernel/cmdline.txt"
+if [ -f "$FEAT" ]; then
+  if grep -q '^VLLM_MINI_NET_DHCP=1' "$FEAT"; then
+    grep -q '^dhcp=on' "$CMDLINE" || echo 'warn: features.conf enables DHCP but cmdline.txt has no dhcp=on'
+  else
+    if grep -q '^dhcp=on' "$CMDLINE"; then
+      echo 'warn: cmdline.txt sets dhcp=on but features.conf leaves VLLM_MINI_NET_DHCP=0 (no DHCP client in image)' >&2
+    fi
+  fi
+fi
 cp "$ROOT/kernel/vinix-mini.elf" "$STAGE/boot/"
 # Strip debug info from the kernel copy: keeps the image lean, symbols stay
 # in kernel/vinix-mini.elf for crash triage.

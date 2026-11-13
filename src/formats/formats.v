@@ -13,6 +13,7 @@ pub enum WeightFormat as u8 {
 	pytorch_bin
 }
 
+// str renders the container kind for boot logs and errors.
 pub fn (f WeightFormat) str() string {
 	return match f {
 		.unknown { 'unknown' }
@@ -36,6 +37,7 @@ pub enum DType as u8 {
 	other
 }
 
+// dtype_from_str maps a SafeTensors dtype tag to DType (unknown -> .other).
 pub fn dtype_from_str(s string) DType {
 	return match s.to_upper() {
 		'F32', 'FLOAT32' { .f32 }
@@ -51,6 +53,8 @@ pub fn dtype_from_str(s string) DType {
 	}
 }
 
+// dtype_nbytes is the conservative per-element size (quantized block
+// averages handled in infer/quant; never used for exact offsets).
 pub fn dtype_nbytes(dt DType) u64 {
 	return match dt {
 		.f32 { 4 }
@@ -78,6 +82,7 @@ pub:
 	nbytes   u64
 }
 
+// numel returns the total element count of a tensor shape.
 pub fn numel(shape []u64) u64 {
 	mut n := u64(1)
 	for d in shape {
@@ -95,6 +100,7 @@ pub:
 	meta    map[string]string
 }
 
+// find returns the tensor metadata for name, or none.
 pub fn (f ModelFile) find(name string) ?TensorMeta {
 	for t in f.tensors {
 		if t.name == name {
@@ -104,6 +110,7 @@ pub fn (f ModelFile) find(name string) ?TensorMeta {
 	return none
 }
 
+// count returns the number of indexed tensors.
 pub fn (f ModelFile) count() int {
 	return f.tensors.len
 }

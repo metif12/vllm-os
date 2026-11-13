@@ -164,6 +164,7 @@ fn (mut r Reader) gguf_str() !string {
 }
 
 // Header-only probe (cheap, used by boot path before full parse).
+// load_gguf_header reads the 24-byte prefix: magic, version, counts.
 pub fn load_gguf_header(path string) !GgufModel {
 	data := read_file_bytes(path, 4096)!
 	if data.len < 24 {
@@ -193,6 +194,7 @@ pub fn load_gguf_header(path string) !GgufModel {
 // Full parse of KV + tensor table. Reads the whole prefix up to the end of
 // the tensor table (NOT the weight blobs). For a 1.7B model this prefix is
 // small (tens of KB); blobs stay on disk / get mmap'd by the kernel port.
+// load_gguf_table is the boot-time index loader.
 pub fn load_gguf_table(path string) !GgufModel {
 	// Read enough to cover header + KV + tensor infos for a 1.7B model.
 	// 8 MB cap keeps a corrupt length field from OOMing the host.

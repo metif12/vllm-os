@@ -100,3 +100,81 @@ fn test_config_from_kv_overrides() {
 	// untouched fallback stays
 	assert c.vocab == 151936
 }
+
+fn test_preset_params_values() {
+	det := preset_params('deterministic')!
+	assert det.temp == 0.0
+	precise := preset_params('precise')!
+	assert precise.temp == f32(0.3)
+	assert precise.top_k == 20
+	bal := preset_params('balanced')!
+	assert bal == SampleParams{}
+	cre := preset_params('creative')!
+	assert cre.temp == f32(1.1)
+	assert cre.top_k == 100
+	assert cre.top_p == f32(0.95)
+	assert sampler_presets().len == 4
+	if _ := preset_params('wild') {
+		assert false, 'expected unknown preset error'
+	} else {
+		assert err.msg().contains('wild')
+	}
+}
+
+fn test_deterministic_preset_is_greedy() {
+	logits := [f32(0.1), 2.5, 1.0]
+	p := preset_params('deterministic')!
+	mut work := logits.clone()
+	mut idx := []int{len: 3}
+	assert sample_into(mut work, mut idx, p) == 1
+}
+
+fn test_min_p_filters_tail() {
+	logits := [f32(4.0), 1.0, 0.5, 0.0, -1.0]
+	mut work := logits.clone()
+	mut idx := []int{len: 5}
+	// top-1 prob ~0.92; min_p 0.5 keeps only the winner deterministically.
+	r := sample_into(mut work, mut idx, SampleParams{
+		temp:  1.0
+		top_k: 5
+		top_p: 1.0
+		min_p: 0.5
+		seed:  1
+	})
+	assert r == 0
+}
+
+fn test_min_p_zero_keeps_all() {
+	logits := [f32(4.0), 1.0, 0.5, 0.0, -1.0]
+	mut w1 := logits.clone()
+	mut w2 := logits.clone()
+	mut i1 := []int{len: 5}
+	mut i2 := []int{len: 5}
+	a := sample_into(mut w1, mut i1, SampleParams{
+		temp:  1.0
+		top_k: 5
+		top_p: 1.0
+		seed:  3
+	})
+	b := sample_into(mut w2, mut i2, SampleParams{
+		temp:  1.0
+		top_k: 5
+		top_p: 1.0
+		min_p: 1e-9
+		seed:  3
+	})
+	assert a == b
+}
+
+fn test_tokenizer_interface_dispatch() {
+	b := Bpe{}
+	t := Tokenizer(b)
+	assert t.name() == 'bpe-stub'
+	assert t.encode('hi there') == encode_stub('hi there')
+	s := Tokenizer(StubTokenizer{})
+	assert s.name() == 'stub'
+	assert s.encode('a b') == encode_stub('a b')
+	m := load_model_stub(Qwen3Config{})
+	assert m.tok.name() == 'stub'
+	assert m.tok.encode('hello').len > 0
+}

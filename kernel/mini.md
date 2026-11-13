@@ -3,16 +3,24 @@
 Concrete keep/drop list with size and boot-time impact. All choices serve
 one goal: power-on → first token as fast as possible, RAM left for weights.
 
+Compile-time selection lives in `kernel/features.conf`: every extra is a
+`VLLM_MINI_*` flag defaulting to OFF, and fallback drivers (NVMe/AHCI,
+e1000, ramfs) are deleted from the fork, not flagged. An image built with
+all flags at default is the minimal boot-to-token set below.
+
 ## Boot sequence (optimized order)
 
 1. `serial init` first — every later stage logs timestamps here.
 2. `pmm/vmm/kheap` with 2 MB + 1 GB huge pages for the weights window.
-3. `virtio-blk` only (skip AHCI/NVMe probe: saves ~200 ms + driver pages).
-   Single queue, read-only mount of the models partition.
+3. `virtio-blk` only (AHCI/NVMe fallback deleted from the fork:
+   saves ~200 ms + driver pages). Single queue, read-only mount of the
+   models partition (tarfs; ramfs deleted — see `features.conf`).
 4. `mmap` GGUF via page-table alias, parse KV + tensor table only.
    Weight blobs stay on disk until first matmul touches the page.
-5. `virtio-net` only (skip e1000 probe), static IP from kernel cmdline
-   (`ip=... gw=...`), no DHCP wait (saves 1–3 s worst case).
+5. `virtio-net` only (e1000 fallback deleted), static IP from kernel
+   cmdline (`ip=... gw=...`, `dhcp=off`), no DHCP wait (saves 1–3 s worst
+   case). DHCP + UDP stack compile back in only with
+   `VLLM_MINI_NET_DHCP=1` and `dhcp=on` on the cmdline.
 6. Scheduler up with `workers = cpus - 1`; accept loop pinned to CPU 0.
 7. Listen `:8000`, print `[vllm-os] boot ok in ${ms} ms`.
 
@@ -45,7 +53,18 @@ budget by ~2 GB. Raise only on ≥16 GB guests.
 
 ## Runner build flags (host + kernel port)
 
-* Host release: `v -prod -o server src` (`-prod` enables `-O3`, strips asserts).
+All builds use an optimizing C compiler (`-cc gcc`) in `-prod`
+(`-O3`, asserts stripped). tcc is never used: scalar C fallbacks exist
+so every profile compiles anywhere, and AVX2 comes from function-target
+attributes + runtime dispatch — never `-march=native`, which measured
+3–5x slower on V's own codegen (see `docs/perf.md`).
+
+* Host release: `v -prod -cc gcc -o server src` (portable AND fastest:
+  AVX2-dispatched C kernels, best V codegen).
+* Host native (LTO): `v -prod -cc gcc -cflags "-O3 -fno-strict-aliasing -flto" -o server src`.
+  Custom `-cflags` REPLACE V's defaults, so `-O3 -fno-strict-aliasing`
+  must be restated (bare `-O3` measured ~2x slower).
+* Host minimal (no C layer): `v -cc gcc -cflags "-Os" -o server src`.
 * Kernel port adds: `-gc none -freestanding`, arena allocator, no `os`/`time` wall-clock in token loop.
 * Never `-march=native` in committed scripts: the ISO must boot anywhere.
 
@@ -53,7 +72,7 @@ budget by ~2 GB. Raise only on ≥16 GB guests.
 
 * `qemu -m 4G -display none -serial stdio`: `boot ok` line < 2 s after SeaBIOS.
 * First `/v1/chat/completions` byte < 5 s after boot line (stub weights).
-* `v test src/infer` stays green, including the `[bench]` gates
+* `v test src` stays green (10 files), including the `[bench]` gates
   (`sample_into` throughput floor, blocked-vs-naive matvec equivalence + speed).
 * Server holds max 64 concurrent connections (`max_conns` semaphore);
   excess load waits at accept instead of spawning unbounded threads.

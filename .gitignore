@@ -1,6 +1,10 @@
 *.exe
 server
 server.exe
+*.manifest
+probe_*
+simd_probe*
+build/
 __pycache__/
 *.pyc
 models/

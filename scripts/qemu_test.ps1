@@ -7,8 +7,8 @@ if (-not (Get-Command qemu-system-x86_64 -ErrorAction SilentlyContinue)) {
   exit 2
 }
 if (-not (Test-Path "$root/server.exe")) {
-  Write-Output 'building server.exe ...'
-  & v -o server.exe src
+  Write-Output 'building server.exe (gcc -prod) ...'
+  & v -prod -cc gcc -o server.exe src
   if ($LASTEXITCODE -ne 0) { exit 1 }
 }
 Write-Output "starting host server on :$Port ..."

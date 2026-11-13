@@ -7,7 +7,6 @@ module infer
 
 pub const qk4_0 = 32
 pub const qk8_0 = 32
-
 pub struct BlockQ40 {
 pub:
 	d  u16    // f16 bits
@@ -18,6 +17,12 @@ pub struct BlockQ80 {
 pub:
 	d  u16 // f16 bits
 	qs [32]i8
+}
+
+// q80_scale decodes a Q8_0 block's f16 scale to f32 (shared by the V and
+// C dot paths so both stay bit-identical on the scale factor).
+pub fn q80_scale(block BlockQ80) f32 {
+	return f16bits_to_f32(block.d)
 }
 
 fn f16bits_to_f32(bits u16) f32 {

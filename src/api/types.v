@@ -15,6 +15,8 @@ pub:
 	max_tokens  int = 256
 	temperature f32 = 0.7
 	top_p       f32 = 0.9
+	top_k       int = 40
+	seed        u64 // 0 = config seed, config 0 = time-based
 	stream      bool
 }
 
@@ -24,6 +26,9 @@ pub:
 	prompt      string
 	max_tokens  int = 256
 	temperature f32 = 0.7
+	top_p       f32 = 0.9
+	top_k       int = 40
+	seed        u64 // 0 = config seed, config 0 = time-based
 	stream      bool
 }
 
