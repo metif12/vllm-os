@@ -26,35 +26,41 @@ pub enum GgufType as u32 {
 }
 
 // GGML quant block types relevant for Qwen3 quants.
+// Numbering follows current llama.cpp ggml.h (Q4_2/Q4_3 removed, Q5 moves
+// to 6/7, Q8 to 8/9, K-quants 10-15, IQs 16-23, I8 at 24). A stale enum
+// once read type 14 as I8; it is Q6_K (210-byte super-blocks). Future
+// files must use these exact codes — never guess from old checkouts.
 pub enum GgmlType as u32 {
 	f32
 	f16
 	q4_0
 	q4_1
-	q5_0
-	q5_1
-	q8_0
-	q8_1
-	q2_k
-	q3_k
-	q4_k
-	q5_k
-	q6_k
-	q8_k
-	i8
-	i16
-	i32
-	i64
-	f64
-	iq2_xxs
-	iq2_xs
-	iq3_xxs
-	iq3_s
-	iq2_s
-	iq4_nl
-	iq4_xs
-	iq8_bb
-	sparse
+	// 4, 5 were Q4_2/Q4_3 (removed upstream, never in GGUF v3 files)
+	q5_0    = 6
+	q5_1    = 7
+	q8_0    = 8
+	q8_1    = 9
+	q2_k    = 10
+	q3_k    = 11
+	q4_k    = 12
+	q5_k    = 13
+	q6_k    = 14
+	q8_k    = 15
+	iq2_xxs = 16
+	iq2_xs  = 17
+	iq3_xxs = 18
+	iq1_s   = 19
+	iq4_nl  = 20
+	iq3_s   = 21
+	iq2_s   = 22
+	iq4_xs  = 23
+	i8      = 24
+	i16     = 25
+	i32     = 26
+	i64     = 27
+	f64     = 28
+	iq1_m   = 29
+	bf16    = 30
 }
 
 pub struct GgufMeta {
@@ -80,6 +86,9 @@ pub:
 	meta    GgufMeta
 	tensors []GgufTensorInfo
 	kv      map[string]string // stringified KV (numbers rendered as text)
+	// data_base is the absolute file offset of the tensor data section
+	// (aligned end of header). Tensor `offset`s are relative to it.
+	data_base u64
 }
 
 struct Reader {
@@ -254,16 +263,45 @@ pub fn load_gguf_table(path string) !GgufModel {
 		}
 	}
 	return GgufModel{
-		path:    path
-		meta:    GgufMeta{
+		path:      path
+		meta:      GgufMeta{
 			version:   version
 			n_tensors: n_tensors
 			n_kv:      n_kv
 			alignment: alignment
 		}
-		tensors: tensors
-		kv:      kv
+		tensors:   tensors
+		kv:        kv
+		data_base: align_up(u64(r.off), alignment)
 	}
+}
+
+// align_up rounds n to a multiple of alignment (GGUF tensor data starts
+// at an aligned offset past the header/KV/infos).
+fn align_up(n u64, alignment u64) u64 {
+	if alignment == 0 {
+		return n
+	}
+	return (n + alignment - 1) / alignment * alignment
+}
+
+// load_model_blob reads the whole GGUF file into RAM (host phase-1b;
+// the bare-metal port mmaps the baked partition instead). Tensor bytes
+// are borrowed slices of this blob — keep it alive while tensors are used.
+pub fn load_model_blob(path string) ![]u8 {
+	return read_whole_file(path)
+}
+
+// tensor_bytes borrows a tensor's raw bytes from a loaded blob. Offsets
+// in the table are relative to the aligned data section start.
+pub fn tensor_bytes(blob []u8, m GgufModel, name string) ![]u8 {
+	info := m.find(name) or { return error('gguf: tensor ${name} not found') }
+	start := m.data_base + info.offset
+	end := start + info.size
+	if end > u64(blob.len) || start > end {
+		return error('gguf: tensor ${name} range [${start}, ${end}) outside blob len ${blob.len}')
+	}
+	return blob[start..end]
 }
 
 fn read_kv_value(mut r Reader, typ u32) !string {
@@ -361,9 +399,10 @@ fn ggml_type_size(t GgmlType) u64 {
 }
 
 // ggml_tensor_bytes is the exact byte size for fixed-block quant types
-// (Q4_0: 2 scale + 16 nibble bytes per 32 elems, etc.); unquantized types
-// fall back to ggml_type_size * n. K-quants use super-blocks and stay on
-// the estimate path (follow-up when a K-quant weight ships in v1).
+// (Q4_0: 2 scale + 16 nibble bytes per 32 elems, etc.; Q6_K: 128+64+16+2
+// per 256-elem super-block); unquantized types fall back to
+// ggml_type_size * n. K-quants other than Q6_K stay on the estimate path
+// (follow-up when a K-quant weight ships in v1).
 fn ggml_tensor_bytes(t GgmlType, n u64) u64 {
 	if t == .q4_0 || t == .q4_1 || t == .q5_0 || t == .q5_1 || t == .q8_0 || t == .q8_1 {
 		blocks := (n + 31) / 32
@@ -376,6 +415,10 @@ fn ggml_tensor_bytes(t GgmlType, n u64) u64 {
 		}
 
 		return blocks * per
+	}
+	if t == .q6_k {
+		blocks := (n + 255) / 256
+		return blocks * 210
 	}
 	return ggml_type_size(t) * n
 }

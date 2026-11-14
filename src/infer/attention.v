@@ -79,7 +79,7 @@ pub fn (mut c KVCache) reset() {
 @[direct_array_access]
 pub fn attention_step(q []f32, k &KVCache, v &KVCache, scale f32, mut probs []f32, mut out []f32) ! {
 	n := k.len()
-	if q.len != k.dim || v.dim != k.dim || out.len != k.dim {
+	if q.len != k.dim || out.len != v.dim {
 		return error('attention: dim mismatch q=${q.len} kdim=${k.dim} vdim=${v.dim} out=${out.len}')
 	}
 	if v.len() != n {

@@ -178,3 +178,70 @@ fn test_tokenizer_interface_dispatch() {
 	assert m.tok.name() == 'stub'
 	assert m.tok.encode('hello').len > 0
 }
+
+fn test_weights_dir_handles_both_separators() {
+	assert weights_dir('models/qwen3.gguf') == 'models'
+	assert weights_dir('C:\\models\\qwen3.gguf') == 'C:\\models'
+	assert weights_dir('qwen3.gguf') == '.'
+}
+
+// BPE golden vectors: exact llama.cpp parity on general text (spaces,
+// punctuation, digits, newlines, contractions, unicode). The sidecar
+// tokenizer.json is gitignored like the weights; skip when absent.
+fn bpe_test_tok() ?Bpe {
+	for c in ['models/tokenizer.json', '../models/tokenizer.json', '../../models/tokenizer.json'] {
+		if os.exists(c) {
+			return load_bpe(c)!
+		}
+	}
+	if v := os.getenv_opt('VLLM_MODELS') {
+		p := v + '/tokenizer.json'
+		if os.exists(p) {
+			return load_bpe(p)!
+		}
+	}
+	return none
+}
+
+fn test_bpe_encode_matches_llama() {
+	b := bpe_test_tok() or { return }
+	cases := {
+		'Hi':                   [13048]
+		'Hello world':          [9707, 1879]
+		'Hello, world!':        [9707, 11, 1879, 0]
+		'The quick brown fox.': [785, 3974, 13876, 38835, 13]
+		'123 456':              [16, 17, 18, 220, 19, 20, 21]
+		"don't stop":           [15007, 944, 2936]
+		'a  b':                 [64, 220, 293]
+		'  leading':            [220, 6388]
+		'trailing  ':           [376, 14277, 256]
+		'Qwen3-0.6B':           [48, 16948, 18, 12, 15, 13, 21, 33]
+		'café':                 [924, 58858]
+		'naïve':                [3376, 37572, 586]
+		'Hello 世界':           [9707, 220, 99489]
+		'price: $19.99':        [6555, 25, 400, 16, 24, 13, 24, 24]
+		'email me@example.com': [2332, 752, 35487, 905]
+		'(a+b)*c':              [2877, 35093, 4806, 66]
+		'x=1;y=2':              [87, 28, 16, 70863, 28, 17]
+		'100%':                 [16, 15, 15, 4]
+		'well-known':           [9157, 21309]
+		"It's fine":            [2132, 594, 6915]
+		'   three':             [256, 2326]
+		'a   b':                [64, 256, 293]
+		'12345':                [16, 17, 18, 19, 20]
+		'3.14159':              [18, 13, 16, 19, 16, 20, 24]
+	}
+	for text, want in cases {
+		got := b.encode(text)
+		assert got == want, 'bpe mismatch for ${text}: got ${got}, want ${want}'
+	}
+}
+
+fn test_bpe_decode_roundtrip() {
+	b := bpe_test_tok() or { return }
+	cases := ['Hi', 'Hello world', 'Hello, world!', 'price: $19.99', 'café', 'line1\nline2',
+		'x=1;y=2', "don't stop", '100%']
+	for text in cases {
+		assert b.decode(b.encode(text)) == text, 'roundtrip failed for ${text}'
+	}
+}

@@ -32,6 +32,10 @@ pub fn silu_in_place(mut x []f32) {
 
 // rope_in_place applies rotary embedding to q/k head slices in place.
 // head_dim must be even; freq base = cfg.rope_theta.
+// Split-half pairing (HF apply_rotary_pos_emb, matches Qwen3/llama.cpp
+// ROPE_TYPE_NORMAL): pair (h, h+half) shares freq h. NeoX adjacent pairs
+// (2h, 2h+1) are a DIFFERENT rotation — using them here silently breaks
+// every position past 0 (pos 0 is identity either way, hiding the bug).
 // cos_sin is a precomputed [2 * (head_dim/2)] table for this position:
 // caller builds it once per position and reuses it across all heads.
 @[direct_array_access]
@@ -40,19 +44,17 @@ pub fn rope_in_place(mut q []f32, mut k []f32, cos_sin []f32, head_dim int) {
 	for h in 0 .. half {
 		c := cos_sin[h]
 		s := cos_sin[half + h]
-		qi := h * 2
-		if qi + 1 < q.len {
-			a := q[qi]
-			b := q[qi + 1]
-			q[qi] = a * c - b * s
-			q[qi + 1] = a * s + b * c
+		if h < q.len && half + h < q.len {
+			a := q[h]
+			b := q[half + h]
+			q[h] = a * c - b * s
+			q[half + h] = a * s + b * c
 		}
-		ki := h * 2
-		if ki + 1 < k.len {
-			a := k[ki]
-			b := k[ki + 1]
-			k[ki] = a * c - b * s
-			k[ki + 1] = a * s + b * c
+		if h < k.len && half + h < k.len {
+			a := k[h]
+			b := k[half + h]
+			k[h] = a * c - b * s
+			k[half + h] = a * s + b * c
 		}
 	}
 }

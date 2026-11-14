@@ -45,8 +45,9 @@ jobs:
           v -cc gcc test src/cfg src/api src/formats \
             src/infer/attention_test.v src/infer/backend_test.v \
             src/infer/bench_test.v src/infer/infer_test.v \
-            src/infer/parallel_test.v src/infer/simd_test.v \
-            src/infer/tensor_view_test.v src/infer/gguf_golden_test.v
+            src/infer/forward_test.v src/infer/parallel_test.v \
+            src/infer/simd_test.v src/infer/tensor_view_test.v \
+            src/infer/gguf_golden_test.v
       - name: prod bench (compiles C kernels under gcc, runs rows)
         run: |
           v -prod -cc gcc -o /tmp/vbench tools/bench_kernels.v
@@ -68,7 +69,8 @@ jobs:
           v test src/cfg src/api src/formats `
             src/infer/attention_test.v src/infer/backend_test.v `
             src/infer/bench_test.v src/infer/infer_test.v `
-            src/infer/parallel_test.v src/infer/simd_test.v `
-            src/infer/tensor_view_test.v src/infer/gguf_golden_test.v
+            src/infer/forward_test.v src/infer/parallel_test.v `
+            src/infer/simd_test.v src/infer/tensor_view_test.v `
+            src/infer/gguf_golden_test.v
       - name: prod build (MSVC, C kernel portability)
         run: v -prod -cc msvc -o bench.exe tools/bench_kernels.v

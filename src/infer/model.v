@@ -5,6 +5,10 @@ import os
 
 // Qwen3-1.7B arch defaults. Values are overridden from the GGUF KV store
 // at boot; these are sane fallbacks for sizing the arenas.
+// head_dim is the Q/K head length (qwen3.attention.key_length); v_dim is
+// the V head length (value_length). Qwen3-1.7B has hidden=2048=16*128 so
+// hidden/heads happens to equal head_dim, but 0.6B has hidden=1024 with
+// 16x128 q heads (o-proj 2048->1024) — never derive hd from hidden.
 pub struct Qwen3Config {
 pub mut:
 	model_id     string = 'Qwen/Qwen3-1.7B'
@@ -12,6 +16,8 @@ pub mut:
 	layers       int    = 28
 	heads_q      int    = 16
 	heads_kv     int    = 8
+	head_dim     int    = 128
+	v_dim        int    = 128
 	intermediate int    = 6144
 	vocab        int    = 151936
 	ctx_native   int    = 32768
@@ -65,6 +71,15 @@ pub fn config_from_kv(base Qwen3Config, kv map[string]string) Qwen3Config {
 	}
 	if v := kv['qwen3.rope.freq_base'] {
 		c.rope_theta = v.f64()
+	}
+	if v := kv['qwen3.attention.key_length'] {
+		c.head_dim = v.int()
+	}
+	if v := kv['qwen3.attention.value_length'] {
+		c.v_dim = v.int()
+	}
+	if v := kv['qwen3.attention.layer_norm_rms_epsilon'] {
+		c.rms_norm_eps = v.f64()
 	}
 	if v := kv['tokenizer.ggml.tokens'] {
 		_ = v
@@ -125,16 +140,79 @@ pub fn load_model_stub(cfg Qwen3Config) Model {
 }
 
 fn weights_dir(p string) string {
-	i := p.last_index('/') or { return '.' }
-	return p[..i]
+	i := p.last_index('/') or { -1 }
+	// Windows callers pass backslash paths; models/ lookups must work
+	// for both (a missed sidecar silently degrades to the stub tokenizer).
+	j := p.last_index('\\') or { -1 }
+	k := if i > j { i } else { j }
+	if k < 0 {
+		return '.'
+	}
+	return p[..k]
 }
 
-// generate runs the wired path: template -> encode -> sample loop.
-// The matmul/attention forward for real logits lands in phase 1b; until then
-// the sampler runs over a deterministic pseudo-logit derived from the prompt
-// so the full pipeline (encode->sample->decode) is exercised end to end.
+// generate runs the wired path: encode -> transformer forward -> sample
+// loop -> decode. With GGUF weights present it runs the real phase-1b
+// forward (prefill + decode steps over ForwardCtx arenas); without weights
+// (stub/test) it falls back to the deterministic pseudo-logit path so the
+// full pipeline stays exercisable end to end.
 pub fn (m Model) generate(prompt string, max_tokens int, sp SampleParams) string {
 	ids := m.tok.encode(prompt)
+	if m.format == .gguf && m.gguf.path != '' && os.exists(m.gguf.path) {
+		return m.generate_real(ids, max_tokens, sp) or {
+			return m.generate_pseudo(prompt, ids, max_tokens, sp)
+		}
+	}
+	return m.generate_pseudo(prompt, ids, max_tokens, sp)
+}
+
+// generate_real runs prefill + sampling over the transformer forward.
+// Blob load is per call (host phase-1b; the bare-metal port hands a baked
+// slice instead). KV arenas are sized from cfg.ctx_cap.
+fn (m Model) generate_real(ids []int, max_tokens int, sp SampleParams) !string {
+	blob := load_model_blob(m.gguf.path)!
+	mut f := new_forward_ctx(m.cfg, m.gguf, blob)!
+	for id in ids {
+		embed_gather(blob, m.gguf, m.cfg.hidden, id, mut f.hidden)!
+		f.decode_step()!
+	}
+	eos := m.gguf.kv['tokenizer.ggml.eos_token_id'].int()
+	mut out := []int{cap: max_tokens}
+	mut work := []f32{len: f.logits.len}
+	mut idx := []int{len: f.logits.len}
+	mut seed := sp.seed
+	for id in ids {
+		seed = seed * 1315423911 + u64(id)
+	}
+	for i in 0 .. max_tokens {
+		for j in 0 .. f.logits.len {
+			work[j] = f.logits[j]
+		}
+		p := SampleParams{
+			temp:  sp.temp
+			top_k: sp.top_k
+			top_p: sp.top_p
+			min_p: sp.min_p
+			seed:  seed + u64(i)
+			fast:  sp.fast
+		}
+		next := if sp.fast {
+			sample_into_fast(mut work, mut idx, p)
+		} else {
+			sample_into(mut work, mut idx, p)
+		}
+		out << next
+		if next == eos {
+			break
+		}
+		embed_gather(blob, m.gguf, m.cfg.hidden, next, mut f.hidden)!
+		f.decode_step()!
+	}
+	return m.tok.decode(out)
+}
+
+// generate_pseudo runs the deterministic pseudo-logit path (no weights).
+fn (m Model) generate_pseudo(prompt string, ids []int, max_tokens int, sp SampleParams) string {
 	mut out := []int{cap: max_tokens}
 	mut seed := u64(0)
 	for id in ids {
@@ -146,8 +224,7 @@ pub fn (m Model) generate(prompt string, max_tokens int, sp SampleParams) string
 	n := if max_tokens < 64 { max_tokens } else { 64 }
 	for i in 0 .. n {
 		// Deterministic pseudo-logits: peak walks with (seed+i), so output
-		// is stable per prompt but varies across prompts. Replaced by the
-		// transformer forward in phase 1b without changing this signature.
+		// is stable per prompt but varies across prompts.
 		base := int(seed % 64) + i
 		for j in 0 .. 64 {
 			logits[j] = -f32((j + base) % 64)

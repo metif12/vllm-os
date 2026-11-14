@@ -52,12 +52,12 @@ fn test_gguf_golden_qwen_06b() {
 	m := load_gguf_table(path)!
 	assert m.meta.n_tensors == 310
 	assert m.meta.n_kv == 32
-	assert total_bytes(m.tensors) == 404160512
+	assert total_bytes(m.tensors) == 376204288
 	h := count_types(m.tensors)
 	assert h[.q4_0] == 193
 	assert h[.f32] == 113
 	assert h[.q4_1] == 3
-	assert h[.i8] == 1
+	assert h[.q6_k] == 1
 	cfg := config_from_kv(Qwen3Config{}, m.kv)
 	assert cfg.hidden == 1024
 	assert cfg.layers == 28
@@ -77,12 +77,12 @@ fn test_gguf_golden_llama_1b() {
 	m := load_gguf_table(path)!
 	assert m.meta.n_tensors == 147
 	assert m.meta.n_kv == 35
-	assert total_bytes(m.tensors) == 812392576
+	assert total_bytes(m.tensors) == 765194368
 	h := count_types(m.tensors)
 	assert h[.q4_0] == 110
 	assert h[.f32] == 34
 	assert h[.q4_1] == 2
-	assert h[.i8] == 1
+	assert h[.q6_k] == 1
 	// NOTE: config_from_kv only understands qwen3.* keys, so Llama arch
 	// fields print Qwen defaults. Assert tensor-level facts instead;
 	// generalizing the keys rides with tokenizer-from-GGUF.
