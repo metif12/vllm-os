@@ -15,14 +15,21 @@ v -prod -cc gcc test src                  # prod: C layer live
 
 tcc is never used for tests either.
 
+CI (`.github/workflows/ci.yml`) runs on every push/PR: `vet` + `fmt -verify`
+on Ubuntu, full `test src/` on Ubuntu/gcc, logic suite on Windows, plus a
+`-prod` bench build under MSVC (C kernel portability — this lane once
+caught a `__builtin_sqrt` the scalar fallback could not compile). Perf
+numbers are never gated in CI (boxes vary); `scripts/bench.py` owns them.
+
 | file | covers |
 |---|---|
 | `src/infer/infer_test.v` | greedy/softmax/seed-determinism/RMSNorm/Q8 scale/template/bad-magic/KV override, presets, min-p, tokenizer dispatch |
+| `src/infer/gguf_golden_test.v` | real-file tables: Qwen3-0.6B + Llama-3.2-1B tensor counts/bytes/types/key shapes; skips when `models/` absent (see `scripts/fetch_small_models.sh`) |
 | `src/infer/bench_test.v` | perf gates: 20k-iteration `sample_into` floor, blocked-vs-naive matvec equivalence + speed |
 | `src/infer/attention_test.v` | KV-cache append/overflow/row/reset, `attention_step` hand values + error gates |
 | `src/infer/backend_test.v` | registry contents (4 backends), explicit/auto selection, backend agreement |
-| `src/infer/simd_test.v` | C-vs-V agreement (matvec/Q8-dot/RMSNorm/range-block), heap top-k winners, fast-vs-exact sampler |
-| `src/infer/parallel_test.v` | threaded-vs-serial agreement (incl. wide + non-divisible rows), range-block parity |
+| `src/infer/simd_test.v` | C-vs-V agreement (matvec/Q8-dot/**Q4-fused-dot**/RMSNorm/range-block), heap top-k winners, fast-vs-exact sampler |
+| `src/infer/parallel_test.v` | threaded-vs-serial agreement (incl. wide + **remainder rows**), range-block parity |
 | `src/infer/tensor_view_test.v` | view validation, `-1` reshape, matvec parity, strided-layout rejection |
 | `src/infer/vtl_parity_test.v` | VTL `la.matmul` and VSL `matrix_matrix_mul` agree with `matvec`; view/VTL layout parity |
 | `src/formats/formats_test.v` | GGUF/SafeTensors/unknown/PyTorch detection, header parse, dtype table, registry resolve + sniff parity |

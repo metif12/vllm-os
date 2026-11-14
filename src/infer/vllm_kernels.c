@@ -178,6 +178,19 @@ float vllm_q4_0_dot_f32(const unsigned char *qs, const float *x, float scale, in
 	return s * scale;
 }
 
+// Freestanding 1/sqrt (no libm anywhere in this file, so no sqrtf):
+// bit-level seed + two Newton iterations, ~1e-7 relative error.
+static float vllm_rsqrt(float x) {
+	union {
+		float f;
+		unsigned int u;
+	} z = { x };
+	z.u = 0x5f3759df - (z.u >> 1);
+	z.f *= 1.5f - 0.5f * x * z.f * z.f;
+	z.f *= 1.5f - 0.5f * x * z.f * z.f;
+	return z.f;
+}
+
 void vllm_rmsnorm_f32(float *x, const float *w, int n, float eps) {
 	// Sum of squares in double (matches infer.rmsnorm_in_place exactly).
 	double ss = 0.0;
@@ -185,7 +198,7 @@ void vllm_rmsnorm_f32(float *x, const float *w, int n, float eps) {
 		double v = (double)x[i];
 		ss += v * v;
 	}
-	float scale = (float)(1.0 / __builtin_sqrt(ss / (double)n + (double)eps));
+	float scale = vllm_rsqrt((float)(ss / (double)n + (double)eps));
 #if VLLM_HAVE_SIMD
 	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
 		rmsnorm_scale_avx2(x, w, n, scale);

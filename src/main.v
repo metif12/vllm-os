@@ -87,11 +87,11 @@ fn main() {
 		eprintln('[vllm-os] run scripts/fetch_model.sh first, pass --model <file>, or set model.weights in config')
 		eprintln('[vllm-os] starting in API-only stub mode (no weights).')
 		stub := infer.Model{
-			cfg: qcfg
+			cfg:  qcfg
 			gguf: infer.GgufModel{
 				path: cc.model.weights
 			}
-			tok: infer.Tokenizer(infer.StubTokenizer{})
+			tok:  infer.Tokenizer(infer.StubTokenizer{})
 		}
 		api.serve(cc, &stub) or {
 			eprintln('[vllm-os] serve failed: ${err}')

@@ -263,6 +263,16 @@ re-measure the floor on the serving box, not this laptop.
 ## How to reproduce
 
 ```sh
+python scripts/bench.py --force            # V bench + NumPy, fingerprinted, CSV/JSON in bench/results_*
+python scripts/bench.py --force --llama-bench /path/to/llama-bench --pp 128 -n 64 -t 8
+python scripts/bench.py --help             # reps/cooldown/models/threads
+```
+
+`bench.py` refuses on a loaded box unless `--force`, sleeps `--cooldown`
+between sections, and records CPU/RAM/V/gcc/commit with every run. The
+manual equivalents still work:
+
+```sh
 v -prod -cc gcc -o /tmp/bench_rel tools/bench_kernels.v && /tmp/bench_rel
 python scripts/perf_baseline.py --kernels
 v -prod -cc gcc -o server.exe src

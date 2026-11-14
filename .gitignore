@@ -10,6 +10,7 @@ __pycache__/
 models/
 *.gguf
 *.safetensors
+bench/results_*/
 qemu/*.iso
 qemu/*.img
 qemu/test.log

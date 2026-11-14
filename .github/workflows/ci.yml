@@ -1,0 +1,61 @@
+name: ci
+
+# Fast signal on every push/PR: vet + format check, full test suite on
+# Ubuntu/gcc, logic suite + MSVC prod build on Windows. Heavy perf
+# numbers are NOT gated here (boxes vary) — scripts/bench.py owns those
+# and docs/perf.md curates them.
+on:
+  push:
+  pull_request:
+
+env:
+  V_VERSION: 0.5.2
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install V
+        run: |
+          curl -sL -o /tmp/v_linux.zip \
+            "https://github.com/vlang/v/releases/download/${V_VERSION}/v_linux.zip"
+          unzip -q /tmp/v_linux.zip -d /tmp
+          echo /tmp/v >> "$GITHUB_PATH"
+      - name: vet
+        run: v vet src tools
+      - name: fmt
+        run: v fmt -verify src tools
+
+  test-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install V
+        run: |
+          curl -sL -o /tmp/v_linux.zip \
+            "https://github.com/vlang/v/releases/download/${V_VERSION}/v_linux.zip"
+          unzip -q /tmp/v_linux.zip -d /tmp
+          echo /tmp/v >> "$GITHUB_PATH"
+      - name: test
+        run: v -cc gcc test src/
+      - name: prod bench (compiles C kernels under gcc, runs rows)
+        run: |
+          v -prod -cc gcc -o /tmp/vbench tools/bench_kernels.v
+          /tmp/vbench
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install V
+        shell: pwsh
+        run: |
+          curl.exe -sL -o "$env:TEMP/v_windows.zip" `
+            "https://github.com/vlang/v/releases/download/${env:V_VERSION}/v_windows.zip"
+          Expand-Archive "$env:TEMP/v_windows.zip" -DestinationPath C:\vlang
+          Add-Content $env:GITHUB_PATH "C:\vlang\v"
+      - name: test (bundled cc, logic + Windows paths)
+        run: v test src/
+      - name: prod build (MSVC, C kernel portability)
+        run: v -prod -cc msvc -o bench.exe tools/bench_kernels.v
