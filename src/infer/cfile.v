@@ -4,14 +4,13 @@ import os
 
 // Minimal C file reader: header probe without pulling a 1GB GGUF into RAM.
 // Bare-metal friendly (no `os` dependency in this unit).
+//
+// NOTE: the C symbols used here (FILE/fopen/fread/fclose) are declared in
+// vlib's builtin/cfns, so this file declares none of its own. A local
+// re-declaration once shadowed vlib's `fread` on some toolchains and broke
+// vlib/os itself (`infer.uint` mismatch) — do not re-add them.
 
 #include <stdio.h>
-
-struct C.FILE {}
-
-fn C.fopen(path &char, mode &char) &C.FILE
-fn C.fread(ptr voidptr, size uint, nmemb uint, stream &C.FILE) uint
-fn C.fclose(stream &C.FILE) int
 
 struct RawFile {
 	f &C.FILE
@@ -29,7 +28,9 @@ fn open_file_rb(path string) !RawFile {
 
 fn (mut r RawFile) read_bytes(n int) []u8 {
 	mut buf := []u8{len: n}
-	got := C.fread(buf.data, uint(1), uint(n), r.f)
+	// Same call shape as vlib/os: int literal + int length, converted by
+	// each toolchain against its own builtin/cfns declaration.
+	got := C.fread(buf.data, 1, n, r.f)
 	unsafe {
 		buf.len = int(got)
 	}

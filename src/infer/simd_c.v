@@ -96,8 +96,7 @@ pub fn matvec_c_range(w []f32, x []f32, rows int, cols int, r0 int, n int, mut o
 pub fn q8_0_dot_row_c(block BlockQ80, x []f32, x_off int) f32 {
 	$if prod {
 		if has_avx2() {
-			return C.vllm_q8_dot_f32(&block.qs[0], &x[x_off], q80_scale(block),
-				qk8_0)
+			return C.vllm_q8_dot_f32(&block.qs[0], &x[x_off], q80_scale(block), qk8_0)
 		}
 	}
 	return q8_0_dot_row(block, x, x_off)
@@ -110,8 +109,7 @@ pub fn q8_0_dot_row_c(block BlockQ80, x []f32, x_off int) f32 {
 pub fn q4_0_dot_row_c(block BlockQ40, x []f32, x_off int) f32 {
 	$if prod {
 		if has_avx2() {
-			return C.vllm_q4_0_dot_f32(&block.qs[0], &x[x_off], q40_scale(block),
-				qk4_0)
+			return C.vllm_q4_0_dot_f32(&block.qs[0], &x[x_off], q40_scale(block), qk4_0)
 		}
 	}
 	return q4_0_dot_row(block, x, x_off)

@@ -1,7 +1,7 @@
 module cfg
 
 import infer
-import json2
+import json
 import os
 
 // File-based configuration: `vllm.json` (or --config path) carries every
@@ -65,7 +65,7 @@ pub fn load(path string) !Config {
 	if raw.len >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF {
 		raw = raw[3..]
 	}
-	mut c := json2.decode[Config](raw)!
+	mut c := json.decode(Config, raw)!
 	c.normalize()
 	c.validate()!
 	return c

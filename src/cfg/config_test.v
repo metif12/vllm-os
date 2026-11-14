@@ -25,8 +25,12 @@ fn test_partial_file_falls_back_to_defaults() ! {
 
 fn test_bom_prefix_is_stripped() ! {
 	// Windows editors (Notepad) save UTF-8 with BOM; the loader must cope.
-	bom := [u8(0xEF), 0xBB, 0xBF]
-	os.write_bytes('cfg_test_bom.json', [...bom, ...'{"server":{"port":9001}}'.bytes()])!
+	// No `...` spread: release 0.5.2 (pinned in CI) rejects it.
+	mut raw := [u8(0xEF), 0xBB, 0xBF]
+	for b in '{"server":{"port":9001}}'.bytes() {
+		raw << b
+	}
+	os.write_bytes('cfg_test_bom.json', raw)!
 	defer {
 		os.rm('cfg_test_bom.json') or {}
 	}

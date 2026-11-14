@@ -7,7 +7,6 @@ module infer
 // and the bare-metal port never link VTL/VSL — see tensor_view.v for why
 // the token loop stays pure V + C).
 // Run: `v -cc gcc test src/infer` (any profile; C layer optional).
-
 import vtl
 import vtl.la
 import vsl.la as vsl_la

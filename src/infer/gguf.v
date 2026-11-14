@@ -110,9 +110,12 @@ fn (mut r Reader) u16_le() !u16 {
 
 fn (mut r Reader) u32_le() !u32 {
 	r.need(4)!
-	v := u32(r.buf[r.off]) | (u32(r.buf[r.off + 1]) << 8) | (u32(r.buf[r.off + 2]) << 16) | (u32(r.buf[r.off + 3]) << 24)
+	b0 := u32(r.buf[r.off])
+	b1 := u32(r.buf[r.off + 1]) << 8
+	b2 := u32(r.buf[r.off + 2]) << 16
+	b3 := u32(r.buf[r.off + 3]) << 24
 	r.off += 4
-	return v
+	return b0 | b1 | b2 | b3
 }
 
 fn (mut r Reader) u64_le() !u64 {
@@ -266,15 +269,33 @@ pub fn load_gguf_table(path string) !GgufModel {
 fn read_kv_value(mut r Reader, typ u32) !string {
 	et_outer := unsafe { GgufType(typ) }
 	match et_outer {
-		.u8 { return r.u8()!.str() }
-		.i8 { return r.i8_()!.str() }
-		.u16 { return r.u16_le()!.str() }
-		.i16 { return r.i16_le()!.str() }
-		.u32 { return r.u32_le()!.str() }
-		.i32 { return r.i32_le()!.str() }
-		.f32 { return r.f32_le()!.str() }
-		.boolean { return (r.u8()! != 0).str() }
-		.string { return r.gguf_str()! }
+		.u8 {
+			return r.u8()!.str()
+		}
+		.i8 {
+			return r.i8_()!.str()
+		}
+		.u16 {
+			return r.u16_le()!.str()
+		}
+		.i16 {
+			return r.i16_le()!.str()
+		}
+		.u32 {
+			return r.u32_le()!.str()
+		}
+		.i32 {
+			return r.i32_le()!.str()
+		}
+		.f32 {
+			return r.f32_le()!.str()
+		}
+		.boolean {
+			return (r.u8()! != 0).str()
+		}
+		.string {
+			return r.gguf_str()!
+		}
 		.array {
 			et := r.u32_le()!
 			n := r.u64_le()!
@@ -298,9 +319,15 @@ fn read_kv_value(mut r Reader, typ u32) !string {
 			}
 			return '[' + parts.join(',') + ']'
 		}
-		.u64 { return r.u64_le()!.str() }
-		.i64 { return r.i64_le()!.str() }
-		.f64 { return r.f64_le()!.str() }
+		.u64 {
+			return r.u64_le()!.str()
+		}
+		.i64 {
+			return r.i64_le()!.str()
+		}
+		.f64 {
+			return r.f64_le()!.str()
+		}
 	}
 }
 
@@ -341,12 +368,13 @@ fn ggml_tensor_bytes(t GgmlType, n u64) u64 {
 	if t == .q4_0 || t == .q4_1 || t == .q5_0 || t == .q5_1 || t == .q8_0 || t == .q8_1 {
 		blocks := (n + 31) / 32
 		per := match t {
-			.q4_0 { 18 }
-			.q4_1 { 20 }
-			.q5_0 { 22 }
-			.q5_1 { 24 }
-			else { 34 }
+			.q4_0 { u64(18) }
+			.q4_1 { u64(20) }
+			.q5_0 { u64(22) }
+			.q5_1 { u64(24) }
+			else { u64(34) }
 		}
+
 		return blocks * per
 	}
 	return ggml_type_size(t) * n

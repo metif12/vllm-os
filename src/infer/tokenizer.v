@@ -1,6 +1,6 @@
 module infer
 
-import json2
+import json
 
 // Tokenizer is the extension point for text encoding. The generate path
 // calls only encode, so a new tokenizer (byte-level, test fake, future
@@ -71,7 +71,7 @@ pub fn decode_stub(ids []int) string {
 // load_bpe parses a HF tokenizer.json (model.vocab + model.merges).
 pub fn load_bpe(path string) !Bpe {
 	raw := read_whole_file(path)!
-	doc := json2.decode[TokenizerJson](raw.bytestr())!
+	doc := json.decode(TokenizerJson, raw.bytestr())!
 	mut merges := map[string]int{}
 	for i, m in doc.model.merges {
 		merges[m] = i

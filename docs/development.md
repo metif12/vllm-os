@@ -1,10 +1,33 @@
 # Development
 
-Host-only dev dependency (parity tests + tools, never the server):
+Host-only dev dependencies (parity tests need all three; the server and
+all kernels need none):
 
 ```sh
 v install vtl vsl
 ```
+
+## Toolchain
+
+Pinned: **V 0.5.2 release** (`v version` prints a second hash after the
+version — `7647ce1` is the release; anything else is a weekly and will
+NOT build this repo). CI downloads the release; use it locally too.
+
+Why the pin is load-bearing, not cosmetic:
+
+- Weeklies removed the stdlib `json` module (use `json2` instead) and
+  their `v fmt -w` auto-migrates `import json` plus call sites — even
+  inventing `escape_unicode`/`time_as_unix` args (verified by probe).
+  Release 0.5.2 has no `json2` module at all. There is no import that
+  compiles on both, so the repo targets release: stdlib `json` only
+  (`Config`, API shapes, tokenizer index).
+- Release 0.5.2 rejects `...` array spread and `&?T` (both used to
+  compile here); keep them out.
+- No module-level `fn C.*` re-declarations (`cfile.v`): on release they
+  shadow vlib's `builtin/cfns` and break vlib/os itself. Use vlib's
+  declarations with vlib's own call shapes.
+- Formatting authority is the **release binary ONLY**. Never run a
+  weekly's `v fmt -w` on this tree.
 
 ## Test suite
 
@@ -13,13 +36,19 @@ v -cc gcc test src                       # dev: pure V (whole tree; per-module d
 v -prod -cc gcc test src                  # prod: C layer live
 ```
 
+`src/infer/vtl_parity_test.v` needs `v install vtl vsl` and is excluded
+from the release-0.5.2 CI run (vtl master does not compile on 0.5.2) —
+run it explicitly wherever your VTL checkout builds; CI runs the exact
+file list in `.github/workflows/ci.yml` instead of the whole tree.
+
 tcc is never used for tests either.
 
 CI (`.github/workflows/ci.yml`) runs on every push/PR: `vet` + `fmt -verify`
-on Ubuntu, full `test src/` on Ubuntu/gcc, logic suite on Windows, plus a
-`-prod` bench build under MSVC (C kernel portability — this lane once
-caught a `__builtin_sqrt` the scalar fallback could not compile). Perf
-numbers are never gated in CI (boxes vary); `scripts/bench.py` owns them.
+on Ubuntu, the pinned file list on Ubuntu/gcc, the same list on Windows,
+plus a `-prod` bench build under MSVC (C kernel portability — this lane
+once caught a `__builtin_sqrt` the scalar fallback could not compile).
+Perf numbers are never gated in CI (boxes vary); `scripts/bench.py`
+owns them.
 
 | file | covers |
 |---|---|

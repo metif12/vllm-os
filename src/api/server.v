@@ -76,7 +76,7 @@ fn read_request(mut conn net.TcpConn, max_body int) !(string, string) {
 
 fn content_length(head string) int {
 	for line in head.split_into_lines() {
-		if line.len > 15 && (line[..15].to_lower() == 'content-length:') {
+		if line.len > 15 && line[..15].to_lower() == 'content-length:' {
 			return line[15..].trim_space().int()
 		}
 	}
@@ -98,13 +98,15 @@ fn handle(mut conn net.TcpConn, ctx &HandlerCtx, sema chan int) {
 		return
 	}
 	route := match_route(parts[0], parts[1]) or {
-		send_response(mut conn, 404, 'application/json', '{"error":"not found, try /health or /v1/models"}')
+		send_response(mut conn, 404, 'application/json',
+			'{"error":"not found, try /health or /v1/models"}')
 		return
 	}
 	handler := route.handler or {
 		send_response(mut conn, 500, 'application/json', '{"error":"unwired route"}')
 		return
 	}
+
 	res := handler(body, ctx)
 	send_response(mut conn, res.status, res.content_type, res.body)
 }
@@ -137,11 +139,21 @@ pub fn escape_json(s string) string {
 	mut sb := strings.new_builder(s.len + 16)
 	for ch in s {
 		match ch {
-			`\\` { sb.write_string('\\\\') }
-			`"` { sb.write_string('\\"') }
-			`\n` { sb.write_string('\\n') }
-			`\r` { sb.write_string('\\r') }
-			`\t` { sb.write_string('\\t') }
+			`\\` {
+				sb.write_string('\\\\')
+			}
+			`"` {
+				sb.write_string('\\"')
+			}
+			`\n` {
+				sb.write_string('\\n')
+			}
+			`\r` {
+				sb.write_string('\\r')
+			}
+			`\t` {
+				sb.write_string('\\t')
+			}
 			else {
 				if ch < 0x20 {
 					sb.write_string('\\u00')

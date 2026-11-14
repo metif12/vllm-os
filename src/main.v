@@ -4,7 +4,7 @@ import cfg
 import flag
 import formats
 import infer
-import json2
+import json
 import os
 import api
 
@@ -14,11 +14,14 @@ import api
 // --print-config) print and exit before any weights are touched.
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
-	cfg_path := fp.string('config', `g`, '', 'path to vllm.json config file (see vllm.example.json)')
-	weights := fp.string('model', `m`, 'models/qwen3-1.7b-q4_k_m.gguf', 'path to weights baked into the image')
+	cfg_path := fp.string('config', `g`, '',
+		'path to vllm.json config file (see vllm.example.json)')
+	weights := fp.string('model', `m`, 'models/qwen3-1.7b-q4_k_m.gguf',
+		'path to weights baked into the image')
 	port := fp.int('port', `p`, 8000, 'listen port for the OpenAI-compat API')
 	ctx_cap := fp.int('ctx', `c`, 4096, 'KV context cap (v1 trims Qwen3 native 32k)')
-	backend := fp.string('backend', `b`, 'cpu', 'compute backend: cpu | cpu-blocked | cpu-simd | auto')
+	backend := fp.string('backend', `b`, 'cpu',
+		'compute backend: cpu | cpu-blocked | cpu-simd | auto')
 	list_backends := fp.bool('list-backends', 0, false, 'print backend registry and exit')
 	list_formats := fp.bool('list-formats', 0, false, 'print weight-format handlers and exit')
 	print_config := fp.bool('print-config', 0, false, 'print effective config as JSON and exit')
@@ -70,7 +73,7 @@ fn main() {
 		exit(1)
 	}
 	if print_config {
-		println(json2.encode(cc))
+		println(json.encode(cc))
 		return
 	}
 	// Resolve once at boot so a bad backend name fails here, not mid-serve.

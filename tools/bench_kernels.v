@@ -18,7 +18,6 @@ module main
 //  - `c-*` variants call the REAL shipped C file
 //    (src/infer/vllm_kernels.c) via #flag — no copy, always in sync.
 //    Without -march=native the scalar fallbacks run; with it, AVX2+FMA.
-
 import math
 import sync
 import time
@@ -175,7 +174,13 @@ fn v_sample_into(mut work []f32, mut idx []int, temp f32, top_k int, top_p f32, 
 	} else {
 		v_softmax_scaled(mut work, 1.0 / temp)
 	}
-	mut rng := BenchRng{ state: if seed == 0 { 0x9e3779b97f4a7c15 } else { seed } }
+	mut rng_state := seed
+	if rng_state == 0 {
+		rng_state = 0x9e3779b97f4a7c15
+	}
+	mut rng := BenchRng{
+		state: rng_state
+	}
 	k := if top_k > 0 && top_k < work.len { top_k } else { work.len }
 	if work.len > 256 {
 		v_heap_topk(work, k, mut idx)
