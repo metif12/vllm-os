@@ -29,8 +29,10 @@ function-target attributes, opt-in fast-softmax sampler.
 ## Kernels
 
 `v-rel` = `v -prod -cc gcc` (portable flags; AVX2 via function
-attributes + runtime dispatch). `v-lto` adds
-`-cflags "-O3 -fno-strict-aliasing -flto"`. Each cell is the
+attributes + runtime dispatch). `v-lto` adds redundant
+`-cflags "-O3 -fno-strict-aliasing -flto"` — kept in the table as
+evidence that extra flags don't move the needle (the profile was
+retired; plain release is optimal). Each cell is the
 median-ish of back-to-back runs (ranges in text). Machine section above
 is the only hardware these numbers may be quoted for.
 
@@ -44,6 +46,7 @@ is the only hardware these numbers may be quoted for.
 | sample 64-logit x20k, exact | ~30 ms | ~30 ms | ~830 ms | **V 28x** (NumPy per-call overhead on tiny arrays) |
 | sample 151936-logit x20, exact (heap top-k) | ~19 ms | ~19 ms | ~24 ms | **V 1.3x** |
 | sample 151936-logit x20, **fast** (approx exp) | **~4 ms** | **~5 ms** | ~24 ms | **V 5.5x** |
+| q4_0 dot 2048 blocks x20, **fused** (no materialize) | **~730 us** (C scalar) | — | ~1327 us materialize-then-dot (same binary) | **fused 1.8x** (the missing store, not SIMD) |
 
 How the wins happened, in order:
 
@@ -107,19 +110,124 @@ here — serve release.
 3. **Sampler is done.** Exact beats NumPy 1.4x at vocab scale and
    28x on small logits; fast beats it 5.5x. No further work planned
    here before real-logit validation (phase 1b gate).
+4. **Quantized dot is fused.** Q4_0 rows never materialize: fused
+   `q4_0_dot_row` (+ C scalar + bridge, `simd_test.v`-gated) beats
+   dequant-then-dot 1.8x on the same bytes. This is the traffic shape
+   the v1 forward pays per row — the win is the missing 32-f32 store,
+   not SIMD width (AVX2 nibble-unpack is follow-up).
+5. **Attention lost its per-row tax.** `attention_step` indexes the KV
+   arenas flat instead of `k.row(i)!` per row: identical checksums,
+   4 ms -> ~3 ms at n=1024 x20 and 4 ms -> ~2-3 ms at n=4096 x5
+   (dim=128). At 4k ctx x 28 layers x 8 KV heads the per-call saving
+   multiplies across 224 calls/token.
+6. **Thread partitions are balanced.** `parallel.v` (and the bench
+   harness) spread `rows % n` remainder rows so blocks differ by at
+   most one — same review fix as VSL `gemv_n`. Gated by a
+   rows=2501/VLLM_THREADS=8 remainder test in `parallel_test.v`.
+
+## External baselines: llama.cpp on real small models (same box)
+
+`llama-b12376-bin-win-cpu-x64`, `-t 8`, `-p 128 -n 64`, back-to-back
+with the rows above (box under load — treat absolutes as conservative,
+ratios as the signal):
+
+| model | size | PP tok/s | TG tok/s |
+|---|---|---|---|
+| Qwen3-0.6B Q4_0 (unsloth) | 359 MB | ~389 | ~63 |
+| Llama-3.2-1B Q4_0 (bartowski) | 730 MB | ~219 | ~33 |
+
+Both files parse with our `load_gguf_table` (310 tensors/404 MB table
+for Qwen, 147/812 MB for Llama) after two robustness fixes this round:
+KV arrays over 4096 entries are walked-not-retained (Qwen3 tokenizers
+carry 152k strings; the boot path only needs arch KV), and tensor byte
+sizes use exact block math for Q4_0/Q4_1/Q5/Q8_0. Analytic decode
+ceilings from weight traffic (~0.36 GB/token Qwen, ~0.73 GB/token
+Llama at ~20 GB/s effective) land at ~55 and ~27 tok/s — llama.cpp sits
+at or above those lines, which is the bar the phase-1b forward has to
+meet. End-to-end V tok/s is still not quotable (forward is
+pseudo-logits until 1b). Known gap found while probing: `config_from_kv`
+only understands `qwen3.*` keys, so the Llama arch line above prints
+Qwen defaults (hidden right, layers/intermediate wrong) — generalizing
+it rides with the tokenizer-from-GGUF follow-up, not this round.
 
 ## Flag hygiene (measured, non-obvious)
 
-* Custom `-cflags` REPLACE V's default C flag set. Bare `-O3`
-  measured ~2x slower than plain `-prod` on V-generated code; the
-  working recipe restates `-O3 -fno-strict-aliasing` (see
-  `scripts/build.ps1` host-native).
-* `-march=native` pessimize V 0.5.2's own codegen 3-5x (naive
-  matvec 425 us -> ~1400 us, exact sampler 20 ms -> ~110 ms) while
-  the hand-written C kernel kept its AVX2 speed. SIMD therefore
-  comes from `__attribute__((target("avx2,fma")))` + runtime
-  dispatch — portable flags, full speed where AVX2 exists. Never
-  `-march=native` in committed scripts (also an ISO portability rule).
+* Custom `-cflags` APPEND to V's defaults (verified: `-dump-c-flags`
+  shows the same `-O3 -flto` plan with and without extras, and
+  `-prod` / `-prod -cflags "-O3"` / `-prod -cflags "-O3
+  -fno-strict-aliasing"` build bit-identical-speed binaries on the
+  bench). An earlier "REPLACE" theory in these docs was wrong —
+  re-measured 2026-11-14 and corrected. Plain `-prod -cc gcc` is
+  already optimal; extra flags are redundant.
+* `-march=native` (and plain `-mavx2`) pessimize V 0.5.2's generated
+  4-accumulator matvec ~2.4x (8-9 ms -> 21 ms, identical checksums;
+  minimal repro below) while a hand-written C kernel with the same
+  loop shape keeps full AVX2 speed (145 us). Root cause, from the
+  generated C + asm: V emits per-access `*((float*)(arr.data) + i64…)`
+  addressing that gcc's SLP pass turns into a `vpermd`/`vblendps`
+  shuffle swamp with a scalar `vaddss` horizontal tail, where the
+  plain-C `const float*` version gets clean 8-wide FMA. `-mavx2
+  -fno-tree-vectorize` recovers most of it, confirming the vectorizer
+  (filed upstream as a vlang/v issue with repro + asm).
+* SIMD therefore comes from `__attribute__((target("avx2,fma")))` +
+  runtime dispatch — portable flags, full speed where AVX2 exists.
+  Never `-march=native` in committed scripts (also an ISO
+  portability rule).
+
+Minimal upstream repro (save as `march_repro.v`):
+
+```v
+module main
+
+import time
+
+@[direct_array_access]
+fn matvec(w []f32, x []f32, rows int, cols int, mut out []f32) {
+	for r in 0 .. rows {
+		mut s0 := f32(0)
+		mut s1 := f32(0)
+		mut s2 := f32(0)
+		mut s3 := f32(0)
+		base := r * cols
+		mut c := 0
+		for c + 4 <= cols {
+			s0 += w[base + c] * x[c]
+			s1 += w[base + c + 1] * x[c + 1]
+			s2 += w[base + c + 2] * x[c + 2]
+			s3 += w[base + c + 3] * x[c + 3]
+			c += 4
+		}
+		for c < cols {
+			s0 += w[base + c] * x[c]
+			c++
+		}
+		out[r] = s0 + s1 + s2 + s3
+	}
+}
+
+fn main() {
+	rows := 2048
+	cols := 6144
+	mut w := []f32{len: rows * cols}
+	mut x := []f32{len: cols}
+	for i in 0 .. w.len { w[i] = f32(i % 13) * 0.125 }
+	for i in 0 .. x.len { x[i] = f32(i % 7) * 0.25 }
+	mut out := []f32{len: rows}
+	matvec(w, x, rows, cols, mut out) // warmup
+	sw := time.new_stopwatch()
+	for _ in 0 .. 3 {
+		matvec(w, x, rows, cols, mut out)
+	}
+	println('matvec 2048x6144 x3: ${sw.elapsed().milliseconds()}ms checksum=${out[0] + out[rows-1]}')
+}
+```
+
+```
+v -prod -cc gcc -o repro_def march_repro.v && ./repro_def        # ~8-9ms
+v -prod -cc gcc -cflags "-mavx2" -o repro_avx2 march_repro.v && ./repro_avx2  # ~21ms
+v -prod -cc gcc -cflags "-mavx2 -fno-tree-vectorize" -o repro_novec march_repro.v  # ~11ms
+```
+(checksums identical: `6906.5`; Ryzen 7 5800HS, gcc 15.2, V 0.5.2)
 
 ## Token throughput (sampling + serving path)
 
@@ -156,7 +264,6 @@ re-measure the floor on the serving box, not this laptop.
 
 ```sh
 v -prod -cc gcc -o /tmp/bench_rel tools/bench_kernels.v && /tmp/bench_rel
-v -prod -cc gcc -cflags "-O3 -fno-strict-aliasing -flto" -o /tmp/bench_lto tools/bench_kernels.v && /tmp/bench_lto
 python scripts/perf_baseline.py --kernels
 v -prod -cc gcc -o server.exe src
 python scripts/perf_baseline.py --api --v-exe .\server.exe

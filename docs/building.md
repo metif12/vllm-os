@@ -14,7 +14,6 @@ runtime dispatch) and strips asserts. Non-prod builds are pure V.
 |---|---|---|---|
 | `host-debug` | `v -cc gcc -g -o server src` | ~1.1 MB + asserts | fast iteration; no C layer linked |
 | `host-release` | `v -prod -cc gcc -o server src` | ~1.27 MB | default: portable AND fastest (SIMD dispatched) |
-| `host-native` | `v -prod -cc gcc -cflags "-O3 -fno-strict-aliasing -flto" -o server src` | ~1.20 MB | LTO cross-module inlining; within noise of release, smaller |
 | `host-minimal` | `v -cc gcc -cflags "-Os" -o server src` | ~1.11 MB | no C layer, asserts on; auditability over speed (~+4 ms p50) |
 | `qemu` | release build, then guest test | — | `run ./scripts/qemu_test.ps1 next` |
 | `bare-metal` | `v -prod -gc none -freestanding -cc gcc -o kernel/vinix-mini.elf src` | elf | experimental freestanding kernel-port |
@@ -23,11 +22,15 @@ runtime dispatch) and strips asserts. Non-prod builds are pure V.
 sh scripts/build.sh host-release  # linux/mac (mirrors the table)
 ```
 
-Custom `-cflags` REPLACE V's default flag set: any profile adding
-flags must restate `-O3 -fno-strict-aliasing` (bare `-O3` measured
-~2x slower). Never `-march=native` in committed scripts: it
-pessimize V's own codegen 3-5x (measured) AND the ISO must boot
-anywhere. SIMD does not need it — see `docs/perf.md` flag hygiene.
+Custom `-cflags` APPEND to V's defaults (verified via `-dump-c-flags`
++ identical binaries for `-O3` / `-O3 -fno-strict-aliasing` / no extra
+flags), so plain `-prod` is already optimal and a separate "native"
+profile was retired as redundant. Never `-march=native` on V code in
+committed scripts: gcc's SLP vectorizer turns the 4-accumulator matvec
+into a vpermd/vblendps swamp ~2.4x slower than scalar (minimal repro +
+asm in the vlang/v issue), AND the ISO must boot anywhere. SIMD comes
+from function-target attributes + runtime dispatch — see `docs/perf.md`
+flag hygiene.
 
 ## Host run (no weights needed)
 

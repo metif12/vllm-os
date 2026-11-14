@@ -31,6 +31,7 @@ import time
 fn C.vllm_has_avx2() int
 fn C.vllm_matvec_f32(w &f32, x &f32, out &f32, rows int, cols int)
 fn C.vllm_softmax_scaled_fast_f32(xs &f32, n int, scale f32)
+fn C.vllm_q4_0_dot_f32(qs &u8, x &f32, scale f32, n int) f32
 
 // ---------- pure-V copies (SYNC with src/infer) ----------
 @[direct_array_access]
@@ -174,7 +175,7 @@ fn v_sample_into(mut work []f32, mut idx []int, temp f32, top_k int, top_p f32, 
 	} else {
 		v_softmax_scaled(mut work, 1.0 / temp)
 	}
-	mut rng := BenchRng{state: if seed == 0 { 0x9e3779b97f4a7c15 } else { seed }}
+	mut rng := BenchRng{ state: if seed == 0 { 0x9e3779b97f4a7c15 } else { seed } }
 	k := if top_k > 0 && top_k < work.len { top_k } else { work.len }
 	if work.len > 256 {
 		v_heap_topk(work, k, mut idx)
@@ -311,10 +312,11 @@ fn tool_matvec_parallel(w []f32, x []f32, rows int, cols int, mut out []f32, nt 
 		return
 	}
 	mut wg := sync.new_waitgroup()
-	chunk := rows / nt
+	base := rows / nt
+	rem := rows % nt
 	for t in 0 .. nt {
-		r0 := t * chunk
-		r1 := if t == nt - 1 { rows } else { r0 + chunk }
+		r0 := t * base + (if t < rem { t } else { rem })
+		r1 := r0 + base + (if t < rem { 1 } else { 0 })
 		wg.add(1)
 		spawn tool_par_chunk(w, x, cols, r0, r1 - r0, mut out, mut wg)
 	}
@@ -357,6 +359,49 @@ fn bench_sample64() {
 	println('v sample 64-logit x20k exact: ${sw.elapsed().milliseconds()}ms')
 }
 
+// Fused Q4_0 dot (no materialized row) vs dequant-then-dot, over 2048
+// blocks x20: the traffic the v1 forward pays per FFN row.
+fn bench_q4_fused() {
+	nblocks := 2048
+	mut qs := []u8{len: 16 * nblocks}
+	for i in 0 .. qs.len {
+		qs[i] = u8((i * 37) % 256)
+	}
+	mut x := []f32{len: 32 * nblocks}
+	for i in 0 .. x.len {
+		x[i] = f32(i % 41) * 0.05 - 1.0
+	}
+	sw := time.new_stopwatch()
+	mut acc := f32(0)
+	unsafe {
+		for _ in 0 .. 20 {
+			for blk in 0 .. nblocks {
+				acc += C.vllm_q4_0_dot_f32(&qs[blk * 16], &x[blk * 32], 1.0, 32)
+			}
+		}
+	}
+	println('q4 fused C x20x${nblocks}blocks: ${sw.elapsed().microseconds()}us acc=${acc}')
+	// Materialize-then-dot reference (same bytes, extra 32-f32 store/row).
+	mut row := []f32{len: 32}
+	sw2 := time.new_stopwatch()
+	mut acc2 := f32(0)
+	for _ in 0 .. 20 {
+		for blk in 0 .. nblocks {
+			boff := blk * 16
+			for i in 0 .. 16 {
+				b := qs[boff + i]
+				row[i * 2] = f32(int(b & 0x0f) - 8)
+				row[i * 2 + 1] = f32(int((b >> 4) & 0x0f) - 8)
+			}
+			xoff := blk * 32
+			for i in 0 .. 32 {
+				acc2 += row[i] * x[xoff + i]
+			}
+		}
+	}
+	println('q4 materialize x20x${nblocks}blocks: ${sw2.elapsed().microseconds()}us acc=${acc2}')
+}
+
 fn bench_sample_vocab() {
 	n := 151936
 	mut logits := []f32{len: n}
@@ -383,6 +428,7 @@ fn main() {
 	bench_matvec_small()
 	bench_matvec_wide()
 	bench_matvec_parallel()
+	bench_q4_fused()
 	bench_sample64()
 	bench_sample_vocab()
 }

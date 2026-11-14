@@ -92,12 +92,16 @@ pub fn attention_step(q []f32, k &KVCache, v &KVCache, scale f32, mut probs []f3
 		return error('attention: probs holds ${probs.len}, need ${n}')
 	}
 	// scores = q.K^T * scale, fused max for the softmax that follows.
+	// Direct flat indexing (not k.row(i) per row): one validation above,
+	// then no per-row slice construction or error unwrap inside the
+	// per-token loop — at 4k ctx that was 8k slice+check pairs per head.
 	mut m := f32(-1e30)
+	kd := k.data
 	for i in 0 .. n {
-		kr := k.row(i)!
+		base := i * k.dim
 		mut s := f32(0)
 		for d in 0 .. q.len {
-			s += q[d] * kr[d]
+			s += q[d] * kd[base + d]
 		}
 		s *= scale
 		probs[i] = s
@@ -116,15 +120,16 @@ pub fn attention_step(q []f32, k &KVCache, v &KVCache, scale f32, mut probs []f3
 	for i in 0 .. n {
 		probs[i] *= inv
 	}
-	// out = P * V
+	// out = P * V (flat access, same order as the reference loop).
+	vd := v.data
 	for d in 0 .. out.len {
 		out[d] = 0
 	}
 	for i in 0 .. n {
-		vr := v.row(i)!
+		base := i * v.dim
 		pi := probs[i]
 		for d in 0 .. out.len {
-			out[d] += pi * vr[d]
+			out[d] += pi * vd[base + d]
 		}
 	}
 }

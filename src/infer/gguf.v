@@ -196,9 +196,11 @@ pub fn load_gguf_header(path string) !GgufModel {
 // small (tens of KB); blobs stay on disk / get mmap'd by the kernel port.
 // load_gguf_table is the boot-time index loader.
 pub fn load_gguf_table(path string) !GgufModel {
-	// Read enough to cover header + KV + tensor infos for a 1.7B model.
-	// 8 MB cap keeps a corrupt length field from OOMing the host.
-	data := read_file_bytes(path, 8 * 1024 * 1024)!
+	// Read enough to cover header + KV + tensor infos. Real files carry
+	// large KV arrays (Qwen3 tokenizers: 152k strings, ~2-8 MB), so the
+	// window is 32 MB; absurd length fields are still rejected below, so
+	// a corrupt file cannot OOM the host.
+	data := read_file_bytes(path, 32 * 1024 * 1024)!
 	mut r := Reader{
 		buf: data
 	}
@@ -239,7 +241,7 @@ pub fn load_gguf_table(path string) !GgufModel {
 		}
 		typ := unsafe { GgmlType(r.u32_le()!) }
 		offset := r.u64_le()!
-		size := ggml_type_size(typ) * numel(shape)
+		size := ggml_tensor_bytes(typ, numel(shape))
 		tensors << GgufTensorInfo{
 			name:   name
 			typ:    typ
@@ -276,8 +278,19 @@ fn read_kv_value(mut r Reader, typ u32) !string {
 		.array {
 			et := r.u32_le()!
 			n := r.u64_le()!
-			if n > 4096 {
+			if n > 4 << 20 {
 				return error('gguf: absurd array len ${n}')
+			}
+			if n > 4096 {
+				// Large arrays (tokenizer tokens/merges: 50-150k strings)
+				// are walked but not retained: the boot path only needs
+				// arch KV (tokenizer comes from the sidecar tokenizer.json).
+				// Offsets must still advance, so each element is parsed
+				// and discarded. Loading tokens from GGUF is follow-up.
+				for _ in 0 .. int(n) {
+					read_kv_value(mut r, et)!
+				}
+				return 'array[${n}]'
 			}
 			mut parts := []string{cap: int(n)}
 			for _ in 0 .. int(n) {
@@ -318,6 +331,25 @@ fn ggml_type_size(t GgmlType) u64 {
 		.f64 { return 8 }
 		else { return 1 }
 	}
+}
+
+// ggml_tensor_bytes is the exact byte size for fixed-block quant types
+// (Q4_0: 2 scale + 16 nibble bytes per 32 elems, etc.); unquantized types
+// fall back to ggml_type_size * n. K-quants use super-blocks and stay on
+// the estimate path (follow-up when a K-quant weight ships in v1).
+fn ggml_tensor_bytes(t GgmlType, n u64) u64 {
+	if t == .q4_0 || t == .q4_1 || t == .q5_0 || t == .q5_1 || t == .q8_0 || t == .q8_1 {
+		blocks := (n + 31) / 32
+		per := match t {
+			.q4_0 { 18 }
+			.q4_1 { 20 }
+			.q5_0 { 22 }
+			.q5_1 { 24 }
+			else { 34 }
+		}
+		return blocks * per
+	}
+	return ggml_type_size(t) * n
 }
 
 // find returns the tensor info by name or none.

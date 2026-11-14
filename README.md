@@ -111,9 +111,9 @@ sh scripts/build.sh host-release   # linux/mac
 sh scripts/build.sh bare-metal     # experimental freestanding kernel-port elf
 ```
 
-Profiles: `host-debug` / `host-release` / `host-native` (LTO) /
-`host-minimal` (no C layer) / `qemu` / `bare-metal`. tcc is never
-used; SIMD comes from function-target attributes + runtime dispatch
+Profiles: `host-debug` / `host-release` / `host-minimal` (no C layer) /
+`qemu` / `bare-metal`. tcc is never used; SIMD comes from
+function-target attributes + runtime dispatch
 (`VLLM_NO_SIMD=1` disables, `backend` in `vllm.json` selects).
 Full matrix + flag hygiene: [docs/building.md](docs/building.md).
 

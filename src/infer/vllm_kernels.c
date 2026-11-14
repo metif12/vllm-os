@@ -168,6 +168,16 @@ float vllm_q8_dot_f32(const signed char *qs, const float *x, float scale, int n)
 	return s * scale;
 }
 
+float vllm_q4_0_dot_f32(const unsigned char *qs, const float *x, float scale, int n) {
+	float s = 0.0f;
+	for (int i = 0; i < n; i += 2) {
+		unsigned char b = qs[i >> 1];
+		s += (float)((int)(b & 0x0f) - 8) * x[i];
+		s += (float)((int)((b >> 4) & 0x0f) - 8) * x[i + 1];
+	}
+	return s * scale;
+}
+
 void vllm_rmsnorm_f32(float *x, const float *w, int n, float eps) {
 	// Sum of squares in double (matches infer.rmsnorm_in_place exactly).
 	double ss = 0.0;

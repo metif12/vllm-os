@@ -46,6 +46,36 @@ fn test_q8_dot_c_matches() {
 	assert d < 1e-4 && d > -1e-4
 }
 
+fn test_q4_dot_matches_dequant_then_dot() {
+	mut qs := [16]u8{}
+	for i in 0 .. 16 {
+		lo := u8((i * 5 + 1) % 16)
+		hi := u8((i * 7 + 3) % 16)
+		qs[i] = lo | (hi << 4)
+	}
+	b := BlockQ40{
+		d:  u16(0x3c00) // 1.0 in f16
+		qs: qs
+	}
+	mut x := []f32{len: 32}
+	for i in 0 .. 32 {
+		x[i] = f32(i) * 0.1 - 1.0
+	}
+	// Reference: materialize then dot.
+	mut row := []f32{len: 32}
+	dequant_q4_0_row(b, mut row)
+	mut want := f32(0)
+	for i in 0 .. 32 {
+		want += row[i] * x[i]
+	}
+	got := q4_0_dot_row(b, x, 0)
+	d := got - want
+	assert d < 1e-4 && d > -1e-4
+	c := q4_0_dot_row_c(b, x, 0)
+	dc := c - want
+	assert dc < 1e-4 && dc > -1e-4
+}
+
 fn test_rmsnorm_c_matches() {
 	mut x := [f32(0.5), -1.5, 2.0, -0.25, 1.0, 0.75, -2.5, 3.0]
 	w := [f32(1.0), 0.5, 1.5, 1.0, 0.25, 2.0, 1.0, 0.75]

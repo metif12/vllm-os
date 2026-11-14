@@ -50,8 +50,9 @@ against vlib's unrelated `config` module instead of ours.
   once per `has_avx2()` call — boot/config time, never in the loop.)
 * No custom `-d` flags in `src/`: V errors on undeclared `$if` names,
   so feature switches use builtins (`$if prod`, `$if freestanding`)
-  + runtime (`VLLM_NO_SIMD`, `backend` knob). Custom `-cflags` REPLACE
-  V's defaults — restate `-O3 -fno-strict-aliasing`, never `-march=native`.
+  + runtime (`VLLM_NO_SIMD`, `backend` knob). Custom `-cflags` append
+  to V's defaults — plain `-prod` is already optimal; never
+  `-march=native` on V code (SLP shuffle swamp, see `docs/perf.md`).
 * `v fmt -w src` before every commit (CRLF/LF churn is the formatter's,
   ignore it). `v vet` warnings about missing docs on `pub` items are
   real — document them.

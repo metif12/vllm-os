@@ -69,8 +69,12 @@ pub fn rope_table(mut cos_sin []f32, pos int, head_dim int, theta f64) {
 }
 
 // matvec computes out = W*x where W is row-major [rows x cols] f32.
-// Four accumulators keep independent dependency chains so scalar backends
-// and the C compiler's autovectorizer stay fed.
+// Four accumulators keep independent dependency chains for scalar/OoO
+// backends. NOTE: do NOT expect the C compiler to autovectorize this
+// shape — under AVX2 gcc's SLP pass turns it into a shuffle-heavy mess
+// ~2.4x slower than scalar (measured, see docs/perf.md). SIMD comes from
+// the C kernel (function-target AVX2 + runtime dispatch), never from
+// -march=native on V code.
 @[direct_array_access]
 pub fn matvec(w []f32, x []f32, rows int, cols int, mut out []f32) {
 	for r in 0 .. rows {

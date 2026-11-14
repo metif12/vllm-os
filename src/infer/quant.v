@@ -7,6 +7,7 @@ module infer
 
 pub const qk4_0 = 32
 pub const qk8_0 = 32
+
 pub struct BlockQ40 {
 pub:
 	d  u16    // f16 bits
@@ -22,6 +23,12 @@ pub:
 // q80_scale decodes a Q8_0 block's f16 scale to f32 (shared by the V and
 // C dot paths so both stay bit-identical on the scale factor).
 pub fn q80_scale(block BlockQ80) f32 {
+	return f16bits_to_f32(block.d)
+}
+
+// q40_scale decodes a Q4_0 block's f16 scale to f32 (shared by the V and
+// C fused-dot paths, mirroring q80_scale).
+pub fn q40_scale(block BlockQ40) f32 {
 	return f16bits_to_f32(block.d)
 }
 
@@ -83,6 +90,23 @@ pub fn q8_0_dot_row(block BlockQ80, x []f32, x_off int) f32 {
 	mut s := f32(0)
 	for i in 0 .. 32 {
 		s += f32(block.qs[i]) * x[x_off + i]
+	}
+	return s * scale
+}
+
+// q4_0_dot_row computes dot(dequant(q_row_4bit), x_f32) * scale without
+// materializing the dequantized row: same fused idea as q8_0_dot_row,
+// but for the Q4_0 weights the v1 model ships (1.1 GB traffic per token
+// at Q4_K_M scale; fused saves a full hidden-size f32 store per row).
+// Nibble order matches dequant_q4_0_row exactly: lo first, then hi.
+@[direct_array_access]
+pub fn q4_0_dot_row(block BlockQ40, x []f32, x_off int) f32 {
+	scale := f16bits_to_f32(block.d)
+	mut s := f32(0)
+	for i in 0 .. 16 {
+		b := block.qs[i]
+		s += f32(int(b & 0x0f) - 8) * x[x_off + i * 2]
+		s += f32(int((b >> 4) & 0x0f) - 8) * x[x_off + i * 2 + 1]
 	}
 	return s * scale
 }

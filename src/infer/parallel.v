@@ -67,10 +67,14 @@ pub fn matvec_parallel(w []f32, x []f32, rows int, cols int, mut out []f32) {
 			return
 		}
 		mut wg := sync.new_waitgroup()
-		chunk := rows / n
+		// Balanced partition: distribute rows % n remainder rows so block
+		// sizes differ by at most one (same fix as VSL gemv_n: a naive
+		// chunk + last-takes-rest leaves one worker with the whole tail).
+		base := rows / n
+		rem := rows % n
 		for t in 0 .. n {
-			r0 := t * chunk
-			r1 := if t == n - 1 { rows } else { r0 + chunk }
+			r0 := t * base + (if t < rem { t } else { rem })
+			r1 := r0 + base + (if t < rem { 1 } else { 0 })
 			wg.add(1)
 			spawn matvec_chunk(w, x, rows, cols, r0, r1 - r0, mut out, mut wg)
 		}

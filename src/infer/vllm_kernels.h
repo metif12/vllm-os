@@ -25,6 +25,12 @@ void vllm_matvec_f32(const float *w, const float *x, float *out, int rows, int c
 // dot(q_row_int8, x_f32) * scale over n elems (Q8_0 block rows use n=32).
 float vllm_q8_dot_f32(const signed char *qs, const float *x, float scale, int n);
 
+// dot(dequant(q_row_4bit), x_f32) * scale over n elems (Q4_0 block rows
+// use n=32, qs holds n/2 packed bytes, lo nibble first). Scalar C;
+// AVX2 nibble-unpack is follow-up (the fused win is the missing store,
+// not the SIMD width).
+float vllm_q4_0_dot_f32(const unsigned char *qs, const float *x, float scale, int n);
+
 // x[i] = x[i] * w[i] / sqrt(mean(x^2) + eps), in place.
 void vllm_rmsnorm_f32(float *x, const float *w, int n, float eps);
 

@@ -1,5 +1,7 @@
 module infer
 
+import os
+
 // Agreement + threshold tests for the threaded backend (parallel.v).
 // Timing is deliberately NOT gated here (CI boxes vary); throughput is
 // measured in tools/bench_kernels.v and reported in docs/perf.md.
@@ -78,4 +80,38 @@ fn test_parallel_threshold_consts_sane() {
 	assert min_cols_parallel >= 128
 	assert parallel_threads() >= 1
 	assert parallel_threads() <= 64
+}
+
+// Remainder rows must be spread across workers (blocks differ by at most
+// one), with full coverage and no overlap. rows=2501 with 8 requested
+// workers resolves to n=4, base=625, rem=1 — the old last-takes-rest
+// split degenerates the same way the VSL gemv_n review caught.
+fn test_parallel_remainder_matches_serial() {
+	orig := os.getenv_opt('VLLM_THREADS')
+	defer {
+		if v := orig {
+			os.setenv('VLLM_THREADS', v, true)
+		} else {
+			os.unsetenv('VLLM_THREADS')
+		}
+	}
+	os.setenv('VLLM_THREADS', '8', true)
+	rows := 2501
+	cols := 1024
+	mut w := []f32{len: rows * cols}
+	mut x := []f32{len: cols}
+	for i in 0 .. w.len {
+		w[i] = f32(i % 13) * 0.125 - 0.5
+	}
+	for i in 0 .. x.len {
+		x[i] = f32(i % 7) * 0.25 - 0.125
+	}
+	mut a := []f32{len: rows}
+	mut b := []f32{len: rows}
+	matvec(w, x, rows, cols, mut a)
+	matvec_parallel(w, x, rows, cols, mut b)
+	for i in 0 .. rows {
+		d := b[i] - a[i]
+		assert d < 1e-4 && d > -1e-4
+	}
 }

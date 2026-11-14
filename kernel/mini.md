@@ -56,14 +56,13 @@ budget by ~2 GB. Raise only on ≥16 GB guests.
 All builds use an optimizing C compiler (`-cc gcc`) in `-prod`
 (`-O3`, asserts stripped). tcc is never used: scalar C fallbacks exist
 so every profile compiles anywhere, and AVX2 comes from function-target
-attributes + runtime dispatch — never `-march=native`, which measured
-3–5x slower on V's own codegen (see `docs/perf.md`).
+attributes + runtime dispatch — never `-march=native`, which gcc's SLP
+vectorizer turns into a shuffle swamp ~2.4x slower than scalar on V's
+emitted loops (minimal repro + asm in `docs/perf.md`).
 
 * Host release: `v -prod -cc gcc -o server src` (portable AND fastest:
-  AVX2-dispatched C kernels, best V codegen).
-* Host native (LTO): `v -prod -cc gcc -cflags "-O3 -fno-strict-aliasing -flto" -o server src`.
-  Custom `-cflags` REPLACE V's defaults, so `-O3 -fno-strict-aliasing`
-  must be restated (bare `-O3` measured ~2x slower).
+  AVX2-dispatched C kernels, best V codegen; custom `-cflags` append to
+  defaults, and extra flags measured identical — no "native" profile needed).
 * Host minimal (no C layer): `v -cc gcc -cflags "-Os" -o server src`.
 * Kernel port adds: `-gc none -freestanding`, arena allocator, no `os`/`time` wall-clock in token loop.
 * Never `-march=native` in committed scripts: the ISO must boot anywhere.

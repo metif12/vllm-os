@@ -17,22 +17,25 @@ import os
 //  3. Config: `backend: cpu | cpu-blocked` never touches SIMD; `auto`
 //     picks SIMD only when has_avx2() is true.
 //
-// Flag hygiene: custom -cflags REPLACE V's default flag set, so any
-// profile adding -cflags must restate `-O3 -fno-strict-aliasing`
-// (bare -O3 measured ~2x slower). Never -march=native: it pessimize
-// V's own codegen 3-5x (measured) — the attributes already cover SIMD.
+// Flag hygiene (all measured, see docs/perf.md): custom -cflags APPEND
+// to V's defaults (verified via -dump-c-flags + identical binaries), so
+// plain `-prod -cc gcc` is already optimal. Never -march=native on V
+// code: gcc's SLP vectorizer turns the 4-accumulator loop above into a
+// vpermd/vblendps swamp ~2.4x slower than scalar (minimal repro + asm in
+// the vlang/v issue). The attributes already cover SIMD.
 
 $if prod {
-#flag -I @VMODROOT/src/infer
-#flag @VMODROOT/src/infer/vllm_kernels.c
-#include "vllm_kernels.h"
+	#flag -I @VMODROOT/src/infer
+	#flag @VMODROOT/src/infer/vllm_kernels.c
+	#include "vllm_kernels.h"
 
-fn C.vllm_has_avx2() int
-fn C.vllm_matvec_f32(w &f32, x &f32, out &f32, rows int, cols int)
-fn C.vllm_q8_dot_f32(qs &i8, x &f32, scale f32, n int) f32
-fn C.vllm_rmsnorm_f32(x &f32, w &f32, n int, eps f64)
-fn C.vllm_dot_f32(a &f32, b &f32, n int) f32
-fn C.vllm_softmax_scaled_fast_f32(xs &f32, n int, scale f32)
+	fn C.vllm_has_avx2() int
+	fn C.vllm_matvec_f32(w &f32, x &f32, out &f32, rows int, cols int)
+	fn C.vllm_q8_dot_f32(qs &i8, x &f32, scale f32, n int) f32
+	fn C.vllm_q4_0_dot_f32(qs &u8, x &f32, scale f32, n int) f32
+	fn C.vllm_rmsnorm_f32(x &f32, w &f32, n int, eps f64)
+	fn C.vllm_dot_f32(a &f32, b &f32, n int) f32
+	fn C.vllm_softmax_scaled_fast_f32(xs &f32, n int, scale f32)
 }
 
 // has_avx2 reports whether the C SIMD fast paths are usable right now:
@@ -98,6 +101,20 @@ pub fn q8_0_dot_row_c(block BlockQ80, x []f32, x_off int) f32 {
 		}
 	}
 	return q8_0_dot_row(block, x, x_off)
+}
+
+// q4_0_dot_row_c is the C version of q4_0_dot_row (fused 4-bit dot *
+// scale, no materialized row). Scalar C today (nibble unpack in AVX2 is
+// follow-up); gated like the Q8 bridge so non-prod stays pure V.
+@[direct_array_access]
+pub fn q4_0_dot_row_c(block BlockQ40, x []f32, x_off int) f32 {
+	$if prod {
+		if has_avx2() {
+			return C.vllm_q4_0_dot_f32(&block.qs[0], &x[x_off], q40_scale(block),
+				qk4_0)
+		}
+	}
+	return q4_0_dot_row(block, x, x_off)
 }
 
 // rmsnorm_c normalizes x with weight w and eps via the C kernel.
