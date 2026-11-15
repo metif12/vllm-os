@@ -284,7 +284,7 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 			f.up[i] *= f.gate[i]
 		}
 		if lt.down_typ == .q4_1 {
-			q4_1_matvec(lt.down, h, inter, f.up, mut f.down)
+			q4_1_matvec_c(lt.down, h, inter, f.up, mut f.down)
 		} else {
 			q4_0_matvec_c(lt.down, h, inter, f.up, mut f.down)
 		}

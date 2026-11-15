@@ -37,6 +37,19 @@ float vllm_q4_0_dot_f32(const unsigned char *qs, const float *x, float scale, in
 void vllm_q4_0_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
 	int cols);
 
+// dot(dequant(q_row_4bit_unsigned), x_f32): Q4_1 block rows use n=32,
+// qs holds 16 packed bytes (SPLIT-HALF: byte i carries q[i] low and
+// q[i+16] high, values 0..15 unsigned), result = dot(q,x)*scale +
+// sum(x)*min — mirrors infer.q4_1_dot_row / GGML vec_dot_q4_1.
+float vllm_q4_1_dot_f32(const unsigned char *qs, const float *x, float scale, float min);
+
+// out = W * x, W row-major Q4_1 [rows x cols] (cols must divide 32).
+// data holds rows*cols/32 packed 20-byte blocks (f16 scale + f16 min +
+// 16 split-half nibble bytes), the exact layout infer.q4_1_matvec
+// consumes.
+void vllm_q4_1_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
+	int cols);
+
 // out = W * x, W row-major Q6_K [rows x cols] (cols must divide 256).
 // data holds rows*cols/256 packed 210-byte super-blocks
 // (ql[128], qh[64], scales[16], f16 d), matching infer.q6_k_dot_block.

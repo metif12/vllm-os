@@ -33,7 +33,9 @@ $if prod {
 	fn C.vllm_matvec_f32(w &f32, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_q8_dot_f32(qs &i8, x &f32, scale f32, n int) f32
 	fn C.vllm_q4_0_dot_f32(qs &u8, x &f32, scale f32, n int) f32
+	fn C.vllm_q4_1_dot_f32(qs &u8, x &f32, scale f32, min f32) f32
 	fn C.vllm_q4_0_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
+	fn C.vllm_q4_1_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_q6_k_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_rmsnorm_f32(x &f32, w &f32, n int, eps f64)
 	fn C.vllm_dot_f32(a &f32, b &f32, n int) f32
@@ -115,6 +117,35 @@ pub fn q4_0_dot_row_c(block BlockQ40, x []f32, x_off int) f32 {
 		}
 	}
 	return q4_0_dot_row(block, x, x_off)
+}
+
+// q4_1_dot_row_c is the C version of q4_1_dot_row (fused unsigned-4-bit
+// dot * scale + sum(x) * min, no materialized row). Split-half layout,
+// AVX2 nibble-unpack with scalar fallback; gated like the Q4_0 bridge.
+@[direct_array_access]
+pub fn q4_1_dot_row_c(block BlockQ41, x []f32, x_off int) f32 {
+	$if prod {
+		if has_avx2() {
+			return C.vllm_q4_1_dot_f32(&block.qs[0], &x[x_off], q41_scale(block), q41_min(block))
+		}
+	}
+	return q4_1_dot_row(block, x, x_off)
+}
+
+// q4_1_matvec_c computes out = W*x for a Q4_1 row-major matrix via the C
+// kernel, or the pure-V kernel outside -prod / without AVX2 / with
+// VLLM_NO_SIMD=1. Same shape contract as q4_1_matvec (cols divides 32).
+@[direct_array_access]
+pub fn q4_1_matvec_c(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q4_1_matvec_f32(data.data, x.data, out.data, rows, cols)
+			}
+			return
+		}
+	}
+	q4_1_matvec(data, rows, cols, x, mut out)
 }
 
 // q4_0_matvec_c computes out = W*x for a Q4_0 row-major matrix via the C

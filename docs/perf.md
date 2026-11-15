@@ -53,6 +53,8 @@ is the only hardware these numbers may be quoted for.
 | q4_0 dot 2048 blocks x20, **fused C AVX2** (split-half) | **~183 us** | — | ~4956 us materialize-then-dot (same bytes) | **fused 27x** (missing 32-f32 store + SIMD; the strided materialize reference has worse locality than the old adjacent one, so read this as fused-vs-naive, not SIMD-alone) |
 | q4_0 matvec 3072x1024 (FFN gate scale), pure V | ~4 ms | — | — | baseline (fused, split-half, no materialize) |
 | q4_0 matvec 3072x1024, **C AVX2** | **<1 ms** (timer floor) | — | — | **V 4x+** (epi64 nibble-unpack + FMA; real-data maxdiff 0.0) |
+| q4_1 matvec 1024x3072 (FFN down scale), pure V | ~4 ms (3.6-4.3) | — | — | baseline (fused split-half + xsum*min, no materialize) |
+| q4_1 matvec 1024x3072, **C AVX2** | **~0.7 ms** (14 ms/20) | — | — | **V ~5-6x** (unsigned-nibble unpack + in-register xsum; real-data maxdiff 0.0) |
 | q6_k matvec 151936x1024 (vocab head), pure V | ~230 ms | — | — | baseline (warm box; cold-start 2.2 s is page-cache) |
 | q6_k matvec 151936x1024, **C AVX2** | **~24 ms** | — | — | **V 9.5x** (16-lane unpack, per-group scale broadcast; maxdiff ~4e-6) |
 
@@ -83,6 +85,10 @@ How the wins happened, in order:
    Serial 106-118 ms -> threaded 89-99 ms (~15% on full decode; the
    head is ~25% of the token). `VLLM_THREADS=1` / freestanding pins
    the serial kernel — the bare-metal guest stays single-threaded.
+9. **Q4_1 AVX2 matvec** (`vllm_q4_1_matvec_f32`): FFN down 1024x3072
+   ~4 ms pure-V -> ~0.7 ms (~5-6x), real-data maxdiff 0.0. The 3/28
+   Q4_1 down-projections stop being the slow layers: serial decode
+   ~118 ms -> ~100 ms, threaded ~99 ms -> ~80-90 ms (~10x cumulative).
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
@@ -101,28 +107,31 @@ see below). Best-of-N in ms/token; ranges are the samples, not CI gates.
 
 | path | prefill 2 tok | decode/token | vs warm pure-V |
 |---|---|---|---|
-| pure-V (`VLLM_NO_SIMD=1`, serial) | ~1.8 s | ~900 ms (904-977) | baseline |
-| C AVX2, serial (`VLLM_THREADS=1`) | ~0.28 s | ~118 ms (118-139) | **7.6x** |
-| C AVX2, threaded (default 4) | ~0.22-0.26 s | **~99 ms** (99-121, best 99) | **~9x** |
+| pure-V (`VLLM_NO_SIMD=1`, serial) | ~1.8 s | ~920 ms (922-1032) | baseline |
+| C AVX2, serial (`VLLM_THREADS=1`) | ~0.20-0.29 s | ~100 ms (98-108, best 98) | **~9x** |
+| C AVX2, threaded (default 4) | ~0.17-0.23 s | **~85 ms** (80-96, best 80) | **~10-11x** |
 
 Scratch prof harness (same box, same day, back-to-back, not in-tree):
-threaded 89 ms / serial 106 ms / prefill 183-217 ms — same ballpark as
-the in-tree probe above (89-99 ms threaded, 106-118 ms serial). Quote
-**~90-100 ms threaded, ~110-120 ms serial, ~900 ms pure-V**; the range is
-harness + box variance, not a code change. Cumulative stage-1+2+3:
-**870 ms → ~99 ms ≈ 9x** (warm pure-V → threaded AVX2).
+q4_1 down 1024x3072 pure-V 3.6-4.3 ms/matvec vs C AVX2 0.7 ms
+(14 ms/20, maxdiff 0.0 on real weights) — the ~10 ms/token saving
+above is that kernel times the 3 Q4_1 layers, not box variance.
+Quote **~80-95 ms threaded, ~100 ms serial, ~920 ms pure-V**.
+Cumulative stage-1+2+3+4: **870 ms → ~85 ms ≈ 10x** (warm pure-V →
+threaded AVX2).
 
 Correctness held at every step (same box, paired): greedy 8-step ids
-identical (1096, 374, 264, 4285, 3110, 315, 1246, 311), PPL 8828617 vs
-8828611 (Δ6 micro-units), vocab maxdiff ~4.3e-6, gate maxdiff 0.0, musl
-serial-pin guest bit-identical (`MUSL-SERIAL-IDENTICAL`). Agreement tests
-green non-prod + `-prod`; `vet` + `fmt -verify` clean.
+identical (1096, 374, 264, 4285, 3110, 315, 1246, 311), re-verified
+post-Q4_1 AVX2 vs pure-V (logit sums rel Δ ~5e-8); PPL 8828617 vs
+8828611 (Δ6 micro-units), vocab maxdiff ~4.3e-6, gate maxdiff 0.0,
+Q4_1 down maxdiff 0.0 (real weights), musl serial-pin guest
+bit-identical (`MUSL-SERIAL-IDENTICAL`). Agreement tests green non-prod
++ `-prod`; `vet` + `fmt -verify` clean.
 
 For context, llama.cpp on the same file/box does ~63 tok/s (~16 ms/token)
-— about 6x faster than the current V forward. Expected: llama blocks,
+— about 5x faster than the current V forward. Expected: llama blocks,
 packs, and reuses across layers in ways this forward does not yet. The
-remaining levers are Q4_1 AVX2 (3/28 down-projections, ~3 ms each) and
-layer fork-join, then host-side profiling against that 16 ms line.
+remaining levers are Q4_0 threading / layer fork-join (profile-gated),
+then host-side profiling against that 16 ms line.
 
 ## Serving overhead (`POST /v1/chat/completions`, n=200, warmed up)
 
@@ -150,9 +159,10 @@ here — serve release.
 1. **Kernels: ahead, every row.** V wins all 8 FP32 rows: 1.3x on small
    matvec, 1.75x on FFN-scale matvec (threads + AVX2), 28x / 1.3x /
    5.5x across sampler scales. Quantized rows are V-vs-V (no NumPy
-   equivalent): Q4_0 AVX2 4x+ on gate scale, Q6_K AVX2 9.5x on vocab
-   scale. The old "matvec is the gap" verdict is closed for FP32;
-   current decode work is quantized-matvec + threading shaped.
+   equivalent): Q4_0 AVX2 4x+ on gate scale, Q4_1 AVX2 ~5-6x on down
+   scale, Q6_K AVX2 9.5x on vocab scale. The old "matvec is the gap"
+   verdict is closed for FP32; current decode work is quantized-matvec
+   + threading shaped.
 2. **Serving overhead is a wash** (unchanged verdict, new numbers).
    Both medians ~1-1.5 ms on quiet runs, both p99 ~25 ms. The
    spawn-per-request + GC-pause p99 theory from the old table did not
@@ -161,12 +171,12 @@ here — serve release.
    28x on small logits; fast beats it 5.5x. Real-logit validation
    (phase 1b gate) passed without sampler changes — no further work
    planned here.
-4. **Quantized dots/matvecs are fused.** Q4_0 rows never materialize:
-   fused `q4_0_dot_row` beats dequant-then-dot, and the AVX2 matvecs
-   (`q4_0_matvec_c`, `q6_k_matvec_c`) keep that fusion in SIMD form —
-   gate <1 ms, vocab ~24 ms. This is the traffic shape the forward pays
-   per row; the win is the missing store + unpack-in-register, not just
-   width.
+4. **Quantized dots/matvecs are fused.** Q4_0/Q4_1 rows never
+   materialize: fused `q4_0_dot_row` beats dequant-then-dot, and the
+   AVX2 matvecs (`q4_0_matvec_c`, `q4_1_matvec_c`, `q6_k_matvec_c`)
+   keep that fusion in SIMD form — gate <1 ms, down ~0.7 ms, vocab
+   ~24 ms. This is the traffic shape the forward pays per row; the win
+   is the missing store + unpack-in-register, not just width.
 5. **Attention lost its per-row tax.** `attention_step` indexes the KV
    arenas flat instead of `k.row(i)!` per row: identical checksums,
    4 ms -> ~3 ms at n=1024 x20 and 4 ms -> ~2-3 ms at n=4096 x5
@@ -178,11 +188,11 @@ here — serve release.
    rows=2501/VLLM_THREADS=8 remainder test in `parallel_test.v`
    (FP32 + Q6_K paths).
 7. **Full decode is measured, not modeled.** `tools/forward_bench.v`
-   gives ~90-100 ms/token threaded, ~110-120 ms serial, ~900 ms pure-V
+   gives ~80-95 ms/token threaded, ~100 ms serial, ~920 ms pure-V
    on Qwen3-0.6B-Q4_0 (same box). Greedy ids identical to the
    pre-kernel forward, PPL within micro-units, musl guest
    bit-identical. Against llama.cpp's ~16 ms/token on the same file,
-   the gap is ~6x — the documented next levers, not a measurement
+   the gap is ~5x — the documented next levers, not a measurement
    artifact.
 
 ## External baselines: llama.cpp on real small models (same box)
@@ -204,8 +214,8 @@ sizes use exact block math for Q4_0/Q4_1/Q5/Q8_0. Analytic decode
 ceilings from weight traffic (~0.36 GB/token Qwen, ~0.73 GB/token
 Llama at ~20 GB/s effective) land at ~55 and ~27 tok/s — llama.cpp sits
 at or above those lines. End-to-end V tok/s is now quotable (phase 1b
-landed): **~10 tok/s** on Qwen3-0.6B-Q4_0 (99 ms/token threaded, same
-box) vs llama.cpp's ~63 tok/s on the same file — a ~6x gap that sizes
+landed): **~12 tok/s** on Qwen3-0.6B-Q4_0 (80 ms/token threaded, same
+box) vs llama.cpp's ~63 tok/s on the same file — a ~5x gap that sizes
 the remaining kernel/threading work. Known gap found while probing:
 `config_from_kv` only understands `qwen3.*` keys, so the Llama arch line
 above prints Qwen defaults (hidden right, layers/intermediate wrong) —
@@ -299,9 +309,9 @@ record; the forward row is the one to quote for model speed:
 
 | stage | V | Python/NumPy | how measured |
 |---|---|---|---|
-| full decode, Qwen3-0.6B-Q4_0 (threaded) | **~10 tok/s** (99 ms best, 99-121 range) | llama.cpp ~63 tok/s same file/box | `tools/forward_bench.v`, `-prod`, warm, back-to-back |
-| full decode, same file (serial AVX2) | ~8.5 tok/s (118 ms best) | — | `VLLM_THREADS=1`, same probe |
-| full decode, same file (pure-V) | ~1.1 tok/s (904 ms best) | — | `VLLM_NO_SIMD=1`, same probe |
+| full decode, Qwen3-0.6B-Q4_0 (threaded) | **~12 tok/s** (80 ms best, 80-96 range) | llama.cpp ~63 tok/s same file/box | `tools/forward_bench.v`, `-prod`, warm, back-to-back |
+| full decode, same file (serial AVX2) | ~10 tok/s (98 ms best, 98-108) | — | `VLLM_THREADS=1`, same probe |
+| full decode, same file (pure-V) | ~1.1 tok/s (922 ms best, 922-1032) | — | `VLLM_NO_SIMD=1`, same probe |
 | 64-logit sample | **~650k tok/s** (31 ms / 20k iters) | 23k tok/s (869 ms) | `sample_into` vs equivalent NumPy sampler, warmed up |
 | vocab-scale sample (151936), exact | ~1000 tok/s (20 ms / 20 iters) | ~730 tok/s (28 ms) | same, incl. full softmax + heap top-k/p |
 | vocab-scale sample, fast | **~4000 tok/s** (5 ms / 20 iters) | ~730 tok/s | approx-exp + heap top-k/p |
@@ -369,7 +379,8 @@ same-model, same-box Python-side pair and the remaining V levers:
 1. Python side: `llama-cpp-python` (or `llama-bench` TG line) on the
    exact `Qwen3-0.6B-Q4_0.gguf` file measured above — the llama.cpp
    binary row (~63 tok/s) is the stand-in until then.
-2. V levers: Q4_1 AVX2 (3/28 down-projections) and layer fork-join,
-   profiled against the 16 ms/token llama line.
+2. V levers: Q4_0 threading / layer fork-join (profile-gated — Q4_1
+   AVX2 landed this round, ~10 ms/token), then blocking/packing work
+   against the 16 ms/token llama line.
 3. Serve path: real-model `POST /v1/chat/completions` tok/s (stub rows
    only cover HTTP overhead, not the forward).

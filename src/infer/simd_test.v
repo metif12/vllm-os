@@ -104,6 +104,67 @@ fn test_q4_matvec_c_matches_v() {
 	}
 }
 
+fn test_q41_dot_c_matches() {
+	mut qs := [16]u8{}
+	for i in 0 .. 16 {
+		lo := u8((i * 5 + 1) % 16)
+		hi := u8((i * 7 + 3) % 16)
+		qs[i] = lo | (hi << 4)
+	}
+	b := BlockQ41{
+		d:  u16(0x3800) // 0.5 in f16 (realistic scale, not ±127)
+		m:  u16(0xb800) // -0.5 in f16 (realistic offset)
+		qs: qs
+	}
+	mut x := []f32{len: 32}
+	for i in 0 .. 32 {
+		x[i] = f32(i) * 0.1 - 1.0
+	}
+	// Reference: materialize then dot.
+	mut row := []f32{len: 32}
+	dequant_q4_1_row(b, mut row)
+	mut want := f32(0)
+	for i in 0 .. 32 {
+		want += row[i] * x[i]
+	}
+	got := q4_1_dot_row(b, x, 0)
+	d := got - want
+	assert d < 1e-4 && d > -1e-4
+	c := q4_1_dot_row_c(b, x, 0)
+	dc := c - want
+	assert dc < 1e-3 && dc > -1e-3
+}
+
+fn test_q41_matvec_c_matches_v() {
+	rows := 5
+	cols := 64
+	mut data := []u8{len: rows * (cols / 32) * 20}
+	for i in 0 .. data.len {
+		data[i] = u8((i * 37 + 11) % 256)
+	}
+	for r in 0 .. rows {
+		for b in 0 .. cols / 32 {
+			off := (r * (cols / 32) + b) * 20
+			data[off] = u8(0x00)
+			data[off + 1] = u8(0x38) // scale 0.5
+			data[off + 2] = u8(0x00)
+			data[off + 3] = u8(0xb8) // min -0.5
+		}
+	}
+	mut x := []f32{len: cols}
+	for i in 0 .. x.len {
+		x[i] = f32(i % 17) * 0.05 - 0.4
+	}
+	mut a := []f32{len: rows}
+	mut b := []f32{len: rows}
+	q4_1_matvec(data, rows, cols, x, mut a)
+	q4_1_matvec_c(data, rows, cols, x, mut b)
+	for i in 0 .. rows {
+		d := b[i] - a[i]
+		assert d < 1e-3 && d > -1e-3
+	}
+}
+
 fn test_q6k_matvec_c_matches_v() {
 	rows := 3
 	cols := 256

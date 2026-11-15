@@ -353,6 +353,112 @@ void vllm_q4_0_matvec_f32(const unsigned char *data, const float *x, float *out,
 	}
 }
 
+#if VLLM_HAVE_SIMD
+// One 32-elem split-half Q4_1 block dot (no scale/min applied by caller
+// confusion — applied here): byte i holds q[i] (low nibble, 0..15) and
+// q[i+16] (high nibble). Same epi64 unpack trick as the Q4_0 path.
+// Returns dot(q,x)*scale + sum(x)*min, mirroring infer.q4_1_dot_row.
+static VLLM_AVX2_FN float q4_1_block_dot_avx2(const unsigned char *qs, const float *x,
+	float scale, float min) {
+	__m128i q = _mm_loadu_si128((const __m128i *)qs);
+	__m128i m15 = _mm_set1_epi8(0x0f);
+	__m128i lo = _mm_and_si128(q, m15);
+	__m128i hi = _mm_and_si128(_mm_srli_epi64(q, 4), m15);
+	__m256i lo0 = _mm256_cvtepi8_epi32(lo);
+	__m256i lo1 = _mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8));
+	__m256i hi0 = _mm256_cvtepi8_epi32(hi);
+	__m256i hi1 = _mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8));
+	__m256 f0 = _mm256_cvtepi32_ps(lo0);
+	__m256 f1 = _mm256_cvtepi32_ps(lo1);
+	__m256 f2 = _mm256_cvtepi32_ps(hi0);
+	__m256 f3 = _mm256_cvtepi32_ps(hi1);
+	__m256 x0 = _mm256_loadu_ps(x);
+	__m256 x1 = _mm256_loadu_ps(x + 8);
+	__m256 x2 = _mm256_loadu_ps(x + 16);
+	__m256 x3 = _mm256_loadu_ps(x + 24);
+	__m256 a0 = _mm256_fmadd_ps(f0, x0, _mm256_mul_ps(f1, x1));
+	__m256 a1 = _mm256_fmadd_ps(f2, x2, _mm256_mul_ps(f3, x3));
+	__m256 s = _mm256_add_ps(a0, a1);
+	__m128 hi128 = _mm256_extractf128_ps(s, 1);
+	__m128 lo128 = _mm256_castps256_ps128(s);
+	__m128 v = _mm_add_ps(lo128, hi128);
+	v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+	v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
+	float dot = _mm_cvtss_f32(v);
+	// sum(x) over the 32 lanes for the offset term.
+	__m256 xs = _mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3));
+	__m128 xhi = _mm256_extractf128_ps(xs, 1);
+	__m128 xlo = _mm256_castps256_ps128(xs);
+	__m128 xv = _mm_add_ps(xlo, xhi);
+	xv = _mm_add_ps(xv, _mm_movehl_ps(xv, xv));
+	xv = _mm_add_ss(xv, _mm_shuffle_ps(xv, xv, 1));
+	float xsum = _mm_cvtss_f32(xv);
+	return dot * scale + xsum * min;
+}
+#endif
+
+float vllm_q4_1_dot_f32(const unsigned char *qs, const float *x, float scale, float min) {
+#if VLLM_HAVE_SIMD
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		return q4_1_block_dot_avx2(qs, x, scale, min);
+	}
+#endif
+	// Scalar mirror of infer.q4_1_dot_row (same order, same rounding).
+	float s = 0.0f;
+	float xsum = 0.0f;
+	for (int i = 0; i < 16; i++) {
+		unsigned char b = qs[i];
+		float lo = (float)(int)(b & 0x0f);
+		float hi = (float)(int)((b >> 4) & 0x0f);
+		s += lo * x[i] + hi * x[i + 16];
+		xsum += x[i] + x[i + 16];
+	}
+	return s * scale + xsum * min;
+}
+
+void vllm_q4_1_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
+	int cols) {
+	int bpr = cols / 32;
+#if VLLM_HAVE_SIMD
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		for (int r = 0; r < rows; r++) {
+			float s = 0.0f;
+			const unsigned char *row = data + (size_t)r * (size_t)bpr * 20;
+			for (int b = 0; b < bpr; b++) {
+				const unsigned char *blk = row + (size_t)b * 20;
+				s += q4_1_block_dot_avx2(blk + 4, x + (size_t)b * 32,
+					vllm_f16_le_to_f32(blk), vllm_f16_le_to_f32(blk + 2));
+			}
+			out[r] = s;
+		}
+		return;
+	}
+#endif
+	// Scalar mirror of infer.q4_1_matvec: per-block fused dot (same order
+	// and rounding as the V kernel).
+	for (int r = 0; r < rows; r++) {
+		float s = 0.0f;
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 20;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 20;
+			float scale = vllm_f16_le_to_f32(blk);
+			float min = vllm_f16_le_to_f32(blk + 2);
+			const float *xb = x + (size_t)b * 32;
+			float d = 0.0f;
+			float xsum = 0.0f;
+			for (int i = 0; i < 16; i++) {
+				unsigned char q = blk[4 + i];
+				float lo = (float)(int)(q & 0x0f);
+				float hi = (float)(int)((q >> 4) & 0x0f);
+				d += lo * xb[i] + hi * xb[i + 16];
+				xsum += xb[i] + xb[i + 16];
+			}
+			s += d * scale + xsum * min;
+		}
+		out[r] = s;
+	}
+}
+
 void vllm_q6_k_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
 	int cols) {
 	int bpr = cols / 256;
