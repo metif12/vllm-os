@@ -304,11 +304,9 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 	}
 	emb := tensor_bytes(f.blob, f.gguf, 'token_embd.weight')!
 	if emb_info.typ == .q6_k {
-		// NOTE: the C Q6_K path is correct (bit-exact, agreement-tested)
-		// but its scalar loop trails the V kernel ~2x on this box, so
-		// the forward stays on V until the AVX2 Q6_K kernel lands.
-		// The C entry remains for the bridge test + that follow-up.
-		q6_k_matvec(emb, f.logits.len, h, f.normed, mut f.logits)
+		// C AVX2 Q6_K (~9.5x over V on Ryzen 5800HS, maxdiff ~4e-6);
+		// pure-V fallback outside -prod / without AVX2 / VLLM_NO_SIMD=1.
+		q6_k_matvec_c(emb, f.logits.len, h, f.normed, mut f.logits)
 	} else {
 		i8_matvec(emb, f.logits.len, h, f.normed, mut f.logits)
 	}

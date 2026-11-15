@@ -127,6 +127,69 @@ static VLLM_AVX2_FN float dot_avx2(const float *a, const float *b, int n) {
 	}
 	return total;
 }
+
+// One 128-position Q6_K half-block dot (no super-scale applied): 4 groups
+// of 16 lanes (offsets +0/+32/+64/+96), one int8 scale per group. Nibble
+// unpack reuses the epi64->own-byte trick from the Q4_0 path (epi16
+// would cross-contaminate odd bytes); the 2-bit qh fields use epi16
+// shifts, whose low-2-bit results always stay in their own byte, and the
+// <<4 rebuild is lane-safe because the shifted values are <= 3.
+static VLLM_AVX2_FN float q6_k_half_dot_avx2(const unsigned char *ql, const unsigned char *qh,
+	const signed char *scales, const float *x) {
+	__m256 acc0 = _mm256_setzero_ps();
+	__m256 acc1 = _mm256_setzero_ps();
+	__m256 bias = _mm256_set1_ps(32.0f);
+	__m128i m15 = _mm_set1_epi8(0x0f);
+	__m128i m3 = _mm_set1_epi8(0x03);
+	for (int c = 0; c < 2; c++) {
+		const unsigned char *qla = ql + c * 16;
+		const unsigned char *qlb = ql + 32 + c * 16;
+		__m128i a = _mm_loadu_si128((const __m128i *)qla);
+		__m128i b = _mm_loadu_si128((const __m128i *)qlb);
+		__m128i h = _mm_loadu_si128((const __m128i *)(qh + c * 16));
+		__m128i lo_a = _mm_and_si128(a, m15);
+		__m128i hi_a = _mm_and_si128(_mm_srli_epi64(a, 4), m15);
+		__m128i lo_b = _mm_and_si128(b, m15);
+		__m128i hi_b = _mm_and_si128(_mm_srli_epi64(b, 4), m15);
+		__m128i f0 = _mm_slli_epi16(_mm_and_si128(h, m3), 4);
+		__m128i f1 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 2), m3), 4);
+		__m128i f2 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 4), m3), 4);
+		__m128i f3 = _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(h, 6), m3), 4);
+		__m128i v0 = _mm_or_si128(lo_a, f0);
+		__m128i v1 = _mm_or_si128(lo_b, f1);
+		__m128i v2 = _mm_or_si128(hi_a, f2);
+		__m128i v3 = _mm_or_si128(hi_b, f3);
+		__m256 s0 = _mm256_set1_ps((float)scales[c]);
+		__m256 s1 = _mm256_set1_ps((float)scales[c + 2]);
+		__m256 s2 = _mm256_set1_ps((float)scales[c + 4]);
+		__m256 s3 = _mm256_set1_ps((float)scales[c + 6]);
+		const float *xb = x + c * 16;
+		__m256 g;
+		g = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v0)), bias), s0);
+		acc0 = _mm256_fmadd_ps(g, _mm256_loadu_ps(xb), acc0);
+		g = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v0, 8))), bias), s0);
+		acc1 = _mm256_fmadd_ps(g, _mm256_loadu_ps(xb + 8), acc1);
+		g = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v1)), bias), s1);
+		acc0 = _mm256_fmadd_ps(g, _mm256_loadu_ps(xb + 32), acc0);
+		g = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v1, 8))), bias), s1);
+		acc1 = _mm256_fmadd_ps(g, _mm256_loadu_ps(xb + 32 + 8), acc1);
+		g = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v2)), bias), s2);
+		acc0 = _mm256_fmadd_ps(g, _mm256_loadu_ps(xb + 64), acc0);
+		g = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v2, 8))), bias), s2);
+		acc1 = _mm256_fmadd_ps(g, _mm256_loadu_ps(xb + 64 + 8), acc1);
+		g = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v3)), bias), s3);
+		acc0 = _mm256_fmadd_ps(g, _mm256_loadu_ps(xb + 96), acc0);
+		g = _mm256_mul_ps(_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v3, 8))), bias), s3);
+		acc1 = _mm256_fmadd_ps(g, _mm256_loadu_ps(xb + 96 + 8), acc1);
+	}
+	__m256 s = _mm256_add_ps(acc0, acc1);
+	__m128 hi = _mm256_extractf128_ps(s, 1);
+	__m128 lo = _mm256_castps256_ps128(s);
+	__m128 v = _mm_add_ps(lo, hi);
+	v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+	v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
+	return _mm_cvtss_f32(v);
+}
 #endif
 
 void vllm_matvec_f32(const float *w, const float *x, float *out, int rows, int cols) {
@@ -293,12 +356,31 @@ void vllm_q4_0_matvec_f32(const unsigned char *data, const float *x, float *out,
 void vllm_q6_k_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
 	int cols) {
 	int bpr = cols / 256;
+#if VLLM_HAVE_SIMD
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		for (int r = 0; r < rows; r++) {
+			float s = 0.0f;
+			const unsigned char *row = data + (size_t)r * (size_t)bpr * 210;
+			for (int b = 0; b < bpr; b++) {
+				const unsigned char *blk = row + (size_t)b * 210;
+				const unsigned char *ql = blk;
+				const unsigned char *qh = blk + 128;
+				const signed char *scales = (const signed char *)(blk + 192);
+				float d = vllm_f16_le_to_f32(blk + 208);
+				const float *xb = x + (size_t)b * 256;
+				float t = q6_k_half_dot_avx2(ql, qh, scales, xb) +
+					q6_k_half_dot_avx2(ql + 64, qh + 32, scales + 8, xb + 128);
+				s += t * d;
+			}
+			out[r] = s;
+		}
+		return;
+	}
+#endif
 	// Scalar mirror of infer.q6_k_matvec/q6_k_dot_block (same j/l order
 	// and per-term rounding, so this path is bit-identical to the V
-	// kernel; the AVX2 path below only reassociates the final hsum).
-	// Scalar mirror of infer.q6_k_matvec/q6_k_dot_block (same j/l order
-	// and per-term rounding, so this path is bit-identical to the V
-	// kernel). Scale indices need no division: p0=j*128+l gives
+	// kernel; the AVX2 path above only reassociates the per-half hsum).
+	// Scale indices need no division: p0=j*128+l gives
 	// p0/16 = j*8+(l>=16), and the +32/+64/+96 lanes add exactly 2/4/6.
 	for (int r = 0; r < rows; r++) {
 		float s = 0.0f;

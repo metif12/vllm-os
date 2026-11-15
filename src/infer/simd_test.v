@@ -114,10 +114,12 @@ fn test_q6k_matvec_c_matches_v() {
 	for r in 0 .. rows {
 		off := r * 210
 		for i in 192 .. 208 {
-			data[off + i] = u8(0x01) // all scales = 1
+			// varied int8 scales -2..2 (as bytes 254,255,0,1,2)
+			v := (i * 7 + r) % 5
+			data[off + i] = u8((v + 254) % 256)
 		}
 		data[off + 208] = u8(0x00)
-		data[off + 209] = u8(0x3c) // d = 1.0
+		data[off + 209] = u8(0x38) // d = 0.5
 	}
 	mut x := []f32{len: cols}
 	for i in 0 .. x.len {
