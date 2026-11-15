@@ -133,6 +133,64 @@ fn q6_k_chunk(data []u8, rows int, cols int, x []f32, r0 int, n int, mut out []f
 	q6_k_matvec_c_range(data, rows, cols, x, r0, n, mut out)
 }
 
+// q4_0_chunk_full runs one whole-matrix Q4_0 matvec on a worker thread.
+// Each fork-join member owns a disjoint out buffer (no row-splitting:
+// these shapes are too small for spawn-per-row-block to win — measured.
+// The win is concurrent independent streams, not partitioned rows).
+fn q4_0_chunk_full(data []u8, rows int, cols int, x []f32, mut out []f32, mut wg sync.WaitGroup) {
+	defer {
+		wg.done()
+	}
+	q4_0_matvec_c(data, rows, cols, x, mut out)
+}
+
+// q4_0_matvec_2way runs two independent Q4_0 matvecs (same x, disjoint
+// outs) concurrently: the FFN gate/up pair. Serial under freestanding /
+// VLLM_THREADS=1 (the bare-metal guest stays single-threaded).
+pub fn q4_0_matvec_2way(a []u8, b []u8, rows_a int, rows_b int, cols int, x []f32, mut out_a []f32, mut out_b []f32) {
+	$if freestanding {
+		q4_0_matvec_c(a, rows_a, cols, x, mut out_a)
+		q4_0_matvec_c(b, rows_b, cols, x, mut out_b)
+		return
+	} $else {
+		if parallel_threads() <= 1 {
+			q4_0_matvec_c(a, rows_a, cols, x, mut out_a)
+			q4_0_matvec_c(b, rows_b, cols, x, mut out_b)
+			return
+		}
+		mut wg := sync.new_waitgroup()
+		wg.add(2)
+		spawn q4_0_chunk_full(a, rows_a, cols, x, mut out_a, mut wg)
+		spawn q4_0_chunk_full(b, rows_b, cols, x, mut out_b, mut wg)
+		wg.wait()
+	}
+}
+
+// q4_0_matvec_3way runs three independent Q4_0 matvecs (same x, disjoint
+// outs) concurrently: the attention q/k/v projections. Same gating as
+// the 2-way entry (freestanding / VLLM_THREADS=1 pin the serial path).
+pub fn q4_0_matvec_3way(a []u8, b []u8, c []u8, rows_a int, rows_b int, rows_c int, cols int, x []f32, mut out_a []f32, mut out_b []f32, mut out_c []f32) {
+	$if freestanding {
+		q4_0_matvec_c(a, rows_a, cols, x, mut out_a)
+		q4_0_matvec_c(b, rows_b, cols, x, mut out_b)
+		q4_0_matvec_c(c, rows_c, cols, x, mut out_c)
+		return
+	} $else {
+		if parallel_threads() <= 1 {
+			q4_0_matvec_c(a, rows_a, cols, x, mut out_a)
+			q4_0_matvec_c(b, rows_b, cols, x, mut out_b)
+			q4_0_matvec_c(c, rows_c, cols, x, mut out_c)
+			return
+		}
+		mut wg := sync.new_waitgroup()
+		wg.add(3)
+		spawn q4_0_chunk_full(a, rows_a, cols, x, mut out_a, mut wg)
+		spawn q4_0_chunk_full(b, rows_b, cols, x, mut out_b, mut wg)
+		spawn q4_0_chunk_full(c, rows_c, cols, x, mut out_c, mut wg)
+		wg.wait()
+	}
+}
+
 // matvec_chunk runs the dispatched kernel on one row block [r0, r0+n).
 // Whole slices cross the spawn boundary (as in the bench harness);
 // offsets resolve inside via matvec_c_range.

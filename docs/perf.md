@@ -89,6 +89,13 @@ How the wins happened, in order:
    ~4 ms pure-V -> ~0.7 ms (~5-6x), real-data maxdiff 0.0. The 3/28
    Q4_1 down-projections stop being the slow layers: serial decode
    ~118 ms -> ~100 ms, threaded ~99 ms -> ~80-90 ms (~10x cumulative).
+10. **Layer fork-join** (`q4_0_matvec_2way`/`3way`): q/k/v and gate/up
+    run as concurrent independent streams (one spawn per member, not
+    per row-block — row-splitting these 1024-3072-row shapes regresses,
+    measured). Threaded decode ~85 ms -> ~78 ms; serial path unchanged
+    (same kernels, same order — threaded vs serial-pin is bit-identical).
+    `VLLM_THREADS=1` / freestanding pin the serial joins — the guest
+    stays single-threaded.
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
@@ -109,23 +116,27 @@ see below). Best-of-N in ms/token; ranges are the samples, not CI gates.
 |---|---|---|---|
 | pure-V (`VLLM_NO_SIMD=1`, serial) | ~1.8 s | ~920 ms (922-1032) | baseline |
 | C AVX2, serial (`VLLM_THREADS=1`) | ~0.20-0.29 s | ~100 ms (98-108, best 98) | **~9x** |
-| C AVX2, threaded (default 4) | ~0.17-0.23 s | **~85 ms** (80-96, best 80) | **~10-11x** |
+| C AVX2, threaded (default 4) | ~0.15-0.23 s | **~78 ms** (78-79, best 78) | **~11x** |
 
 Scratch prof harness (same box, same day, back-to-back, not in-tree):
-q4_1 down 1024x3072 pure-V 3.6-4.3 ms/matvec vs C AVX2 0.7 ms
-(14 ms/20, maxdiff 0.0 on real weights) — the ~10 ms/token saving
-above is that kernel times the 3 Q4_1 layers, not box variance.
-Quote **~80-95 ms threaded, ~100 ms serial, ~920 ms pure-V**.
-Cumulative stage-1+2+3+4: **870 ms → ~85 ms ≈ 10x** (warm pure-V →
-threaded AVX2).
+q4_0 row-split of 1024-3072-row shapes NEVER wins (spawn dominates —
+gate 3072x1024 serial 0.6 ms vs 2/4-way slower); fork-join over the
+independent q/k/v + gate/up matvecs wins 0-20% per rep on the 7-matvec
+layer set (interleaved reps: 56/57, 66/52, 59/54 ms serial/forkjoin).
+In-forward that lands as threaded 80-96 ms -> 78-79 ms stable, serial
+unchanged. Quote **~78-80 ms threaded, ~100 ms serial, ~920 ms pure-V**.
+Cumulative stage-1+2+3+4+5: **870 ms → ~78 ms ≈ 11x** (warm pure-V →
+threaded AVX2 + fork-join).
 
 Correctness held at every step (same box, paired): greedy 8-step ids
 identical (1096, 374, 264, 4285, 3110, 315, 1246, 311), re-verified
-post-Q4_1 AVX2 vs pure-V (logit sums rel Δ ~5e-8); PPL 8828617 vs
-8828611 (Δ6 micro-units), vocab maxdiff ~4.3e-6, gate maxdiff 0.0,
-Q4_1 down maxdiff 0.0 (real weights), musl serial-pin guest
-bit-identical (`MUSL-SERIAL-IDENTICAL`). Agreement tests green non-prod
-+ `-prod`; `vet` + `fmt -verify` clean.
+post-Q4_1 AVX2 vs pure-V (logit sums rel Δ ~5e-8); fork-join is
+bit-identical by construction (same kernels, disjoint outs) — threaded
+vs `VLLM_THREADS=1` logit sums match to the unit, plus bit-exact
+2-way/3-way unit tests. PPL 8828617 vs 8828611 (Δ6 micro-units),
+vocab maxdiff ~4.3e-6, gate maxdiff 0.0, Q4_1 down maxdiff 0.0 (real
+weights), musl serial-pin guest bit-identical (`MUSL-SERIAL-IDENTICAL`).
+Agreement tests green non-prod + `-prod`; `vet` + `fmt -verify` clean.
 
 For context, llama.cpp on the same file/box does ~63 tok/s (~16 ms/token)
 — about 5x faster than the current V forward. Expected: llama blocks,
@@ -188,12 +199,12 @@ here — serve release.
    rows=2501/VLLM_THREADS=8 remainder test in `parallel_test.v`
    (FP32 + Q6_K paths).
 7. **Full decode is measured, not modeled.** `tools/forward_bench.v`
-   gives ~80-95 ms/token threaded, ~100 ms serial, ~920 ms pure-V
+   gives ~78-80 ms/token threaded, ~100 ms serial, ~920 ms pure-V
    on Qwen3-0.6B-Q4_0 (same box). Greedy ids identical to the
-   pre-kernel forward, PPL within micro-units, musl guest
-   bit-identical. Against llama.cpp's ~16 ms/token on the same file,
-   the gap is ~5x — the documented next levers, not a measurement
-   artifact.
+   pre-kernel forward, fork-join bit-identical to serial, PPL within
+   micro-units, musl guest bit-identical. Against llama.cpp's
+   ~16 ms/token on the same file, the gap is ~5x — the documented
+   next levers, not a measurement artifact.
 
 ## External baselines: llama.cpp on real small models (same box)
 
@@ -214,7 +225,7 @@ sizes use exact block math for Q4_0/Q4_1/Q5/Q8_0. Analytic decode
 ceilings from weight traffic (~0.36 GB/token Qwen, ~0.73 GB/token
 Llama at ~20 GB/s effective) land at ~55 and ~27 tok/s — llama.cpp sits
 at or above those lines. End-to-end V tok/s is now quotable (phase 1b
-landed): **~12 tok/s** on Qwen3-0.6B-Q4_0 (80 ms/token threaded, same
+landed): **~13 tok/s** on Qwen3-0.6B-Q4_0 (78 ms/token threaded, same
 box) vs llama.cpp's ~63 tok/s on the same file — a ~5x gap that sizes
 the remaining kernel/threading work. Known gap found while probing:
 `config_from_kv` only understands `qwen3.*` keys, so the Llama arch line
@@ -309,8 +320,8 @@ record; the forward row is the one to quote for model speed:
 
 | stage | V | Python/NumPy | how measured |
 |---|---|---|---|
-| full decode, Qwen3-0.6B-Q4_0 (threaded) | **~12 tok/s** (80 ms best, 80-96 range) | llama.cpp ~63 tok/s same file/box | `tools/forward_bench.v`, `-prod`, warm, back-to-back |
-| full decode, same file (serial AVX2) | ~10 tok/s (98 ms best, 98-108) | — | `VLLM_THREADS=1`, same probe |
+| full decode, Qwen3-0.6B-Q4_0 (threaded) | **~13 tok/s** (78 ms best, 78-79 range) | llama.cpp ~63 tok/s same file/box | `tools/forward_bench.v`, `-prod`, warm, back-to-back |
+| full decode, same file (serial AVX2) | ~10 tok/s (101 ms best, 98-108) | — | `VLLM_THREADS=1`, same probe |
 | full decode, same file (pure-V) | ~1.1 tok/s (922 ms best, 922-1032) | — | `VLLM_NO_SIMD=1`, same probe |
 | 64-logit sample | **~650k tok/s** (31 ms / 20k iters) | 23k tok/s (869 ms) | `sample_into` vs equivalent NumPy sampler, warmed up |
 | vocab-scale sample (151936), exact | ~1000 tok/s (20 ms / 20 iters) | ~730 tok/s (28 ms) | same, incl. full softmax + heap top-k/p |
@@ -379,8 +390,9 @@ same-model, same-box Python-side pair and the remaining V levers:
 1. Python side: `llama-cpp-python` (or `llama-bench` TG line) on the
    exact `Qwen3-0.6B-Q4_0.gguf` file measured above — the llama.cpp
    binary row (~63 tok/s) is the stand-in until then.
-2. V levers: Q4_0 threading / layer fork-join (profile-gated — Q4_1
-   AVX2 landed this round, ~10 ms/token), then blocking/packing work
-   against the 16 ms/token llama line.
+2. V levers: blocking/packing the weight layout (llama-style reuse
+   across layers), attention-path work, then host-side profiling
+   against the 16 ms/token llama line. Q4_1 AVX2 and q/k/v + gate/up
+   fork-join both landed (this round + last).
 3. Serve path: real-model `POST /v1/chat/completions` tok/s (stub rows
    only cover HTTP overhead, not the forward).

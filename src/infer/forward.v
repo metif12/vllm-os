@@ -237,9 +237,10 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 			f.normed[i] = f.hidden[i]
 		}
 		rmsnorm_in_place(mut f.normed, lt.an, f.cfg.rms_norm_eps)
-		q4_0_matvec_c(lt.q, nh * hd, h, f.normed, mut f.q)
-		q4_0_matvec_c(lt.k, nkv * hd, h, f.normed, mut f.k)
-		q4_0_matvec_c(lt.v, nkv * vd, h, f.normed, mut f.v)
+		// q/k/v fork-join: three independent projections over the same
+		// normed hidden (serial under freestanding / VLLM_THREADS=1).
+		q4_0_matvec_3way(lt.q, lt.k, lt.v, nh * hd, nkv * hd, nkv * vd, h, f.normed, mut f.q, mut
+			f.k, mut f.v)
 		// QK-norm per head (slices passed directly as mut args borrow;
 		// never `mut qs := ...` — that implicitly clones and drops the write).
 		for qh in 0 .. nh {
@@ -277,8 +278,9 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 			f.normed[i] = f.hidden[i]
 		}
 		rmsnorm_in_place(mut f.normed, lt.fn_, f.cfg.rms_norm_eps)
-		q4_0_matvec_c(lt.gate, inter, h, f.normed, mut f.gate)
-		q4_0_matvec_c(lt.up, inter, h, f.normed, mut f.up)
+		// gate/up fork-join: two independent projections over the same
+		// normed hidden (same serial fallback as the q/k/v join above).
+		q4_0_matvec_2way(lt.gate, lt.up, inter, inter, h, f.normed, mut f.gate, mut f.up)
 		silu_in_place(mut f.gate)
 		for i in 0 .. inter {
 			f.up[i] *= f.gate[i]

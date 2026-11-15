@@ -190,3 +190,93 @@ fn test_parallel_remainder_matches_serial() {
 		assert d < 1e-4 && d > -1e-4
 	}
 }
+
+// Fork-join agreement: each member runs the same deterministic kernel on
+// disjoint outs, so 2-way/3-way must be BIT-EXACT vs serial — both via
+// the threaded path and via the VLLM_THREADS=1 serial fallback.
+fn test_q40_forkjoin_matches_serial() {
+	orig := os.getenv_opt('VLLM_THREADS')
+	defer {
+		if v := orig {
+			os.setenv('VLLM_THREADS', v, true)
+		} else {
+			os.unsetenv('VLLM_THREADS')
+		}
+	}
+	ra := 64
+	rb := 48
+	rc := 32
+	cols := 128
+	mut da := []u8{len: ra * (cols / 32) * 18}
+	mut db := []u8{len: rb * (cols / 32) * 18}
+	mut dc := []u8{len: rc * (cols / 32) * 18}
+	for i in 0 .. da.len {
+		da[i] = u8((i * 37 + 11) % 256)
+	}
+	for i in 0 .. db.len {
+		db[i] = u8((i * 53 + 7) % 256)
+	}
+	for i in 0 .. dc.len {
+		dc[i] = u8((i * 29 + 5) % 200)
+	}
+	for r in 0 .. ra {
+		for b in 0 .. cols / 32 {
+			off := (r * (cols / 32) + b) * 18
+			da[off] = u8(0x00)
+			da[off + 1] = u8(0x3c) // scale 1.0
+		}
+	}
+	for r in 0 .. rb {
+		for b in 0 .. cols / 32 {
+			off := (r * (cols / 32) + b) * 18
+			db[off] = u8(0x00)
+			db[off + 1] = u8(0x3c)
+		}
+	}
+	for r in 0 .. rc {
+		for b in 0 .. cols / 32 {
+			off := (r * (cols / 32) + b) * 18
+			dc[off] = u8(0x00)
+			dc[off + 1] = u8(0x3c)
+		}
+	}
+	mut x := []f32{len: cols}
+	for i in 0 .. x.len {
+		x[i] = f32(i % 17) * 0.05 - 0.4
+	}
+	for threads in ['4', '1'] {
+		os.setenv('VLLM_THREADS', threads, true)
+		mut sa := []f32{len: ra}
+		mut sb := []f32{len: rb}
+		mut sc := []f32{len: rc}
+		mut pa := []f32{len: ra}
+		mut pb := []f32{len: rb}
+		mut pc := []f32{len: rc}
+		q4_0_matvec_c(da, ra, cols, x, mut sa)
+		q4_0_matvec_c(db, rb, cols, x, mut sb)
+		q4_0_matvec_c(dc, rc, cols, x, mut sc)
+		q4_0_matvec_3way(da, db, dc, ra, rb, rc, cols, x, mut pa, mut pb, mut pc)
+		for i in 0 .. ra {
+			assert pa[i] == sa[i]
+		}
+		for i in 0 .. rb {
+			assert pb[i] == sb[i]
+		}
+		for i in 0 .. rc {
+			assert pc[i] == sc[i]
+		}
+		mut s2a := []f32{len: ra}
+		mut s2b := []f32{len: rb}
+		mut p2a := []f32{len: ra}
+		mut p2b := []f32{len: rb}
+		q4_0_matvec_c(da, ra, cols, x, mut s2a)
+		q4_0_matvec_c(db, rb, cols, x, mut s2b)
+		q4_0_matvec_2way(da, db, ra, rb, cols, x, mut p2a, mut p2b)
+		for i in 0 .. ra {
+			assert p2a[i] == s2a[i]
+		}
+		for i in 0 .. rb {
+			assert p2b[i] == s2b[i]
+		}
+	}
+}
