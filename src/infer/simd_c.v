@@ -149,6 +149,28 @@ pub fn q6_k_matvec_c(data []u8, rows int, cols int, x []f32, mut out []f32) {
 	q6_k_matvec(data, rows, cols, x, mut out)
 }
 
+// q6_k_matvec_c_range computes out[r0..r0+n] for a Q6_K row-major matrix
+// on a row block. Offsets resolve inside (no slice copying on the C
+// path); the V fallback borrows slices. Same dispatch as q6_k_matvec_c;
+// the range form exists so worker threads can share the caller's buffers
+// (offsets resolve inside, no slice copying).
+// Contract: cols divides 256, r0 + n <= rows, out.len == rows.
+@[direct_array_access]
+pub fn q6_k_matvec_c_range(data []u8, rows int, cols int, x []f32, r0 int, n int, mut out []f32) {
+	bpr := cols / 256
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q6_k_matvec_f32(&data[r0 * bpr * 210], x.data, &out[r0], n, cols)
+			}
+			return
+		}
+	}
+	ds := data[r0 * bpr * 210..(r0 + n) * bpr * 210]
+	mut outs := unsafe { out[r0..r0 + n] }
+	q6_k_matvec(ds, n, cols, x, mut outs)
+}
+
 // rmsnorm_c normalizes x with weight w and eps via the C kernel.
 @[direct_array_access]
 pub fn rmsnorm_c(mut x []f32, w []f32, eps f64) {

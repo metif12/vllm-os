@@ -19,9 +19,12 @@ Gate: `/v1/models` + `/v1/chat/completions` return 200. Green.
 * ✅ KV-overridden arch config, wired generate path (`model.v`).
 * ✅ `v -prod -cc gcc test src` — 10 files green (api, cfg, formats, infer).
 * ✅ Kernels beat NumPy 4/5 rows, tie 5th at DRAM wall (`docs/perf.md`).
-* ⏳ Phase 1b: transformer forward (attention + KV-cache) for real logits;
-  pseudo-logit path exercises encode→sample→decode end to end until then.
-* Gate: perplexity smoke test vs `llama.cpp` on 3 prompts (needs 1b + weights).
+* ✅ Phase 1b: transformer forward (attention + KV-cache) for real logits —
+  landed: GQA + QK-norm + split-half RoPE decode_step, fused Q4_0/Q4_1/Q6_K
+  matvecs (C AVX2, runtime-dispatched), real BPE, wired generate path.
+* Gate: perplexity + greedy smoke test vs `llama.cpp` — green: greedy
+  tokens identical on the probe prompt, PPL close (see `docs/perf.md`
+  for the measured pairs; gate prompts run where weights are present).
 
 ## Phase 2 — QEMU network path
 

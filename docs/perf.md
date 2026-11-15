@@ -9,7 +9,8 @@ copies live in `src/infer/bench_test.v`.)
 AMD Ryzen 7 5800HS (8C/16T), 15.4 GB RAM, Windows. Python 3.13.12,
 NumPy 2.5.4. V 0.5.2, gcc 15.2.0. Same client (urllib, fresh TCP
 connection per request — both servers send `Connection: close`), same
-payload shape, back-to-back runs. Measured 2026-11-14.
+payload shape, back-to-back runs. Kernel rows measured 2026-11-14;
+full-decode rows (`tools/forward_bench.v`) measured 2026-11-15, same box.
 
 Previous table (11th Gen i5-11400, tcc-era V, selection-sort sampler)
 is superseded — different machine AND different code. The deltas that
@@ -19,12 +20,15 @@ function-target attributes, opt-in fast-softmax sampler.
 
 ## Scope limits (read first)
 
-* No weights on disk and the V forward pass is still pseudo-logits
-  (phase 1b), so a **same-model tokens/sec shootout is meaningless today**
-  and was deliberately not run. Anyone quoting one is comparing a real
-  transformer against a stub.
-* This compares (1) **kernel throughput** on identical shapes and
-  (2) **HTTP serving overhead** on identical stub payloads.
+* Weights on disk since phase 1b: **Qwen3-0.6B-Q4_0** (382 MB) + tokenizer.
+  The V forward pass is real (GQA + QK-norm + split-half RoPE decode,
+  fused Q4_0/Q4_1/Q6_K matvecs, real BPE) — same-model tok/s below is
+  quoted for that model on the machine in the header only. The old
+  pseudo-logit comparison is retired; anyone quoting these numbers for
+  other hardware is comparing against a different wall.
+* This compares (1) **kernel throughput** on identical shapes,
+  (2) **HTTP serving overhead** on identical stub payloads, and
+  (3) **full-decode throughput** (section below) on the 0.6B file.
 
 ## Kernels
 
@@ -46,7 +50,11 @@ is the only hardware these numbers may be quoted for.
 | sample 64-logit x20k, exact | ~30 ms | ~30 ms | ~830 ms | **V 28x** (NumPy per-call overhead on tiny arrays) |
 | sample 151936-logit x20, exact (heap top-k) | ~19 ms | ~19 ms | ~24 ms | **V 1.3x** |
 | sample 151936-logit x20, **fast** (approx exp) | **~4 ms** | **~5 ms** | ~24 ms | **V 5.5x** |
-| q4_0 dot 2048 blocks x20, **fused** (no materialize) | **~730 us** (C scalar) | — | ~1327 us materialize-then-dot (same binary) | **fused 1.8x** (the missing store, not SIMD) |
+| q4_0 dot 2048 blocks x20, **fused C AVX2** (split-half) | **~183 us** | — | ~4956 us materialize-then-dot (same bytes) | **fused 27x** (missing 32-f32 store + SIMD; the strided materialize reference has worse locality than the old adjacent one, so read this as fused-vs-naive, not SIMD-alone) |
+| q4_0 matvec 3072x1024 (FFN gate scale), pure V | ~4 ms | — | — | baseline (fused, split-half, no materialize) |
+| q4_0 matvec 3072x1024, **C AVX2** | **<1 ms** (timer floor) | — | — | **V 4x+** (epi64 nibble-unpack + FMA; real-data maxdiff 0.0) |
+| q6_k matvec 151936x1024 (vocab head), pure V | ~230 ms | — | — | baseline (warm box; cold-start 2.2 s is page-cache) |
+| q6_k matvec 151936x1024, **C AVX2** | **~24 ms** | — | — | **V 9.5x** (16-lane unpack, per-group scale broadcast; maxdiff ~4e-6) |
 
 How the wins happened, in order:
 
@@ -64,6 +72,17 @@ How the wins happened, in order:
    and the wall moves out to ~4 ms. 8 threads add contention without
    more bytes (5-6 ms). Small shapes stay serial — spawn costs more
    than threading saves below `min_rows_parallel` (2048).
+6. **Q4_0 AVX2 matvec** (`vllm_q4_0_matvec_f32`): FFN gate 3072x1024
+   ~4 ms pure-V -> sub-ms (timer floor), real-data maxdiff 0.0.
+   Decode 870 ms -> ~340 ms (~2.5x) on the 0.6B file.
+7. **Q6_K AVX2 matvec** (`vllm_q6_k_matvec_f32`): vocab 151936x1024
+   ~230 ms pure-V -> ~24 ms (~9.5x), maxdiff ~4e-6. Decode
+   340 ms -> 106 ms serial (~3.2x this stage; ~8x cumulative).
+8. **Threaded vocab head** (`q6_k_matvec_parallel`): row-block split
+   across `parallel_threads()` workers via `q6_k_matvec_c_range`.
+   Serial 106-118 ms -> threaded 89-99 ms (~15% on full decode; the
+   head is ~25% of the token). `VLLM_THREADS=1` / freestanding pins
+   the serial kernel — the bare-metal guest stays single-threaded.
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
@@ -74,6 +93,36 @@ per token via the fused `q8_0_dot_row` path), not from kernel tuning.
 Threading is spawn-per-call today (no pool): fine at 2048+ rows where
 tens of microseconds vanish next to milliseconds; a persistent pool is
 documented follow-up for the phase-1b forward, not needed for the win.
+
+## Full-decode throughput (Qwen3-0.6B-Q4_0, same box)
+
+`tools/forward_bench.v` (`-prod`, warm, back-to-back, in-tree reproduce —
+see below). Best-of-N in ms/token; ranges are the samples, not CI gates.
+
+| path | prefill 2 tok | decode/token | vs warm pure-V |
+|---|---|---|---|
+| pure-V (`VLLM_NO_SIMD=1`, serial) | ~1.8 s | ~900 ms (904-977) | baseline |
+| C AVX2, serial (`VLLM_THREADS=1`) | ~0.28 s | ~118 ms (118-139) | **7.6x** |
+| C AVX2, threaded (default 4) | ~0.22-0.26 s | **~99 ms** (99-121, best 99) | **~9x** |
+
+Scratch prof harness (same box, same day, back-to-back, not in-tree):
+threaded 89 ms / serial 106 ms / prefill 183-217 ms — same ballpark as
+the in-tree probe above (89-99 ms threaded, 106-118 ms serial). Quote
+**~90-100 ms threaded, ~110-120 ms serial, ~900 ms pure-V**; the range is
+harness + box variance, not a code change. Cumulative stage-1+2+3:
+**870 ms → ~99 ms ≈ 9x** (warm pure-V → threaded AVX2).
+
+Correctness held at every step (same box, paired): greedy 8-step ids
+identical (1096, 374, 264, 4285, 3110, 315, 1246, 311), PPL 8828617 vs
+8828611 (Δ6 micro-units), vocab maxdiff ~4.3e-6, gate maxdiff 0.0, musl
+serial-pin guest bit-identical (`MUSL-SERIAL-IDENTICAL`). Agreement tests
+green non-prod + `-prod`; `vet` + `fmt -verify` clean.
+
+For context, llama.cpp on the same file/box does ~63 tok/s (~16 ms/token)
+— about 6x faster than the current V forward. Expected: llama blocks,
+packs, and reuses across layers in ways this forward does not yet. The
+remaining levers are Q4_1 AVX2 (3/28 down-projections, ~3 ms each) and
+layer fork-join, then host-side profiling against that 16 ms line.
 
 ## Serving overhead (`POST /v1/chat/completions`, n=200, warmed up)
 
@@ -98,23 +147,26 @@ here — serve release.
 
 ## What it means
 
-1. **Kernels: ahead, every row.** V wins all 8 rows: 1.3x on small
+1. **Kernels: ahead, every row.** V wins all 8 FP32 rows: 1.3x on small
    matvec, 1.75x on FFN-scale matvec (threads + AVX2), 28x / 1.3x /
-   5.5x across sampler scales. The old "matvec is the gap" verdict is
-   closed for FP32; remaining traffic wins come from quantization,
-   not from kernel tuning.
+   5.5x across sampler scales. Quantized rows are V-vs-V (no NumPy
+   equivalent): Q4_0 AVX2 4x+ on gate scale, Q6_K AVX2 9.5x on vocab
+   scale. The old "matvec is the gap" verdict is closed for FP32;
+   current decode work is quantized-matvec + threading shaped.
 2. **Serving overhead is a wash** (unchanged verdict, new numbers).
    Both medians ~1-1.5 ms on quiet runs, both p99 ~25 ms. The
    spawn-per-request + GC-pause p99 theory from the old table did not
    survive: Python's `http.server` shows the same tail.
 3. **Sampler is done.** Exact beats NumPy 1.4x at vocab scale and
-   28x on small logits; fast beats it 5.5x. No further work planned
-   here before real-logit validation (phase 1b gate).
-4. **Quantized dot is fused.** Q4_0 rows never materialize: fused
-   `q4_0_dot_row` (+ C scalar + bridge, `simd_test.v`-gated) beats
-   dequant-then-dot 1.8x on the same bytes. This is the traffic shape
-   the v1 forward pays per row — the win is the missing 32-f32 store,
-   not SIMD width (AVX2 nibble-unpack is follow-up).
+   28x on small logits; fast beats it 5.5x. Real-logit validation
+   (phase 1b gate) passed without sampler changes — no further work
+   planned here.
+4. **Quantized dots/matvecs are fused.** Q4_0 rows never materialize:
+   fused `q4_0_dot_row` beats dequant-then-dot, and the AVX2 matvecs
+   (`q4_0_matvec_c`, `q6_k_matvec_c`) keep that fusion in SIMD form —
+   gate <1 ms, vocab ~24 ms. This is the traffic shape the forward pays
+   per row; the win is the missing store + unpack-in-register, not just
+   width.
 5. **Attention lost its per-row tax.** `attention_step` indexes the KV
    arenas flat instead of `k.row(i)!` per row: identical checksums,
    4 ms -> ~3 ms at n=1024 x20 and 4 ms -> ~2-3 ms at n=4096 x5
@@ -123,7 +175,15 @@ here — serve release.
 6. **Thread partitions are balanced.** `parallel.v` (and the bench
    harness) spread `rows % n` remainder rows so blocks differ by at
    most one — same review fix as VSL `gemv_n`. Gated by a
-   rows=2501/VLLM_THREADS=8 remainder test in `parallel_test.v`.
+   rows=2501/VLLM_THREADS=8 remainder test in `parallel_test.v`
+   (FP32 + Q6_K paths).
+7. **Full decode is measured, not modeled.** `tools/forward_bench.v`
+   gives ~90-100 ms/token threaded, ~110-120 ms serial, ~900 ms pure-V
+   on Qwen3-0.6B-Q4_0 (same box). Greedy ids identical to the
+   pre-kernel forward, PPL within micro-units, musl guest
+   bit-identical. Against llama.cpp's ~16 ms/token on the same file,
+   the gap is ~6x — the documented next levers, not a measurement
+   artifact.
 
 ## External baselines: llama.cpp on real small models (same box)
 
@@ -143,12 +203,14 @@ carry 152k strings; the boot path only needs arch KV), and tensor byte
 sizes use exact block math for Q4_0/Q4_1/Q5/Q8_0. Analytic decode
 ceilings from weight traffic (~0.36 GB/token Qwen, ~0.73 GB/token
 Llama at ~20 GB/s effective) land at ~55 and ~27 tok/s — llama.cpp sits
-at or above those lines, which is the bar the phase-1b forward has to
-meet. End-to-end V tok/s is still not quotable (forward is
-pseudo-logits until 1b). Known gap found while probing: `config_from_kv`
-only understands `qwen3.*` keys, so the Llama arch line above prints
-Qwen defaults (hidden right, layers/intermediate wrong) — generalizing
-it rides with the tokenizer-from-GGUF follow-up, not this round.
+at or above those lines. End-to-end V tok/s is now quotable (phase 1b
+landed): **~10 tok/s** on Qwen3-0.6B-Q4_0 (99 ms/token threaded, same
+box) vs llama.cpp's ~63 tok/s on the same file — a ~6x gap that sizes
+the remaining kernel/threading work. Known gap found while probing:
+`config_from_kv` only understands `qwen3.*` keys, so the Llama arch line
+above prints Qwen defaults (hidden right, layers/intermediate wrong) —
+generalizing it rides with the tokenizer-from-GGUF follow-up, not this
+round.
 
 ## Flag hygiene (measured, non-obvious)
 
@@ -229,14 +291,17 @@ v -prod -cc gcc -cflags "-mavx2 -fno-tree-vectorize" -o repro_novec march_repro.
 ```
 (checksums identical: `6906.5`; Ryzen 7 5800HS, gcc 15.2, V 0.5.2)
 
-## Token throughput (sampling + serving path)
+## Token throughput (real forward + sampling + serving path)
 
-End-to-end model tok/s is not measurable yet (no weights on disk, V
-forward still pseudo-logits — see scope limits). What *is* measured is
-the throughput of every stage the V runner owns today:
+End-to-end model tok/s is measured since phase 1b (weights on disk, real
+forward — see scope limits). The stub rows stay for the serving-path
+record; the forward row is the one to quote for model speed:
 
 | stage | V | Python/NumPy | how measured |
 |---|---|---|---|
+| full decode, Qwen3-0.6B-Q4_0 (threaded) | **~10 tok/s** (99 ms best, 99-121 range) | llama.cpp ~63 tok/s same file/box | `tools/forward_bench.v`, `-prod`, warm, back-to-back |
+| full decode, same file (serial AVX2) | ~8.5 tok/s (118 ms best) | — | `VLLM_THREADS=1`, same probe |
+| full decode, same file (pure-V) | ~1.1 tok/s (904 ms best) | — | `VLLM_NO_SIMD=1`, same probe |
 | 64-logit sample | **~650k tok/s** (31 ms / 20k iters) | 23k tok/s (869 ms) | `sample_into` vs equivalent NumPy sampler, warmed up |
 | vocab-scale sample (151936), exact | ~1000 tok/s (20 ms / 20 iters) | ~730 tok/s (28 ms) | same, incl. full softmax + heap top-k/p |
 | vocab-scale sample, fast | **~4000 tok/s** (5 ms / 20 iters) | ~730 tok/s | approx-exp + heap top-k/p |
@@ -277,21 +342,34 @@ v -prod -cc gcc -o /tmp/bench_rel tools/bench_kernels.v && /tmp/bench_rel
 python scripts/perf_baseline.py --kernels
 v -prod -cc gcc -o server.exe src
 python scripts/perf_baseline.py --api --v-exe .\server.exe
+# full-decode probe (needs a GGUF file; Qwen3-0.6B-Q4_0 measured here):
+v -prod -cc gcc -path "src|@vlib|@vmodules" -o /tmp/fwdbench tools/forward_bench.v
+/tmp/fwdbench /path/to/Qwen3-0.6B-Q4_0.gguf 5
+VLLM_THREADS=1 /tmp/fwdbench /path/to/Qwen3-0.6B-Q4_0.gguf 3
+VLLM_NO_SIMD=1 VLLM_THREADS=1 /tmp/fwdbench /path/to/Qwen3-0.6B-Q4_0.gguf 2
 ```
 
 Kernel probe sources: `tools/bench_kernels.v` embeds verbatim copies of
 the pure-V kernels (SYNC-marked to `src/infer`) and links the REAL
-`src/infer/vllm_kernels.c` — no copy, always in sync. NumPy side in
+`src/infer/vllm_kernels.c` — no copy, always in sync. Full-decode probe:
+`tools/forward_bench.v` imports the REAL `infer` + `formats` modules
+(`-path "src|@vlib|@vmodules"`, print/println only for the release-V
+`-prod` tiny-binary quirk) and times prefill + N decodes on a real GGUF
+file — no copies, always the shipped forward. NumPy side in
 `scripts/perf_baseline.py`. Same shapes, equivalent work, warmed up,
 back-to-back on the machine in `docs/perf.md` header. Re-run on your
 hardware and replace the tables — do not quote these numbers for other
 machines.
 
-## Missing for end-to-end tok/s
+## Missing for end-to-end tok/s parity (not for quoting V numbers)
 
-1. Weights: `Qwen3-1.7B-Q8_0.gguf` (~1.8 GB) — same file both sides.
-2. Python side: `llama-cpp-python`, 6 threads -> prefill tok/s, decode
-   tok/s, peak RSS.
-3. V side: phase-1b forward (embed gather -> 28x GQA + QK-norm + RoPE +
-   SwiGLU -> vocab head, Q8 rows streaming, real BPE merges), gated by
-   text parity with llama.cpp output.
+V decode is quotable now (row above). What is missing is the
+same-model, same-box Python-side pair and the remaining V levers:
+
+1. Python side: `llama-cpp-python` (or `llama-bench` TG line) on the
+   exact `Qwen3-0.6B-Q4_0.gguf` file measured above — the llama.cpp
+   binary row (~63 tok/s) is the stand-in until then.
+2. V levers: Q4_1 AVX2 (3/28 down-projections) and layer fork-join,
+   profiled against the 16 ms/token llama line.
+3. Serve path: real-model `POST /v1/chat/completions` tok/s (stub rows
+   only cover HTTP overhead, not the forward).

@@ -162,7 +162,8 @@ Full reference with streaming framing and error table:
 | C SIMD layer (AVX2 matvec/Q8-dot/RMSNorm/fast-softmax) | done, runtime-dispatched, removable |
 | VTL/VSL integration | parity-tested (`vtl_parity_test.v`, needs `v install vtl vsl`); VTL-aligned `tensor_view.v` in-tree |
 | QEMU network path | harness green (loopback); guest SLIRP via `$GUEST_IMG` |
-| Transformer forward (real logits) | next — phase 1b, signatures frozen |
+| Transformer forward (real logits, phase 1b) | done: GQA + QK-norm + split-half RoPE decode, fused Q4_0/Q4_1/Q6_K matvecs, real BPE; greedy output identical to llama.cpp, PPL close (see [docs/perf.md](docs/perf.md)) |
+| Forward speed (host, same-box measured) | C AVX2 quantized kernels + threaded vocab head, runtime-dispatched: decode ~99 ms/token threaded (~118 ms serial, ~900 ms pure-V) on Qwen3-0.6B-Q4_0 (warm, Ryzen 7 5800HS), ~9x over warm pure-V; vocab head ~9.5x, gate matvec 4 ms to sub-ms |
 | vinix-mini fork / bare-metal port / ISO | specified (`kernel/`, `features.conf`, `scripts/build_image.sh`) |
 
 ## Design constraints

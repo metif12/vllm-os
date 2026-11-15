@@ -304,9 +304,9 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 	}
 	emb := tensor_bytes(f.blob, f.gguf, 'token_embd.weight')!
 	if emb_info.typ == .q6_k {
-		// C AVX2 Q6_K (~9.5x over V on Ryzen 5800HS, maxdiff ~4e-6);
-		// pure-V fallback outside -prod / without AVX2 / VLLM_NO_SIMD=1.
-		q6_k_matvec_c(emb, f.logits.len, h, f.normed, mut f.logits)
+		// Threaded row-block vocab head (serial fallback under
+		// freestanding / VLLM_THREADS=1 / small rows; the guest pins 1).
+		q6_k_matvec_parallel(emb, f.logits.len, h, f.normed, mut f.logits)
 	} else {
 		i8_matvec(emb, f.logits.len, h, f.normed, mut f.logits)
 	}

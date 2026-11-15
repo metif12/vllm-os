@@ -82,6 +82,57 @@ pub fn matvec_parallel(w []f32, x []f32, rows int, cols int, mut out []f32) {
 	}
 }
 
+// q6_k_matvec_parallel computes out = W*x for a Q6_K row-major matrix,
+// split across parallel_threads() workers (row-block partitioned, each
+// running the dispatched C/V kernel on its chunk via q6_k_matvec_c_range).
+// The phase-1b vocab head (151936 rows, single call site) is the target:
+// small projections stay serial (spawn vanishes only next to streaming).
+// Gating mirrors matvec_parallel: freestanding and VLLM_THREADS=1 run
+// the serial kernel (the bare-metal guest pins threads to 1).
+pub fn q6_k_matvec_parallel(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if freestanding {
+		q6_k_matvec_c(data, rows, cols, x, mut out)
+		return
+	} $else {
+		nt := parallel_threads()
+		if nt <= 1 || rows < 2 {
+			q6_k_matvec_c(data, rows, cols, x, mut out)
+			return
+		}
+		// Cap workers so every chunk amortizes spawn (>= 512 rows).
+		mut n := nt
+		for n > 1 && rows / n < 512 {
+			n--
+		}
+		if n <= 1 {
+			q6_k_matvec_c(data, rows, cols, x, mut out)
+			return
+		}
+		mut wg := sync.new_waitgroup()
+		// Balanced partition: rows % n remainder rows spread so block
+		// sizes differ by at most one (same as matvec_parallel).
+		base := rows / n
+		rem := rows % n
+		for t in 0 .. n {
+			r0 := t * base + (if t < rem { t } else { rem })
+			r1 := r0 + base + (if t < rem { 1 } else { 0 })
+			wg.add(1)
+			spawn q6_k_chunk(data, rows, cols, x, r0, r1 - r0, mut out, mut wg)
+		}
+		wg.wait()
+	}
+}
+
+// q6_k_chunk runs the dispatched range kernel on one row block [r0, r0+n).
+// Whole slices cross the spawn boundary; offsets resolve inside via
+// q6_k_matvec_c_range (same discipline as matvec_chunk).
+fn q6_k_chunk(data []u8, rows int, cols int, x []f32, r0 int, n int, mut out []f32, mut wg sync.WaitGroup) {
+	defer {
+		wg.done()
+	}
+	q6_k_matvec_c_range(data, rows, cols, x, r0, n, mut out)
+}
+
 // matvec_chunk runs the dispatched kernel on one row block [r0, r0+n).
 // Whole slices cross the spawn boundary (as in the bench harness);
 // offsets resolve inside via matvec_c_range.

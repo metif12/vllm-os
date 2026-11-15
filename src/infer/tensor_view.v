@@ -104,24 +104,24 @@ pub fn (v TensorView) get(idx []int) !f32 {
 pub fn (v TensorView) reshape(new_shape []int) !TensorView {
 	mut shape := new_shape.clone()
 	mut known := 1
-	mut infer := -1
+	mut infer_idx := -1
 	for i, d in shape {
 		if d == -1 {
-			if infer >= 0 {
+			if infer_idx >= 0 {
 				return error('view: only one -1 allowed')
 			}
-			infer = i
+			infer_idx = i
 		} else if d <= 0 {
 			return error('view: bad dim ${d}')
 		} else {
 			known *= d
 		}
 	}
-	if infer >= 0 {
+	if infer_idx >= 0 {
 		if v.numel() % known != 0 {
 			return error('view: cannot infer -1 for ${shape}')
 		}
-		shape[infer] = v.numel() / known
+		shape[infer_idx] = v.numel() / known
 	}
 	return view_from_slice(v.data, shape)
 }
