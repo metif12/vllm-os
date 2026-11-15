@@ -237,9 +237,9 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 			f.normed[i] = f.hidden[i]
 		}
 		rmsnorm_in_place(mut f.normed, lt.an, f.cfg.rms_norm_eps)
-		q4_0_matvec(lt.q, nh * hd, h, f.normed, mut f.q)
-		q4_0_matvec(lt.k, nkv * hd, h, f.normed, mut f.k)
-		q4_0_matvec(lt.v, nkv * vd, h, f.normed, mut f.v)
+		q4_0_matvec_c(lt.q, nh * hd, h, f.normed, mut f.q)
+		q4_0_matvec_c(lt.k, nkv * hd, h, f.normed, mut f.k)
+		q4_0_matvec_c(lt.v, nkv * vd, h, f.normed, mut f.v)
 		// QK-norm per head (slices passed directly as mut args borrow;
 		// never `mut qs := ...` — that implicitly clones and drops the write).
 		for qh in 0 .. nh {
@@ -268,7 +268,7 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 			attention_step(f.q[qh * hd..(qh + 1) * hd], &f.k_cache[l * nkv + kh], &f.v_cache[
 				l * nkv + kh], scale, mut f.probs, mut f.attn_out[qh * vd..(qh + 1) * vd])!
 		}
-		q4_0_matvec(lt.o, h, nh * vd, f.attn_out, mut f.proj)
+		q4_0_matvec_c(lt.o, h, nh * vd, f.attn_out, mut f.proj)
 		for i in 0 .. h {
 			f.hidden[i] += f.proj[i]
 		}
@@ -277,8 +277,8 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 			f.normed[i] = f.hidden[i]
 		}
 		rmsnorm_in_place(mut f.normed, lt.fn_, f.cfg.rms_norm_eps)
-		q4_0_matvec(lt.gate, inter, h, f.normed, mut f.gate)
-		q4_0_matvec(lt.up, inter, h, f.normed, mut f.up)
+		q4_0_matvec_c(lt.gate, inter, h, f.normed, mut f.gate)
+		q4_0_matvec_c(lt.up, inter, h, f.normed, mut f.up)
 		silu_in_place(mut f.gate)
 		for i in 0 .. inter {
 			f.up[i] *= f.gate[i]
@@ -286,7 +286,7 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 		if lt.down_typ == .q4_1 {
 			q4_1_matvec(lt.down, h, inter, f.up, mut f.down)
 		} else {
-			q4_0_matvec(lt.down, h, inter, f.up, mut f.down)
+			q4_0_matvec_c(lt.down, h, inter, f.up, mut f.down)
 		}
 		for i in 0 .. h {
 			f.hidden[i] += f.down[i]
@@ -304,6 +304,10 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 	}
 	emb := tensor_bytes(f.blob, f.gguf, 'token_embd.weight')!
 	if emb_info.typ == .q6_k {
+		// NOTE: the C Q6_K path is correct (bit-exact, agreement-tested)
+		// but its scalar loop trails the V kernel ~2x on this box, so
+		// the forward stays on V until the AVX2 Q6_K kernel lands.
+		// The C entry remains for the bridge test + that follow-up.
 		q6_k_matvec(emb, f.logits.len, h, f.normed, mut f.logits)
 	} else {
 		i8_matvec(emb, f.logits.len, h, f.normed, mut f.logits)

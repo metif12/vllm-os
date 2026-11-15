@@ -76,6 +76,63 @@ fn test_q4_dot_matches_dequant_then_dot() {
 	assert dc < 1e-4 && dc > -1e-4
 }
 
+fn test_q4_matvec_c_matches_v() {
+	rows := 5
+	cols := 64
+	mut data := []u8{len: rows * (cols / 32) * 18}
+	for i in 0 .. data.len {
+		data[i] = u8((i * 37 + 11) % 256)
+	}
+	for r in 0 .. rows {
+		for b in 0 .. cols / 32 {
+			off := (r * (cols / 32) + b) * 18
+			data[off] = u8(0x00)
+			data[off + 1] = u8(0x3c) // scale 1.0
+		}
+	}
+	mut x := []f32{len: cols}
+	for i in 0 .. x.len {
+		x[i] = f32(i % 17) * 0.05 - 0.4
+	}
+	mut a := []f32{len: rows}
+	mut b := []f32{len: rows}
+	q4_0_matvec(data, rows, cols, x, mut a)
+	q4_0_matvec_c(data, rows, cols, x, mut b)
+	for i in 0 .. rows {
+		d := b[i] - a[i]
+		assert d < 1e-3 && d > -1e-3
+	}
+}
+
+fn test_q6k_matvec_c_matches_v() {
+	rows := 3
+	cols := 256
+	mut data := []u8{len: rows * 210}
+	for i in 0 .. data.len {
+		data[i] = u8((i * 53 + 7) % 256)
+	}
+	for r in 0 .. rows {
+		off := r * 210
+		for i in 192 .. 208 {
+			data[off + i] = u8(0x01) // all scales = 1
+		}
+		data[off + 208] = u8(0x00)
+		data[off + 209] = u8(0x3c) // d = 1.0
+	}
+	mut x := []f32{len: cols}
+	for i in 0 .. x.len {
+		x[i] = f32(i % 41) * 0.05 - 1.0
+	}
+	mut a := []f32{len: rows}
+	mut b := []f32{len: rows}
+	q6_k_matvec(data, rows, cols, x, mut a)
+	q6_k_matvec_c(data, rows, cols, x, mut b)
+	for i in 0 .. rows {
+		d := b[i] - a[i]
+		assert d < 1e-3 && d > -1e-3
+	}
+}
+
 fn test_rmsnorm_c_matches() {
 	mut x := [f32(0.5), -1.5, 2.0, -0.25, 1.0, 0.75, -2.5, 3.0]
 	w := [f32(1.0), 0.5, 1.5, 1.0, 0.25, 2.0, 1.0, 0.75]

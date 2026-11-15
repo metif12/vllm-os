@@ -168,14 +168,175 @@ float vllm_q8_dot_f32(const signed char *qs, const float *x, float scale, int n)
 	return s * scale;
 }
 
+// f16 (LE bytes) -> f32, freestanding bit trick (mirrors
+// infer.f16bits_to_f32 exactly, including subnormal normalization).
+static float vllm_f16_le_to_f32(const unsigned char *p) {
+	unsigned int bits = (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+	unsigned int sign = (bits >> 15) << 31;
+	unsigned int exp = (bits >> 10) & 0x1f;
+	unsigned int mant = bits & 0x3ff;
+	unsigned int f;
+	if (exp == 0) {
+		if (mant == 0) {
+			f = sign;
+		} else {
+			int e = -14;
+			unsigned int m = mant;
+			while ((m & 0x400) == 0) {
+				m <<= 1;
+				e--;
+			}
+			m &= 0x3ff;
+			f = sign | ((unsigned int)(e + 127) << 23) | (m << 13);
+		}
+	} else if (exp == 31) {
+		f = sign | 0x7f800000 | (mant << 13);
+	} else {
+		f = sign | ((unsigned int)(exp - 15 + 127) << 23) | (mant << 13);
+	}
+	union {
+		unsigned int u;
+		float f;
+	} z;
+	z.u = f;
+	return z.f;
+}
+
+#if VLLM_HAVE_SIMD
+// One 32-elem split-half Q4_0 block dot (no scale applied): byte i holds
+// q[i] (low nibble) and q[i+16] (high nibble), values are nibble - 8.
+// Unpack trick: epi64 >> 4 moves every byte's HIGH nibble into its own
+// low nibble (epi16 would cross-contaminate odd bytes from the neighbor's
+// low nibble — verify with byte pattern 0xAB at odd offsets).
+static VLLM_AVX2_FN float q4_0_block_dot_avx2(const unsigned char *qs, const float *x) {
+	__m128i q = _mm_loadu_si128((const __m128i *)qs);
+	__m128i m15 = _mm_set1_epi8(0x0f);
+	__m128i lo = _mm_and_si128(q, m15);
+	__m128i hi = _mm_and_si128(_mm_srli_epi64(q, 4), m15);
+	__m256 eight = _mm256_set1_ps(8.0f);
+	// lo[0..16) dots x[0..16), hi[0..16) dots x[16..32).
+	__m256i lo0 = _mm256_cvtepi8_epi32(lo);
+	__m256i lo1 = _mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8));
+	__m256i hi0 = _mm256_cvtepi8_epi32(hi);
+	__m256i hi1 = _mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8));
+	__m256 f0 = _mm256_sub_ps(_mm256_cvtepi32_ps(lo0), eight);
+	__m256 f1 = _mm256_sub_ps(_mm256_cvtepi32_ps(lo1), eight);
+	__m256 f2 = _mm256_sub_ps(_mm256_cvtepi32_ps(hi0), eight);
+	__m256 f3 = _mm256_sub_ps(_mm256_cvtepi32_ps(hi1), eight);
+	__m256 a0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(x), _mm256_mul_ps(f1, _mm256_loadu_ps(x + 8)));
+	__m256 a1 = _mm256_fmadd_ps(f2, _mm256_loadu_ps(x + 16), _mm256_mul_ps(f3, _mm256_loadu_ps(x + 24)));
+	__m256 s = _mm256_add_ps(a0, a1);
+	__m128 hi128 = _mm256_extractf128_ps(s, 1);
+	__m128 lo128 = _mm256_castps256_ps128(s);
+	__m128 v = _mm_add_ps(lo128, hi128);
+	v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+	v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
+	return _mm_cvtss_f32(v);
+}
+#endif
+
 float vllm_q4_0_dot_f32(const unsigned char *qs, const float *x, float scale, int n) {
+#if VLLM_HAVE_SIMD
+	if (n == 32 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		return q4_0_block_dot_avx2(qs, x) * scale;
+	}
+#endif
+	// Scalar mirror of infer.q4_0_dot_row (same order, same rounding).
 	float s = 0.0f;
-	for (int i = 0; i < n; i += 2) {
-		unsigned char b = qs[i >> 1];
+	for (int i = 0; i < n / 2; i++) {
+		unsigned char b = qs[i];
 		s += (float)((int)(b & 0x0f) - 8) * x[i];
-		s += (float)((int)((b >> 4) & 0x0f) - 8) * x[i + 1];
+		s += (float)((int)((b >> 4) & 0x0f) - 8) * x[i + n / 2];
 	}
 	return s * scale;
+}
+
+void vllm_q4_0_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
+	int cols) {
+	int bpr = cols / 32;
+#if VLLM_HAVE_SIMD
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		for (int r = 0; r < rows; r++) {
+			float s = 0.0f;
+			const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
+			for (int b = 0; b < bpr; b++) {
+				const unsigned char *blk = row + (size_t)b * 18;
+				s += q4_0_block_dot_avx2(blk + 2, x + (size_t)b * 32) *
+					vllm_f16_le_to_f32(blk);
+			}
+			out[r] = s;
+		}
+		return;
+	}
+#endif
+	// Scalar mirror of infer.q4_0_matvec: per-block dot, scaled per block
+	// (same order and rounding as the V kernel).
+	for (int r = 0; r < rows; r++) {
+		float s = 0.0f;
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 18;
+			float scale = vllm_f16_le_to_f32(blk);
+			const float *xb = x + (size_t)b * 32;
+			float d = 0.0f;
+			for (int i = 0; i < 16; i++) {
+				unsigned char q = blk[2 + i];
+				d += (float)((int)(q & 0x0f) - 8) * xb[i];
+				d += (float)((int)((q >> 4) & 0x0f) - 8) * xb[i + 16];
+			}
+			s += d * scale;
+		}
+		out[r] = s;
+	}
+}
+
+void vllm_q6_k_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
+	int cols) {
+	int bpr = cols / 256;
+	// Scalar mirror of infer.q6_k_matvec/q6_k_dot_block (same j/l order
+	// and per-term rounding, so this path is bit-identical to the V
+	// kernel; the AVX2 path below only reassociates the final hsum).
+	// Scalar mirror of infer.q6_k_matvec/q6_k_dot_block (same j/l order
+	// and per-term rounding, so this path is bit-identical to the V
+	// kernel). Scale indices need no division: p0=j*128+l gives
+	// p0/16 = j*8+(l>=16), and the +32/+64/+96 lanes add exactly 2/4/6.
+	for (int r = 0; r < rows; r++) {
+		float s = 0.0f;
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 210;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 210;
+			const unsigned char *ql = blk;
+			const unsigned char *qh = blk + 128;
+			const signed char *scales = (const signed char *)(blk + 192);
+			float d = vllm_f16_le_to_f32(blk + 208);
+			const float *xb = x + (size_t)b * 256;
+			float t = 0.0f;
+			for (int j = 0; j < 2; j++) {
+				int sbase = j * 8;
+				for (int l = 0; l < 32; l++) {
+					unsigned char qh_b = qh[j * 32 + l];
+					unsigned char q0 = ql[j * 64 + l];
+					unsigned char q1 = ql[j * 64 + l + 32];
+					int f0 = (qh_b & 3) << 4;
+					int f1 = ((qh_b >> 2) & 3) << 4;
+					int f2 = ((qh_b >> 4) & 3) << 4;
+					int f3 = ((qh_b >> 6) & 3) << 4;
+					int v0 = (int)((q0 & 0x0f) | (unsigned char)f0) - 32;
+					int v1 = (int)((q1 & 0x0f) | (unsigned char)f1) - 32;
+					int v2 = (int)((q0 >> 4) | (unsigned char)f2) - 32;
+					int v3 = (int)((q1 >> 4) | (unsigned char)f3) - 32;
+					int p0 = j * 128 + l;
+					int s0 = sbase + (l >= 16);
+					t += (float)v0 * (float)scales[s0] * xb[p0] +
+						(float)v1 * (float)scales[s0 + 2] * xb[p0 + 32] +
+						(float)v2 * (float)scales[s0 + 4] * xb[p0 + 64] +
+						(float)v3 * (float)scales[s0 + 6] * xb[p0 + 96];
+				}
+			}
+			s += t * d;
+		}
+		out[r] = s;
+	}
 }
 
 // Freestanding 1/sqrt (no libm anywhere in this file, so no sqrtf):

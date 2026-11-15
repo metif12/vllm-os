@@ -395,8 +395,8 @@ fn bench_q4_fused() {
 			boff := blk * 16
 			for i in 0 .. 16 {
 				b := qs[boff + i]
-				row[i * 2] = f32(int(b & 0x0f) - 8)
-				row[i * 2 + 1] = f32(int((b >> 4) & 0x0f) - 8)
+				row[i] = f32(int(b & 0x0f) - 8)
+				row[i + 16] = f32(int((b >> 4) & 0x0f) - 8)
 			}
 			xoff := blk * 32
 			for i in 0 .. 32 {

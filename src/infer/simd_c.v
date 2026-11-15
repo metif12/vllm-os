@@ -33,6 +33,8 @@ $if prod {
 	fn C.vllm_matvec_f32(w &f32, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_q8_dot_f32(qs &i8, x &f32, scale f32, n int) f32
 	fn C.vllm_q4_0_dot_f32(qs &u8, x &f32, scale f32, n int) f32
+	fn C.vllm_q4_0_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
+	fn C.vllm_q6_k_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_rmsnorm_f32(x &f32, w &f32, n int, eps f64)
 	fn C.vllm_dot_f32(a &f32, b &f32, n int) f32
 	fn C.vllm_softmax_scaled_fast_f32(xs &f32, n int, scale f32)
@@ -103,8 +105,8 @@ pub fn q8_0_dot_row_c(block BlockQ80, x []f32, x_off int) f32 {
 }
 
 // q4_0_dot_row_c is the C version of q4_0_dot_row (fused 4-bit dot *
-// scale, no materialized row). Scalar C today (nibble unpack in AVX2 is
-// follow-up); gated like the Q8 bridge so non-prod stays pure V.
+// scale, no materialized row). Split-half layout, AVX2 nibble-unpack with
+// scalar fallback; gated like the Q8 bridge so non-prod stays pure V.
 @[direct_array_access]
 pub fn q4_0_dot_row_c(block BlockQ40, x []f32, x_off int) f32 {
 	$if prod {
@@ -113,6 +115,38 @@ pub fn q4_0_dot_row_c(block BlockQ40, x []f32, x_off int) f32 {
 		}
 	}
 	return q4_0_dot_row(block, x, x_off)
+}
+
+// q4_0_matvec_c computes out = W*x for a Q4_0 row-major matrix via the C
+// kernel, or the pure-V kernel outside -prod / without AVX2 / with
+// VLLM_NO_SIMD=1. Same shape contract as q4_0_matvec (cols divides 32).
+@[direct_array_access]
+pub fn q4_0_matvec_c(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q4_0_matvec_f32(data.data, x.data, out.data, rows, cols)
+			}
+			return
+		}
+	}
+	q4_0_matvec(data, rows, cols, x, mut out)
+}
+
+// q6_k_matvec_c computes out = W*x for a Q6_K row-major matrix via the C
+// kernel, or the pure-V kernel outside -prod / without AVX2 / with
+// VLLM_NO_SIMD=1. Same shape contract as q6_k_matvec (cols divides 256).
+@[direct_array_access]
+pub fn q6_k_matvec_c(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q6_k_matvec_f32(data.data, x.data, out.data, rows, cols)
+			}
+			return
+		}
+	}
+	q6_k_matvec(data, rows, cols, x, mut out)
 }
 
 // rmsnorm_c normalizes x with weight w and eps via the C kernel.
