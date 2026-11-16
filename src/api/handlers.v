@@ -1,7 +1,7 @@
 module api
 
 import infer
-import json
+import json2
 import strings
 import time
 
@@ -23,11 +23,11 @@ fn handle_health(_body string, ctx &HandlerCtx) HandlerResult {
 // bytes of JSON, negligible next to the socket write, and keeps the
 // handler stateless (no precomputed globals to invalidate).
 fn models_payload() string {
-	return json.encode(ModelsResponse{
+	return json2.encode(ModelsResponse{
 		data: [ModelCard{
 			id: 'qwen3-1.7b'
 		}]
-	})
+	}, escape_unicode: true, time_as_unix: true)
 }
 
 fn handle_models(_body string, _ctx &HandlerCtx) HandlerResult {
@@ -82,7 +82,7 @@ fn request_max_tokens(want int, ctx &HandlerCtx) int {
 }
 
 fn handle_chat(body string, ctx &HandlerCtx) HandlerResult {
-	chat := json.decode(ChatRequest, body) or {
+	chat := json2.decode[ChatRequest](body) or {
 		return HandlerResult{
 			status: 400
 			body:   '{"error":"bad chat request"}'
@@ -120,7 +120,7 @@ fn handle_chat(body string, ctx &HandlerCtx) HandlerResult {
 }
 
 fn handle_completions(body string, ctx &HandlerCtx) HandlerResult {
-	comp := json.decode(CompletionRequest, body) or {
+	comp := json2.decode[CompletionRequest](body) or {
 		return HandlerResult{
 			status: 400
 			body:   '{"error":"bad completion request"}'

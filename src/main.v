@@ -4,7 +4,7 @@ import cfg
 import flag
 import formats
 import infer
-import json
+import json2
 import os
 import api
 
@@ -73,7 +73,7 @@ fn main() {
 		exit(1)
 	}
 	if print_config {
-		println(json.encode(cc))
+		println(json2.encode(cc, escape_unicode: true, time_as_unix: true))
 		return
 	}
 	// Resolve once at boot so a bad backend name fails here, not mid-serve.
