@@ -25,13 +25,35 @@ Gate: `/v1/models` + `/v1/chat/completions` return 200. Green.
 * Gate: perplexity + greedy smoke test vs `llama.cpp` — green: greedy
   tokens identical on the probe prompt, PPL close (see `docs/perf.md`
   for the measured pairs; gate prompts run where weights are present).
+* ✅ Real-weights validation (2026-11-17, CPU): `Qwen3-0.6B-Q4_0.gguf`
+  (382156480 B, size-asserted) + `tokenizer.json` fetched; golden GGUF
+  tests green on the real file; server boots on real weights
+  (tensors=310); `hello` → real BPE text at ~2.7 tok/s (stub tokenizer
+  emits `<tok_N>` when `tokenizer.json` is absent — expected fallback).
 
-## Phase 2 — QEMU network path
+## Phase 2 — QEMU network path (done ✅, 2026-11-17)
 
 * Host server + QEMU guest curls it via SLIRP (`10.0.2.2:8000`).
-* `scripts/qemu_test.ps1/.sh` automated: boot microvm, curl models +
-  chat, assert 200 + `qwen3-1.7b` id.
-* Gate: cold-boot guest → first token < 30 s wall (stub), log saved.
+* `scripts/qemu_test.ps1` / `qemu_test.sh` automated: build-if-missing,
+  port poll (no fixed sleep), models + chat asserts, boot→first-token
+  timing, exit codes 0/1/2/3, guaranteed cleanup. Host gate green:
+  ready=2.6 s, total 2.7 s (< 30 s wall, stub).
+* Guest leg validated for real: OpenWrt 25.12.6 x86-64 on SLIRP user
+  networking (`-accel whpx -machine q35`), driven via TCP serial through
+  the **failsafe shell** (normal boot stalls pre-console on some
+  QEMU/host combos — failsafe does not), `10.0.2.15/24` + default route,
+  in-guest `wget` of `/v1/models` **and** a full chat round trip:
+  GUEST-GATE PASS. ssh path kept as an alternative.
+* Found + fixed by this testing: uclient-fetch sends even tiny POSTs as
+  `Transfer-Encoding: chunked` with no Content-Length; the server only
+  read Content-Length bodies and answered 400. Server now de-chunks
+  (capped at `max_body`); chunked and CL POSTs both 200, suite 12/12.
+* Gate: cold-boot guest → first token < 30 s wall (stub), log saved —
+  green (`qemu/test.log`, `qemu/guest.log`, both gitignored).
+
+Follow-ups (not gates): server log/API still print config-default
+`Qwen/Qwen3-1.7B` / `Q4_K_M` labels instead of GGUF-derived id/quant;
+Llama-3.2-1B golden fixture not yet fetched (773 MB, optional).
 
 ## Phase 3 — vinix-mini fork
 
