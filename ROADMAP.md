@@ -117,6 +117,15 @@ its DHCP lease — the gate must wait for `DHCP lease` in the serial log
 before connecting. (Repro/tool paths live in WSL: `~/isowork/staging`,
 `~/.local/xorroot`, `~/isowork/limine-tool`; not yet committed scripts.)
 
+Reproducible since 2026-11-18: `sh kernel/init/build-image.sh`
+(committed) performs the whole assembly — static init build, initramfs
+tar+gzip, pinned limine-binary 12.9.3 download (tag `v12.9.3`, asset
+`limine-binary.tar.gz`; needs `https_proxy=http://192.168.2.5:10808`
+on this LAN), xorriso bootstrap via `apt-get download` + `dpkg -x`
+(no sudo), mkisofs + `limine bios-install` — and
+`scripts/mini_boot_gate.ps1` runs the QEMU gate (exit 0/1/2).
+Script-built ISO booted green end to end (`MINI-BOOT-GATE PASS`).
+
 ## Phase 4 — Bare-metal inference
 
 * Build `src/infer` with `-gc none -freestanding`, arena KV-cache.
