@@ -3,6 +3,7 @@ module api
 import cfg
 import infer
 import net
+import strconv
 import strings
 
 // Raw-socket HTTP server on purpose: `veb` pulls in OS deps we cannot
@@ -40,14 +41,15 @@ fn sema_release(s chan int) {
 	_ = token
 }
 
-// read_request reads headers + exactly Content-Length body bytes, capped
-// at max_body (configured; rejects absurd Content-Length before alloc).
+// read_request reads headers + body bytes, capped at max_body (configured;
+// rejects absurd lengths before alloc). Bodies arrive either Content-Length
+// framed or Transfer-Encoding: chunked (uclient-fetch and friends send
+// small POSTs chunked with no Content-Length at all).
 fn read_request(mut conn net.TcpConn, max_body int) !(string, string) {
 	mut acc := []u8{cap: 8192}
 	mut tmp := []u8{len: 4096}
 	mut head_end := -1
-	mut total_needed := -1
-	for {
+	for head_end < 0 {
 		n := conn.read(mut tmp) or { return error('closed') }
 		if n <= 0 {
 			return error('closed')
@@ -56,18 +58,29 @@ fn read_request(mut conn net.TcpConn, max_body int) !(string, string) {
 		if acc.len > 16384 + max_body {
 			return error('request too large')
 		}
-		if head_end < 0 {
-			s := acc.bytestr()
-			if idx := s.index('\r\n\r\n') {
-				head_end = idx
-				total_needed = head_end + 4 + content_length(s[..head_end])
-				if total_needed - (head_end + 4) > max_body {
-					return error('body too large')
-				}
-			}
+		s := acc.bytestr()
+		if idx := s.index('\r\n\r\n') {
+			head_end = idx
 		}
-		if head_end >= 0 && acc.len >= total_needed {
-			break
+	}
+	head := acc[..head_end].bytestr()
+	if has_chunked(head) {
+		body := read_chunked_body(mut acc, head_end + 4, mut conn, max_body)!
+		return head, body
+	}
+	need := content_length(head)
+	if need > max_body {
+		return error('body too large')
+	}
+	total_needed := head_end + 4 + need
+	for acc.len < total_needed {
+		n := conn.read(mut tmp) or { return error('closed') }
+		if n <= 0 {
+			return error('closed')
+		}
+		acc << tmp[..n]
+		if acc.len > 16384 + max_body {
+			return error('request too large')
 		}
 	}
 	full := acc.bytestr()
@@ -81,6 +94,92 @@ fn content_length(head string) int {
 		}
 	}
 	return 0
+}
+
+// has_chunked reports whether the header block selects Transfer-Encoding:
+// chunked (matched case-insensitively; other codings alongside are fine).
+fn has_chunked(head string) bool {
+	for line in head.split_into_lines() {
+		if line.len > 18 && line[..18].to_lower() == 'transfer-encoding:' {
+			if line[18..].to_lower().contains('chunked') {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// read_chunked_body de-chunks the body starting at pos (just past the
+// header terminator), topping up acc from conn as needed. Chunk extensions
+// and trailers are skipped; the total is capped at max_body like the
+// Content-Length path.
+fn read_chunked_body(mut acc []u8, pos int, mut conn net.TcpConn, max_body int) !string {
+	mut out := []u8{cap: 4096}
+	mut tmp := []u8{len: 4096}
+	mut at := pos
+	for {
+		mut eol := -1
+		for {
+			if idx := acc.bytestr().index_after('\r\n', at) {
+				eol = idx
+				break
+			}
+			n := conn.read(mut tmp) or { return error('closed') }
+			if n <= 0 {
+				return error('closed')
+			}
+			acc << tmp[..n]
+			if acc.len > 16384 + max_body {
+				return error('request too large')
+			}
+		}
+		line := acc[at..eol].bytestr()
+		size_str := if i := line.index(';') { line[..i] } else { line }
+		size64 := strconv.parse_int(size_str.trim_space(), 16, 32) or {
+			return error('bad chunk size')
+		}
+		if size64 < 0 || size64 > i64(max_body) {
+			return error('bad chunk size')
+		}
+		size := int(size64)
+		at = eol + 2
+		if size == 0 {
+			// Consume trailers + final CRLF (usually just one empty line).
+			for {
+				if idx := acc.bytestr().index_after('\r\n', at) {
+					if idx == at {
+						return out.bytestr()
+					}
+					at = idx + 2
+					continue
+				}
+				n := conn.read(mut tmp) or { return error('closed') }
+				if n <= 0 {
+					return error('closed')
+				}
+				acc << tmp[..n]
+				if acc.len > 16384 + max_body {
+					return error('request too large')
+				}
+			}
+		}
+		for acc.len < at + size + 2 {
+			n := conn.read(mut tmp) or { return error('closed') }
+			if n <= 0 {
+				return error('closed')
+			}
+			acc << tmp[..n]
+			if acc.len > 16384 + max_body {
+				return error('request too large')
+			}
+		}
+		out << acc[at..at + size]
+		if out.len > max_body {
+			return error('body too large')
+		}
+		at += size + 2
+	}
+	return out.bytestr()
 }
 
 fn handle(mut conn net.TcpConn, ctx &HandlerCtx, sema chan int) {
