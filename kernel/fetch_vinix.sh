@@ -5,7 +5,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Pinned hobby-OS upstream. Update deliberately, never floating.
 VINIX_REPO="${VINIX_REPO:-https://github.com/vlang/vinix}"
-VINIX_REF="${VINIX_REF:-master}"
+VINIX_REF="${VINIX_REF:-63fc675f13718e5724bfeac54431344815be5085}"
 DEST="$ROOT/third_party/vinix"
 mkdir -p "$ROOT/third_party"
 if [ ! -d "$DEST/.git" ]; then
