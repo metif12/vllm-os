@@ -128,6 +128,16 @@ Script-built ISO booted green end to end (`MINI-BOOT-GATE PASS`).
 
 ## Phase 4 — Bare-metal inference
 
+Step 1 done 2026-11-18: a normal V userland binary runs on the fork.
+The C init now `execve("/sbin/vllm")` after printing boot ok (falls back
+to the :8000 stub only when it is absent); `kernel/init/probe.v`
+(GC + strings + `os.write_file` to `/dev/com1`) packed as `/sbin/vllm`
+via `build-image.sh --initramfs-extra` prints
+`[vllm-os] userland V probe ok` on the guest serial — i.e. fork/execve,
+V runtime startup (mmap/brk), GC, and devtmpfs open/write/close all
+work for userland V. Build: utility V 0.5.2 (`~/vlinux/v/v`) with
+`-cc gcc -cflags '-static'` (V has no `-static` flag).
+
 * Build `src/infer` with `-gc none -freestanding`, arena KV-cache.
 * mmap GGUF from baked partition (no `os` file APIs in kernel).
 * Single accept loop + N worker threads on the trimmed scheduler.

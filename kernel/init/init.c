@@ -100,6 +100,16 @@ void _start(void) {
 	// marker; the framebuffer /dev/console is headless under -display none.
 	serial_fd = sc4(257 /* openat */, -100, (long)"/dev/com1", 1, 0);
 	puts1("[vllm-os] boot ok\n");
+	// Phase-4 handoff: the real server lives at /sbin/vllm (a normal V
+	// userland binary). execve replaces us (pid 1); only when it is
+	// absent (or fails) do we fall through to the stub listener below.
+	{
+		static char path[] = "/sbin/vllm";
+		static char *argv[] = { path, 0 };
+		static char *envp[] = { 0 };
+		sc3(59 /* execve */, (long)path, (long)argv, (long)envp);
+		puts1("[vllm-os] no /sbin/vllm, stub mode\n");
+	}
 
 	long fd = sc3(41 /* socket */, 2 /* AF_INET */, 1 /* SOCK_STREAM */, 0);
 	if (fd < 0) {

@@ -20,6 +20,9 @@
 #   4. runs xorriso (system one, else bootstrapped via apt-get download +
 #      dpkg -x into the work dir) and the limine BIOS installer.
 #
+# Extra initramfs content (Phase 4: /sbin/vllm, models) comes from
+# --initramfs-extra DIR, copied over img/ with permissions preserved.
+#
 # Boot the result with scripts/mini_boot_gate.ps1 (Windows) or:
 #   qemu-system-x86_64 -cdrom vllm-mini.iso -m 2G -display none -serial stdio \
 #     -netdev user,id=n0,hostfwd=tcp::18000-:8000 -device e1000,netdev=n0
@@ -32,13 +35,15 @@ IMAGE_ID="mini-smoke-00000001"
 LIMINE_VER="12.9.3"
 LIMINE_URL="https://github.com/limine-bootloader/limine/releases/download/v${LIMINE_VER}/limine-binary.tar.gz"
 CACHE="${VLLM_CACHE:-$HOME/.cache/vllm-os}"
+EXTRA=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --kernel) KERNEL="$2"; shift 2;;
     --out) OUT="$2"; shift 2;;
     --work) WORK="$2"; shift 2;;
     --image-id) IMAGE_ID="$2"; shift 2;;
-    *) echo "usage: $0 [--kernel PATH] [--out ISO] [--work DIR] [--image-id ID]" >&2; exit 2;;
+    --initramfs-extra) EXTRA="$2"; shift 2;;
+    *) echo "usage: $0 [--kernel PATH] [--out ISO] [--work DIR] [--image-id ID] [--initramfs-extra DIR]" >&2; exit 2;;
   esac
 done
 if [ ! -f "$KERNEL" ]; then
@@ -64,6 +69,9 @@ cp "$INIT" "$IMG/sbin/init"
 chmod 755 "$IMG/sbin/init"
 printf '%s\n' "$IMAGE_ID" > "$IMG/.vinix-image-id"
 dd if=/dev/urandom of="$IMG/.pad.bin" bs=4096 count=1 status=none
+if [ -n "$EXTRA" ]; then
+  cp -a "$EXTRA/." "$IMG/"
+fi
 (cd "$IMG" && tar -cf "$WORK/initramfs.tar" .)
 gzip -kf "$WORK/initramfs.tar"
 
