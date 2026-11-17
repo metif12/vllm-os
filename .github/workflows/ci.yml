@@ -3,7 +3,8 @@ name: ci
 # Fast signal on every push/PR: vet + format check, full test suite on
 # Ubuntu/gcc, logic suite + MSVC prod build on Windows. Heavy perf
 # numbers are NOT gated here (boxes vary) — scripts/bench.py owns those
-# and docs/perf.md curates them.
+# and docs/perf.md curates them; .github/workflows/perf.yml re-runs them
+# weekly and refreshes only the marked CI section of docs/perf.md.
 on:
   push:
   pull_request:

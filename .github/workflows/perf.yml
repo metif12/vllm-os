@@ -1,0 +1,61 @@
+name: perf
+
+# Weekly perf tracking (plus manual runs): kernel bench + NumPy baseline
+# + full-decode probe, then rewrite ONLY the marked CI section of
+# docs/perf.md and commit it back with [skip ci]. Numbers are NOT gated
+# — GitHub runners vary, so the curated tables stay human-owned; the CI
+# section tracks regressions on runners, nothing else.
+#
+# Raw results.json goes to the workflow artifact, not the repo
+# (bench/results_*/ is gitignored).
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: perf-track
+  cancel-in-progress: false
+
+env:
+  V_VERSION: 0.5.2
+
+jobs:
+  perf-track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install V
+        run: |
+          curl -sL -o /tmp/v_linux.zip \
+            "https://github.com/vlang/v/releases/download/${V_VERSION}/v_linux.zip"
+          unzip -q /tmp/v_linux.zip -d /tmp
+          echo /tmp/v >> "$GITHUB_PATH"
+      - name: Install Python deps
+        run: |
+          python3 -m venv .venv-ci
+          .venv-ci/bin/pip install --quiet numpy
+      - name: Run perf track
+        run: |
+          .venv-ci/bin/python scripts/perf_ci.py --out bench/ci \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+      - name: Upload raw results
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results
+          path: bench/ci/results.json
+      - name: Commit perf.md update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/perf.md
+          if git diff --cached --quiet; then
+            echo "perf.md unchanged"
+          else
+            git commit -m "perf: CI-tracked numbers $(date -u +%F) [skip ci]"
+            git push
+          fi

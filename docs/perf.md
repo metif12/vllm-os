@@ -328,6 +328,12 @@ record; the forward row is the one to quote for model speed:
 | vocab-scale sample, fast | **~4000 tok/s** (5 ms / 20 iters) | ~730 tok/s | approx-exp + heap top-k/p |
 | stub chat round trip (64 tokens/response) | ~16-30k tok/s served (~2-6 ms/resp) | ~40k tok/s served (~1 ms/resp, quiet) | `POST /v1/chat/completions`, n=200, 20 warmups |
 
+## CI-tracked numbers (auto-updated, do not edit by hand)
+
+<!-- PERF-CI-START -->
+_Not yet run: the weekly perf workflow fills this section._
+<!-- PERF-CI-END -->
+
 ## Per-token resource budget, Qwen3-1.7B (analytic, exact math)
 
 Decode is memory-bound: each token re-reads all weights once.
@@ -352,6 +358,14 @@ re-measure the floor on the serving box, not this laptop.
 python scripts/bench.py --force            # V bench + NumPy, fingerprinted, CSV/JSON in bench/results_*
 python scripts/bench.py --force --llama-bench /path/to/llama-bench --pp 128 -n 64 -t 8
 python scripts/bench.py --help             # reps/cooldown/models/threads
+```
+
+Full track incl. the forward probe and the perf.md CI-section rewrite
+(same flow the weekly perf workflow runs):
+
+```sh
+python scripts/perf_ci.py --run-url <workflow-run-url>   # needs models/*.gguf, updates docs/perf.md
+python scripts/perf_ci.py --skip-forward                 # kernels only, no weights
 ```
 
 `bench.py` refuses on a loaded box unless `--force`, sleeps `--cooldown`

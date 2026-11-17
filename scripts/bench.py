@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """vllm-os perf harness: one command, fingerprinted, comparable numbers.
 
-Runs the V kernel bench, the NumPy baseline, and (optionally) a pinned
-llama-bench matrix, then writes results.json + results.csv next to a
-machine fingerprint. docs/perf.md stays the curated log; this script
-produces the raw data it quotes.
+Runs the V kernel bench, the NumPy baseline, (optionally) the
+full-decode forward probe and a pinned llama-bench matrix, then writes
+results.json + results.csv next to a machine fingerprint.
+docs/perf.md stays the curated log; this script produces the raw data
+it quotes (and scripts/perf_update_md.py refreshes the CI section).
 
 Quiet-box protocol (enforced unless --force): refuse when the box is
 loaded, sleep --cooldown between timed sections, repeat short benches
@@ -13,6 +14,7 @@ loaded, sleep --cooldown between timed sections, repeat short benches
 Examples:
   python scripts/bench.py                      # V bench + NumPy, 2 reps
   python scripts/bench.py --force              # this box is always loaded
+  python scripts/bench.py --forward --force    # + full-decode probe (needs models/*.gguf)
   python scripts/bench.py --llama-bench /path/to/llama-bench --pp 128 -n 64 -t 8
 """
 import argparse
@@ -163,9 +165,13 @@ def box_load():
     return False, "load check unavailable on this platform"
 
 
-def run(cmd, cwd=ROOT):
+def run(cmd, cwd=ROOT, env=None):
+    merged = None
+    if env:
+        merged = dict(os.environ)
+        merged.update(env)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
-                       cwd=cwd)
+                       cwd=cwd, env=merged)
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
@@ -222,6 +228,72 @@ def parse_llama(text):
     return recs
 
 
+FORWARD_MODES = [
+    ("threaded", {}),
+    ("serial", {"VLLM_THREADS": "1"}),
+    ("pure-v", {"VLLM_NO_SIMD": "1", "VLLM_THREADS": "1"}),
+]
+
+
+def parse_forward(text, mode):
+    """Parse one tools/forward_bench.v run. Raises ValueError when the
+    run is incomplete (missing OK marker or rows) so callers fail loudly
+    instead of recording garbage."""
+    prefill = None
+    decodes = []
+    best = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("prefill_2tok_ms="):
+            prefill = float(line.split("=", 1)[1])
+        elif line.startswith("decode_ms="):
+            decodes.append(float(line.split("=", 1)[1]))
+        elif line.startswith("decode_best_ms="):
+            best = float(line.split("=", 1)[1])
+    if "FORWARD-BENCH-OK" not in text:
+        raise ValueError(f"forward bench {mode}: missing FORWARD-BENCH-OK")
+    if prefill is None or best is None or not decodes:
+        raise ValueError(f"forward bench {mode}: incomplete output")
+    lo, hi = min(decodes), max(decodes)
+    return [
+        {"suite": "forward", "bench": f"prefill 2tok {mode}",
+         "value": prefill, "unit": "ms", "detail": ""},
+        {"suite": "forward", "bench": f"decode {mode}",
+         "value": best, "unit": "ms/token",
+         "detail": f"range {lo:g}-{hi:g} over {len(decodes)} tokens"},
+    ]
+
+
+def run_forward(model, tokens, outdir, section):
+    """Build tools/forward_bench.v once, run it in each FORWARD_MODES
+    mode. Returns records, or None on any failure (caller aborts)."""
+    exe = os.path.join(outdir, "fwdbench" + (".exe" if os.name == "nt"
+                                             else ""))
+    section("build forward bench")
+    code, out = run(["v", "-prod", "-cc", "gcc", "-path",
+                     "src|@vlib|@vmodules", "-o", exe,
+                     os.path.join("tools", "forward_bench.v")])
+    if code != 0 or not os.path.exists(exe):
+        print("forward bench build failed:\n" + out[-3000:])
+        return None
+    if not os.path.exists(model):
+        print(f"forward bench skipped: model not found: {model}")
+        return None
+    recs = []
+    for mode, env in FORWARD_MODES:
+        section(f"forward bench {mode}")
+        code, out = run([exe, model, str(tokens)], env=env)
+        if code != 0:
+            print(f"forward bench {mode} exited {code}:\n" + out[-2000:])
+            return None
+        try:
+            recs.extend(parse_forward(out, mode))
+        except ValueError as e:
+            print(f"{e}\n{out[-2000:]}")
+            return None
+    return recs
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--force", action="store_true",
@@ -232,6 +304,13 @@ def main():
                     help="process repeats of each timed section")
     ap.add_argument("--no-vbench", action="store_true")
     ap.add_argument("--no-numpy", action="store_true")
+    ap.add_argument("--forward", action="store_true",
+                    help="also run tools/forward_bench.v (needs --model)")
+    ap.add_argument("--model",
+                    default="models/Qwen3-0.6B-Q4_0.gguf",
+                    help="GGUF file for the forward bench")
+    ap.add_argument("--forward-tokens", type=int, default=5,
+                    help="timed decode steps per forward mode")
     ap.add_argument("--llama-bench", default="",
                     help="path to llama-bench binary (skipped if absent)")
     ap.add_argument("--models", nargs="*", default=[
@@ -307,6 +386,14 @@ def main():
                     for r in parse_llama(out):
                         r["detail"] += f" pp={args.pp} n={args.n}"
                         records.append(r)
+
+    if args.forward:
+        mp = (args.model if os.path.isabs(args.model)
+              else os.path.join(ROOT, args.model))
+        recs_fwd = run_forward(mp, args.forward_tokens, outdir, section)
+        if recs_fwd is None:
+            return 1
+        records.extend(recs_fwd)
 
     with open(os.path.join(outdir, "results.json"), "w") as f:
         json.dump({"fingerprint": fp, "records": records}, f, indent=2)
