@@ -49,6 +49,12 @@ pub fn (m Model) n_tensors() int {
 }
 
 // config_from_kv overrides arch fields from GGUF metadata when present.
+// Identity labels come along too: general.name (e.g. Qwen3-0.6B) and
+// general.file_type (llama ftype code) replace the 1.7B/Q4_K_M fallbacks
+// so the boot log and /health name the weights actually mapped. Only
+// common ftype codes are mapped; anything else keeps the default rather
+// than inventing a label. The served /v1/models id stays configured
+// (API contract + gate scripts assert it) — see handlers.v.
 pub fn config_from_kv(base Qwen3Config, kv map[string]string) Qwen3Config {
 	mut c := base
 	if v := kv['qwen3.embedding_length'] {
@@ -84,7 +90,36 @@ pub fn config_from_kv(base Qwen3Config, kv map[string]string) Qwen3Config {
 	if v := kv['tokenizer.ggml.tokens'] {
 		_ = v
 	}
+	if v := kv['general.name'] {
+		if v.len > 0 {
+			c.model_id = v
+		}
+	}
+	if v := kv['general.file_type'] {
+		c.quant = file_type_label(v.int(), c.quant)
+	}
 	return c
+}
+
+// file_type_label maps llama ftype codes to display labels, falling back
+// to dflt for unmapped codes (never invent a label for unknown files).
+fn file_type_label(ftype int, dflt string) string {
+	match ftype {
+		0 { return 'F32' }
+		1 { return 'F16' }
+		2 { return 'Q4_0' }
+		3 { return 'Q4_1' }
+		7 { return 'Q8_0' }
+		8 { return 'Q5_0' }
+		9 { return 'Q5_1' }
+		10 { return 'Q2_K' }
+		14 { return 'Q4_K_S' }
+		15 { return 'Q4_K_M' }
+		16 { return 'Q5_K_S' }
+		17 { return 'Q5_K_M' }
+		18 { return 'Q6_K' }
+		else { return dflt }
+	}
 }
 
 // Boot path: detect container, parse index, load tokenizer sidecar. No Python.
