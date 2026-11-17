@@ -1,0 +1,396 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (c) 2026 Alexander Medvednikov
+//
+// mknod(2)/mknodat(2): the special files a container runtime makes in the
+// rootfs it is building. A device node leads to the real device of the same
+// name -- Vinix names its devices rather than numbering them, so /dev/null a
+// container makes is the /dev/null the kernel already has -- and a FIFO is a
+// named pipe.
+module fs
+
+import kbudget
+import errno
+import katomic
+import klock
+import lib
+import pipe
+import proc
+import resource
+import stat
+import event.eventstruct
+
+// A device node created by mknod. It has no storage of its own: every
+// operation is forwarded to the device the kernel published under the same
+// name, so a container's /dev/null discards writes exactly as the host's does.
+@[heap]
+struct MknodDeviceResource {
+pub mut:
+	kernel_charge kbudget.Charge
+	stat     stat.Stat
+	refcount int
+	l        klock.Lock
+	event    eventstruct.Event
+	status   int
+	can_mmap bool
+
+	backing &resource.Resource = unsafe { nil }
+	// Retain the actual backing capability, never the caller's rdev or mode. In
+	// particular a basename alias may describe a block disk as a character
+	// node, which must not turn disk writes into unprotected stream writes.
+	// The node's own interface value for this, handed to every open that the
+	// backing device does not decide. Making one per open left it behind.
+	boxed &resource.Resource = unsafe { nil }
+}
+
+fn (this &MknodDeviceResource) block_identity() resource.BlockIdentity {
+	mut backing := this.backing
+	return resource.block_identity(mut backing)
+}
+
+fn (mut this MknodDeviceResource) block_status() resource.BlockStatus {
+	return resource.block_status(mut this.backing) or { resource.BlockStatus{version: 0} }
+}
+
+fn (mut this MknodDeviceResource) discard(offset u64, bytes u64) ? {
+	resource.discard_resource(mut this.backing, offset, bytes)?
+}
+
+// A device that decides what an open returns, as /dev/tty and /dev/ptmx do,
+// must decide it for the container's node too.
+fn (mut this MknodDeviceResource) open_owned(flags int) ?&resource.Resource {
+ // A path lookup can race unlink. Never resurrect a retired wrapper, and
+ // hold it while a delegated open blocks and still borrows the backing.
+ for {
+  refs := katomic.load(&this.refcount)
+  if refs == 0 { errno.set(errno.enoent); return none }
+  if katomic.cas(mut &this.refcount, refs, refs + 1) { break }
+ }
+ mut backing := this.backing
+ if backing is resource.OwnedOpenableResource || backing is resource.OpenableResource {
+  defer { this.unref(unsafe { nil }) or {} }
+  opened := resource.open_resource(mut backing, flags) or { return none }
+  mut result := opened.resource
+  if !opened.owned { katomic.inc(mut &result.refcount) }
+  return result
+ }
+ return this.boxed
+}
+
+fn (mut this MknodDeviceResource) read(handle voidptr, buf voidptr, loc u64, count u64) ?i64 {
+	mut backing := this.backing
+	return backing.read(handle, buf, loc, count)
+}
+
+fn (mut this MknodDeviceResource) write(handle voidptr, buf voidptr, loc u64, count u64) ?i64 {
+	mut backing := this.backing
+	return backing.write(handle, buf, loc, count)
+}
+
+fn (mut this MknodDeviceResource) ioctl(handle voidptr, request u64, argp voidptr) ?int {
+	mut backing := this.backing
+	return backing.ioctl(handle, request, argp)
+}
+
+fn (mut this MknodDeviceResource) mmap(handle voidptr, page u64, flags int) voidptr {
+	mut backing := this.backing
+	return backing.mmap(handle, page, flags)
+}
+
+fn (mut this MknodDeviceResource) grow(_handle voidptr, _new_size u64) ? {
+	return
+}
+
+fn (mut this MknodDeviceResource) unref(_handle voidptr) ? {
+	if !katomic.dec(mut &this.refcount) {
+		release_resource_after_grace(this.backing)
+		free_after_grace(voidptr(this.boxed))
+		free_charged_after_grace(voidptr(this), this.kernel_charge)
+	}
+}
+
+fn (mut this MknodDeviceResource) link(_handle voidptr) ? {
+	katomic.inc(mut &this.stat.nlink)
+}
+
+fn (mut this MknodDeviceResource) unlink(_handle voidptr) ? {
+	katomic.dec(mut &this.stat.nlink)
+}
+
+__global (
+	special_inode_counter = u64(1) << 40
+)
+
+// A node mknod(2) makes is numbered as a file of the filesystem it is made in:
+// that filesystem's device, and an inode number of its own. Go's directory
+// reader skips an entry numbered 0 as a deleted one, so a FIFO or an overlay
+// whiteout numbered 0 could not be listed, packed into an image layer or
+// removed by os.RemoveAll.
+fn number_special_node(mut res resource.Resource, parent &VFSNode) {
+	if parent.resource != unsafe { nil } {
+		res.stat.dev = parent.resource.stat.dev
+	}
+	mut filesystem := parent.filesystem
+	if filesystem != unsafe { nil } {
+		if mut filesystem is TmpFS {
+			res.stat.ino = filesystem.inode_counter
+			filesystem.inode_counter++
+			return
+		}
+	}
+	res.stat.ino = special_inode_counter
+	special_inode_counter++
+}
+
+// The device the kernel published under `name`, or nil.
+fn device_by_name(name string) &resource.Resource {
+	if unsafe { devtmpfs_root == 0 } || devtmpfs_root.children == unsafe { nil } {
+		return unsafe { nil }
+	}
+	if name !in devtmpfs_root.children {
+		return unsafe { nil }
+	}
+	node := unsafe { devtmpfs_root.children[name] }
+	if node == unsafe { nil } {
+		return unsafe { nil }
+	}
+	return node.resource
+}
+
+// The device the kernel published with the number `rdev`, of the kind
+// (character or block) `kind` is, or nil. Looked for in /dev and one level
+// of directories below it, where /dev/dri/card0 is.
+fn device_by_number(kind u32, rdev u64) &resource.Resource {
+	if unsafe { devtmpfs_root == 0 } {
+		return unsafe { nil }
+	}
+	return find_device_number(devtmpfs_root, kind, rdev, 1)
+}
+
+fn find_device_number(directory &VFSNode, kind u32, rdev u64, depth int) &resource.Resource {
+	if directory.children == unsafe { nil } {
+		return unsafe { nil }
+	}
+	for _, node in directory.children {
+		if node == unsafe { nil } || node.resource == unsafe { nil } || is_dot_name(node.name) {
+			continue
+		}
+		node_kind := node.resource.stat.mode & stat.ifmt
+		if node_kind == kind && node.resource.stat.rdev == rdev {
+			return node.resource
+		}
+		if node_kind == stat.ifdir && depth > 0 {
+			found := find_device_number(node, kind, rdev, depth - 1)
+			if found != unsafe { nil } {
+				return found
+			}
+		}
+	}
+	return unsafe { nil }
+}
+
+// A node leads to the device of its name, as the ones a runtime makes in
+// every container do. A name Vinix has no device by -- `docker run --device
+// /dev/zero:/dev/myzero` -- leads to the device with its number instead,
+// which the runtime took from the host's node.
+fn make_device_node(mut parent VFSNode, name string, mode u32, rdev u64) ?&VFSNode {
+	mut backing := device_by_name(name)
+	// 0/0 is no device: it is what an overlay whiteout is made as.
+	if backing == unsafe { nil } && rdev != 0 {
+		backing = device_by_number(mode & stat.ifmt, rdev)
+	}
+	if backing == unsafe { nil } {
+		// A device Vinix does not have. /dev/null stands in: writes are
+		// discarded and reads give EOF, which is what an unbacked device node
+		// in a container is least likely to be harmed by.
+		fallback := device_by_name('null')
+		if fallback == unsafe { nil } {
+			errno.set(errno.enodev)
+			return none
+		}
+		return install_device_node(mut parent, name, mode, rdev, fallback)
+	}
+	return install_device_node(mut parent, name, mode, rdev, backing)
+}
+
+fn install_device_node(mut parent VFSNode, name string, mode u32, rdev u64, backing &resource.Resource) ?&VFSNode {
+ node := prepare_device_node(mut parent, name, mode, rdev, backing)?
+ publish_child(parent, name, node)
+ return node
+}
+
+fn prepare_device_node(mut parent VFSNode, name string, mode u32, rdev u64, backing &resource.Resource) ?&VFSNode {
+	charge := proc.reserve_kernel(.file, 8192)?
+	mut transferred := false
+	defer { if !transferred { kbudget.release(charge) } }
+	wrapper_charge := proc.reserve_kernel(.file, 4096)?
+ mut node := create_node(parent.filesystem, parent, name.clone(), false)
+	node.kernel_charge = charge
+	transferred = true
+	mut actual_backing := unsafe { backing }
+	resource.retain_resource(mut actual_backing)
+
+	mut res := &MknodDeviceResource{
+		kernel_charge: wrapper_charge
+		refcount: 1
+		backing:  unsafe { backing }
+	}
+	res.stat.mode = mode
+	res.stat.rdev = rdev
+	res.stat.nlink = 1
+	res.stat.blksize = 512
+	res.can_mmap = backing.can_mmap
+	res.stat.atim = realtime_clock
+	res.stat.ctim = realtime_clock
+	res.stat.mtim = realtime_clock
+	// One interface value, kept for the life of the node: passing `res` where
+	// a resource.Resource is taken makes a new one each time.
+	mut boxed := &resource.Resource(res)
+	res.boxed = boxed
+	number_special_node(mut boxed, parent)
+	node.resource = boxed
+	apply_creation_identity(mut node, parent) or {
+		failure := errno.get()
+		// This unpublished wrapper owns one backing reference. Return it
+		// outside VFS locks; its final release can detach a device pathname.
+		node.resource = unsafe { nil }
+		kbudget.release(wrapper_charge)
+		release_resource_after_grace(backing)
+		unsafe { free(boxed); free(res) }
+		retire_node(mut node)
+		errno.set(failure)
+		return none
+	}
+	return node
+}
+
+fn make_fifo_node(mut parent VFSNode, name string, mode u32) ?&VFSNode {
+	charge := proc.reserve_kernel(.file, 8192)?
+	mut transferred := false
+	defer { if !transferred { kbudget.release(charge) } }
+	// A named pipe has no ends open until something opens one, and blocks
+	// an opener until the other side arrives; see pipe.create_fifo.
+	mut new_pipe := pipe.create_fifo(mode) or {
+		errno.set(errno.enomem)
+		return none
+	}
+	// One interface value for the node, rather than one more for the call.
+	mut boxed := new_pipe.box
+	number_special_node(mut boxed, parent)
+	mut node := create_node(parent.filesystem, parent, name.clone(), false)
+	node.kernel_charge = charge
+	transferred = true
+	node.resource = boxed
+	apply_creation_identity(mut node, parent) or {
+		failure := errno.get()
+		discard_created_node(mut node, parent)
+		errno.set(failure)
+		return none
+	}
+	publish_child(parent, name, node)
+	return node
+}
+
+pub fn syscall_mknodat(_ voidptr, dirfd int, _path charptr, mode u32, dev u64) (u64, u64) {
+	path := user_path(_path) or { return errno.err, errno.get() }
+	defer {
+		unsafe { path.free() }
+	}
+	if path.len == 0 {
+		return errno.err, errno.enoent
+	}
+	kind := mode & stat.ifmt
+	// A device node needs the privilege to make one; a FIFO or a plain file
+	// does not, exactly as on Linux.
+	if (kind == stat.ifchr || kind == stat.ifblk)
+		&& (!proc.mac_trusted() || !proc.current_has_capability(proc.cap_mknod)) {
+		return errno.err, errno.eperm
+	}
+
+	identity := unsafe { &lib.MountContext(C.vinix_stack_alloc(sizeof(lib.MountContext))) }
+	parent := parent_and_mount_for(dirfd, path, identity) or { return errno.err, errno.get() }
+	vfs_lock.acquire()
+	defer { vfs_lock.release() }
+	// A view into `path`: the node made below is given a copy of its own.
+	parent_of_tgt_node, target_node, basename := walk_path_on_mount(parent, path, 0, true, identity)
+	if unsafe { parent_of_tgt_node == 0 } {
+		return errno.err, errno.get()
+	}
+	require_linked(parent_of_tgt_node) or { return errno.err, errno.get() }
+	// pledge(2) asks "dpath" for a FIFO or a device and "cpath" for a file.
+	policy_access := if kind == stat.ififo || kind == stat.ifchr || kind == stat.ifblk {
+		proc.policy_device
+	} else {
+		proc.policy_create
+	}
+	if !policy_check_name(parent_of_tgt_node, basename, policy_access) {
+		return errno.err, errno.get()
+	}
+	if unsafe { target_node != 0 } {
+		return errno.err, errno.eexist
+	}
+	if read_only_on_mount(parent_of_tgt_node, identity) {
+		return errno.err, errno.erofs
+	}
+	if !attr_allows_dir_add(parent_of_tgt_node) {
+		return errno.err, errno.get()
+	}
+	require_access(parent_of_tgt_node, access_write | access_exec) or {
+		return errno.err, errno.get()
+	}
+
+	mut dir := unsafe { parent_of_tgt_node }
+	umask := proc.current_thread().process.umask
+	final_mode := (mode & ~umask) & 0o7777
+
+	// A FIFO or a device node in an overlay directory is made in its upper
+	// layer.
+	if dir.overlay != unsafe { nil } && (kind == stat.ififo || kind == stat.ifchr
+		|| kind == stat.ifblk) {
+		overlay_mknod(mut dir, basename, kind | final_mode, dev) or {
+			return errno.err, errno.get()
+		}
+		return 0, 0
+	}
+	match kind {
+		0, stat.ifreg {
+			// Keep the same attachment for the regular-file creation walk too.
+			internal_create_resolved_locked(dir, basename, stat.ifreg | (mode & 0o7777),
+				0, true, identity, 0, false, true, 0) or {
+				return errno.err, errno.get()
+			}
+		}
+		stat.ififo {
+			make_fifo_node(mut dir, basename, final_mode) or {
+				return errno.err, errno.get()
+			}
+		}
+		stat.ifchr, stat.ifblk {
+			make_device_node(mut dir, basename, kind | final_mode, dev) or {
+				return errno.err, errno.get()
+			}
+		}
+		stat.ifsock {
+			// A filesystem socket node with no bound socket: a placeholder a
+			// runtime can bind to later is not modelled, so refuse rather than
+			// leave a file that cannot be connected.
+			return errno.err, errno.eperm
+		}
+		else {
+			return errno.err, errno.einval
+		}
+	}
+	return 0, 0
+}
+
+// Dynamically retired device wrappers cannot be resurrected by a lockless
+// lookup. Other published devices may start with a zero static refcount.
+fn retain_open_origin(mut res resource.Resource) ? {
+ if res is MknodDeviceResource || res is LogicalVolume {
+  for {
+   refs := katomic.load(&res.refcount)
+   if refs == 0 { errno.set(errno.enoent); return none }
+   if katomic.cas(mut &res.refcount, refs, refs + 1) { return }
+  }
+ }
+ resource.retain_resource(mut res)
+}

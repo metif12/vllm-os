@@ -1,0 +1,1825 @@
+module file
+
+import kbudget
+import krandom
+import resource
+import proc
+import klock
+import katomic
+import errno
+import stat
+import event
+import event.eventstruct
+import memory
+import memory.mmap
+import time
+import usercopy
+import lib
+import security
+
+pub const f_dupfd = 0
+pub const f_dupfd_cloexec = 1030
+pub const f_dupfd_query = 1027
+pub const f_created_query = 1028
+pub const f_setpipe_sz = 1031
+pub const f_getpipe_sz = 1032
+pub const f_getfd = 1
+pub const f_setfd = 2
+pub const f_getfl = 3
+pub const f_setfl = 4
+
+// close_range(2) flags.
+pub const close_range_cloexec = u32(1) << 2
+pub const f_add_seals = 1033
+pub const f_get_seals = 1034
+pub const f_ofd_getlk = 36
+pub const f_ofd_setlk = 37
+pub const f_ofd_setlkw = 38
+pub const f_getlk = 5
+pub const f_setlk = 6
+pub const f_setlkw = 7
+pub const f_setown = 8
+pub const f_getown = 9
+pub const f_setsig = 10
+pub const f_getsig = 11
+pub const f_setown_ex = 15
+pub const f_getown_ex = 16
+
+const f_owner_tid = 0
+const f_owner_pid = 1
+const f_owner_pgrp = 2
+
+const f_rdlck = i16(0)
+const f_wrlck = i16(1)
+const f_unlck = i16(2)
+
+struct Flock {
+mut:
+	l_type   i16
+	l_whence i16
+	l_start  i64
+	l_len    i64
+	l_pid    i32
+}
+
+pub const fd_cloexec = 1
+
+pub struct Handle {
+pub mut:
+	kernel_charge kbudget.Charge
+	l             klock.Lock
+	resource      &resource.Resource = unsafe { nil }
+ // The path resource stays alive across blocking/delegated opens and for
+ // metadata through Handle.node, even when resource is a different device.
+ origin_resource &resource.Resource = unsafe { nil }
+	// An openable device may return another resource class. Keep its origin
+	// so that passing the resulting descriptor cannot erase the device gate.
+	mac_device bool
+	mac_block_device bool
+	// Opened from a device of the seat, by this login session (0: by the
+	// system). Checked at every use; see proc/login.v.
+	seat_gated bool
+	// Whether this open created its file; immutable before table publication.
+	// Duplicates and fork retain this same description.
+	created bool
+	seat_owner u32
+	node          voidptr
+	// Identity of the mount traversed at open, rather than the inode's aliases.
+	// Mount entries are permanent; fs resolves namespace copies by mount id.
+	mount         lib.MountContext
+	// One writer pin belongs to this shared open description, not each FD.
+	mount_writer  voidptr
+	// One actual-attachment pin for this description's entire retained lifetime.
+	// Dup/fork, in-flight lookups, mappings and queued rights share the pin.
+	mount_description voidptr
+	refcount      int
+	loc           i64
+	flags         int
+	// Shared by dup/fork with the file position, under l. Random advice
+	// suppresses automatic prefetch; explicit WILLNEED remains available.
+	read_advice   int
+	read_next     u64
+	read_streak   u32
+	read_ahead_end u64
+	dirlist_valid bool
+	dirlist       []stat.Dirent
+	dirlist_index u64
+	// The F_OWNER_* kind and kernel PID number selected by F_SETOWN, under l.
+	// Getters map attached tasks into the caller's namespace. This stores a
+	// number, not a retained PID identity; I/O readiness raises no SIGIO here.
+	owner_type int
+	owner_id   int
+	signal     int
+	// How many of `refcount` are epoll sets' registrations of it.
+	epoll_refs int
+}
+
+__global (
+	handle_released fn (voidptr)
+	mount_policy_flags fn (&lib.MountContext) u64
+	mount_writer_released fn (voidptr)
+)
+
+// on_handle_released has `f` called with a handle's node as the handle is
+// freed: the VFS counts the handles that lead to each node.
+pub fn on_handle_released(f fn (voidptr)) {
+	handle_released = f
+}
+
+pub fn on_mount_flags(f fn (&lib.MountContext) u64) {
+	mount_policy_flags = f
+}
+
+pub fn on_mount_writer_released(f fn (voidptr)) {
+	mount_writer_released = f
+}
+
+// A Handle is the open-file description shared by dup() and fork(). Its
+// resource reference must therefore be released exactly once, after both the
+// final descriptor and every in-flight lookup have dropped their references.
+fn (mut this Handle) unref() {
+	if katomic.dec(mut &this.refcount) {
+		// Only epoll sets hold it now: its last descriptor is closed, and, as
+		// on Linux, it leaves every set that watches it.
+		watches := katomic.load(&this.epoll_refs)
+		if watches != 0 && katomic.load(&this.refcount) == watches {
+			epoll_forget(this)
+		}
+		return
+	}
+
+	kbudget.release(this.kernel_charge)
+	release_description_locks(this, false)
+	mut res := this.resource
+	res.unref(voidptr(this)) or {}
+ if this.origin_resource != unsafe { nil } {
+  mut origin := this.origin_resource
+  resource.release_resource(mut origin)
+ }
+	if this.mount_writer != unsafe { nil } && mount_writer_released != unsafe { nil } {
+		mount_writer_released(this.mount_writer)
+	}
+	if this.node != unsafe { nil } && voidptr(handle_released) != unsafe { nil } {
+		handle_released(this.node)
+	}
+	// Keep unmount busy until every filesystem/resource close callback above
+	// has finished. The remaining bookkeeping only frees this handle's memory.
+	if this.mount_description != unsafe { nil } && mount_description_released != unsafe { nil } {
+		mount_description_released(this.mount_description)
+	}
+	unsafe {
+		this.dirlist.free()
+		free(voidptr(this))
+	}
+}
+
+fn retain_mmap_handle(handle voidptr) {
+	if handle == unsafe { nil } {
+		return
+	}
+	mut open_handle := unsafe { &Handle(handle) }
+	katomic.inc(mut &open_handle.refcount)
+}
+
+fn release_mmap_handle(handle voidptr) {
+	if handle == unsafe { nil } {
+		return
+	}
+	mut open_handle := unsafe { &Handle(handle) }
+	open_handle.unref()
+}
+
+struct PollFD {
+mut:
+	// Linux and mlibc expose pollfd.fd as a signed 32-bit C int. V3's plain
+	// `int` is pointer-width, so spelling this field explicitly keeps the
+	// userspace ABI at its required eight-byte layout on 64-bit kernels.
+	fd      i32
+	events  i16
+	revents i16
+}
+
+pub const pollin = 0x01
+pub const pollout = 0x04
+pub const pollpri = 0x02
+pub const pollhup = 0x10
+pub const pollerr = 0x08
+pub const pollrdhup = 0x2000
+pub const pollnval = 0x20
+pub const pollwrnorm = 0x100
+
+// POLLERR and POLLHUP are reported even when userspace did not ask for them.
+// In particular, readers use POLLHUP to notice that the final writer of a
+// pipe has gone away and drain it to EOF.
+fn poll_revents(status int, requested i16) i16 {
+	return (i16(status) & requested) | (i16(status) & i16(pollerr | pollhup))
+}
+
+fn ppoll(fds &PollFD, nfds u64, tmo_p &time.TimeSpec, sigmask &u64) (u64, u64) {
+	if voidptr(sigmask) != unsafe { nil } {
+		mut t := proc.current_thread()
+		proc.begin_wait_mask(mut t, *sigmask)
+	}
+	if voidptr(tmo_p) != unsafe { nil }
+		&& (tmo_p.tv_sec < 0 || tmo_p.tv_nsec < 0 || tmo_p.tv_nsec >= 1000000000) {
+		return errno.err, errno.einval
+	}
+
+	// poll(NULL, 0, timeout) is a sleep used by glibc and UI event loops.
+	// Keep a signal-interruptible event even without a timeout; returning
+	// immediately here makes a supposedly sleeping loop spin at full speed.
+	if nfds == 0 {
+		if voidptr(tmo_p) != unsafe { nil } && tmo_p.tv_sec == 0 && tmo_p.tv_nsec == 0 {
+			return 0, 0
+		}
+		// The event only lives for this synchronous wait. V promoted the local
+		// Event when its address escaped through the listener list, retaining
+		// one slab object on every interrupted poll(NULL, 0, ...).
+		mut sleeper := unsafe { &eventstruct.Event(C.vinix_stack_alloc(sizeof(eventstruct.Event))) }
+		unsafe { *sleeper = eventstruct.Event{} }
+		mut sleep_storage := unsafe { &&eventstruct.Event(C.vinix_stack_alloc(sizeof(voidptr))) }
+		unsafe { *sleep_storage = sleeper }
+		mut timer := &time.Timer(unsafe { nil })
+		if voidptr(tmo_p) != unsafe { nil } {
+			timer = time.new_timer(*tmo_p)
+			unsafe { *sleep_storage = &timer.event }
+		}
+		mut sleep_events := unsafe { event.stack_list(sleep_storage, 1) }
+		defer {
+			if voidptr(timer) != unsafe { nil } {
+				timer.disarm()
+				unsafe { free(timer) }
+			}
+		}
+		event.await(mut sleep_events, true) or { return errno.err, errno.eintr }
+		return 0, 0
+	}
+
+	// Sized up front: growing them would leave each outgrown block behind.
+	mut fdlist := []&FD{cap: int(nfds)} @[freed]
+	mut fdnums := []u64{cap: int(nfds)} @[freed]
+	mut events := []&eventstruct.Event{cap: int(nfds) + 1} @[freed]
+	mut generations := []u64{cap: int(nfds) + 1} @[freed]
+
+	defer {
+		for mut f in fdlist {
+			f.unref()
+		}
+		unsafe {
+			events.free()
+			generations.free()
+			fdnums.free()
+			fdlist.free()
+		}
+	}
+
+	mut ret := u64(0)
+
+	for i := u64(0); i < nfds; i++ {
+		mut fdd := unsafe { &fds[i] }
+
+		fdd.revents = 0
+
+		if fdd.fd < 0 {
+			continue
+		}
+
+		mut fd := fd_from_fdnum(unsafe { nil }, int(fdd.fd)) or {
+			fdd.revents = pollnval
+			ret++
+			continue
+		}
+		// Path-only descriptions are metadata handles, not pollable files.
+		// POLLNVAL is unconditional, including an empty requested event mask.
+		if fd.handle.flags & resource.o_path != 0 {
+			fd.unref()
+			fdd.revents = pollnval
+			ret++
+			continue
+		}
+
+		mut resource_ := fd.handle.resource
+
+		status := resource.poll_status(mut resource_)
+
+		revents := poll_revents(status, fdd.events)
+		if revents != 0 {
+			fdd.revents = revents
+			ret++
+			fd.unref()
+			continue
+		}
+
+		fdlist << fd
+		fdnums << i
+		events << &resource_.event
+	}
+
+	if ret != 0 {
+		return ret, 0
+	}
+
+	// A zero timeout is only a readiness probe, even with descriptors.
+	if voidptr(tmo_p) != unsafe { nil } && tmo_p.tv_sec == 0 && tmo_p.tv_nsec == 0 {
+		return 0, 0
+	}
+
+	// The scheduler stores at most max_events distinct listeners per thread.
+	// Count shared resource events once, plus the optional timeout event.
+	mut needed_events := if voidptr(tmo_p) != unsafe { nil } { 1 } else { 0 }
+	for i in 0 .. events.len {
+		mut duplicate := false
+		for j in 0 .. i {
+			if voidptr(events[i]) == voidptr(events[j]) { duplicate = true; break }
+		}
+		if !duplicate { needed_events++ }
+		if needed_events > proc.max_events { return errno.err, errno.einval }
+	}
+
+	mut timer := &time.Timer(unsafe { nil })
+
+	if voidptr(tmo_p) != unsafe { nil } {
+		mut target_time := *tmo_p
+
+		timer = time.new_timer(target_time)
+
+		events << &timer.event
+	}
+
+	defer {
+		if voidptr(timer) != unsafe { nil } {
+			timer.disarm()
+			unsafe { free(timer) }
+		}
+	}
+
+	mut timed_out := false
+	for {
+		generations.clear()
+		for mut ev in events { generations << event.generation(mut ev) }
+		// Recheck after sampling generations. Exit readiness is permanent,
+		// whereas an event's pending wake can be consumed by another poller.
+		for i in 0 .. fdlist.len {
+			mut fdd := unsafe { &fds[fdnums[i]] }
+			fdd.revents = poll_revents(resource.poll_status(mut fdlist[i].handle.resource), fdd.events)
+			if fdd.revents != 0 { ret++ }
+		}
+		if ret != 0 { return ret, 0 }
+		if timed_out { return 0, 0 }
+		which := event.await_changes(mut events, generations, true) or { return errno.err, errno.eintr }
+		timed_out = voidptr(timer) != unsafe { nil } && which == u64(events.len) - 1
+		// Rescan every descriptor after a wake. Several pollfds can refer to
+		// the same event, and readiness may change before a timeout wakes us.
+	}
+}
+
+// ppoll may sleep while a socket or pipe becomes ready. Keep the poll array,
+// timeout and signal mask in kernel memory across that wait: dereferencing the
+// caller's virtual addresses after the scheduler has run can fault in EL1, and
+// malformed userspace pointers must return EFAULT rather than crash the kernel.
+pub fn syscall_ppoll(_ voidptr, user_fds u64, nfds u64, user_timeout u64, user_sigmask u64) (u64, u64) {
+	if nfds > 4096 {
+		return errno.err, errno.einval
+	}
+	pagemap := proc.current_thread().process.pagemap
+
+	scratch := proc.reserve_kernel(.scratch, nfds * 128 + 256) or { return errno.err, errno.get() }
+	defer { kbudget.release(scratch) }
+	mut pollfds := []PollFD{len: int(nfds)} @[freed]
+	defer {
+		unsafe { pollfds.free() }
+	}
+	if nfds != 0
+		&& !usercopy.copy_from_user(unsafe { voidptr(&pollfds[0]) }, user_fds, nfds * sizeof(PollFD)) {
+		return errno.err, errno.efault
+	}
+
+	// Fixed-array locals escape to the heap when their elements' addresses
+	// reach another function, even through unsafe. The wait is synchronous;
+	// these explicit caller-stack slots remain live across its sleep.
+	timeout_storage := unsafe { &time.TimeSpec(C.vinix_stack_alloc(sizeof(time.TimeSpec))) }
+	mut timeout_ptr := &time.TimeSpec(unsafe { nil })
+	if user_timeout != 0 {
+		if !usercopy.copy_from_user(voidptr(timeout_storage), user_timeout, sizeof(time.TimeSpec)) {
+			return errno.err, errno.efault
+		}
+		timeout_ptr = timeout_storage
+	}
+
+	sigmask_storage := unsafe { &u64(C.vinix_stack_alloc(sizeof(u64))) }
+	mut sigmask_ptr := &u64(unsafe { nil })
+	if user_sigmask != 0 {
+		if !usercopy.copy_from_user(voidptr(sigmask_storage), user_sigmask, sizeof(u64)) {
+			return errno.err, errno.efault
+		}
+		sigmask_ptr = sigmask_storage
+	}
+	ret, err := poll_user_fds(pagemap, user_fds, mut pollfds, nfds, timeout_ptr, sigmask_ptr)
+	return ret, err
+}
+
+// poll(2), which x86-64 Linux programs call rather than ppoll: musl's DNS
+// resolver among them. The timeout is in milliseconds, and negative for none.
+pub fn syscall_poll(_ voidptr, user_fds u64, nfds u64, timeout_ms u64) (u64, u64) {
+	if nfds > 4096 {
+		return errno.err, errno.einval
+	}
+	pagemap := proc.current_thread().process.pagemap
+
+	scratch := proc.reserve_kernel(.scratch, nfds * 128 + 256) or { return errno.err, errno.get() }
+	defer { kbudget.release(scratch) }
+	mut pollfds := []PollFD{len: int(nfds)} @[freed]
+	defer {
+		unsafe { pollfds.free() }
+	}
+	if nfds != 0
+		&& !usercopy.copy_from_user(unsafe { voidptr(&pollfds[0]) }, user_fds, nfds * sizeof(PollFD)) {
+		return errno.err, errno.efault
+	}
+
+	// The C int arrives in a 64-bit register; only its low half is defined.
+	milliseconds := i64(i32(u32(timeout_ms)))
+	timeout_storage := unsafe { &time.TimeSpec(C.vinix_stack_alloc(sizeof(time.TimeSpec))) }
+	unsafe { *timeout_storage = time.TimeSpec{
+		tv_sec: milliseconds / 1000
+		tv_nsec: (milliseconds % 1000) * 1000000
+	} }
+	mut timeout_ptr := &time.TimeSpec(unsafe { nil })
+	if milliseconds >= 0 {
+		timeout_ptr = timeout_storage
+	}
+	ret, err := poll_user_fds(pagemap, user_fds, mut pollfds, nfds, timeout_ptr, unsafe { nil })
+	return ret, err
+}
+
+// Wait on a poll array already copied in from `pagemap`, then copy the
+// results back out.
+fn poll_user_fds(pagemap &memory.Pagemap, user_fds u64, mut pollfds []PollFD, nfds u64, timeout_ptr &time.TimeSpec, sigmask_ptr &u64) (u64, u64) {
+	mut fds_ptr := &PollFD(unsafe { nil })
+	if nfds != 0 {
+		fds_ptr = unsafe { &pollfds[0] }
+	}
+	ret, err := ppoll(fds_ptr, nfds, timeout_ptr, sigmask_ptr)
+	if err != 0 {
+		return ret, err
+	}
+	if nfds != 0
+		&& !usercopy.copy_to_pagemap(pagemap, user_fds, unsafe { voidptr(&pollfds[0]) }, nfds * sizeof(PollFD)) {
+		return errno.err, errno.efault
+	}
+	return ret, 0
+}
+
+// Streams synchronize their own queues and may sleep without the shared offset lock.
+fn stream_mode(mode u32) bool {
+	return stat.ischr(mode) || stat.isifo(mode) || stat.issock(mode)
+		|| mode & stat.ifmt == stat.ifpipe
+}
+
+pub fn (mut this Handle) mac_check(access u32) ? {
+	if this.seat_gated && !proc.seat_allows(this.seat_owner) {
+		errno.set(errno.eacces)
+		return none
+	}
+	if !proc.mac_trusted() && this.mac_device {
+		if this.mac_block_device || !proc.mac_allows(proc.mac_current_domain(), proc.mac_device_type, access) {
+			errno.set(errno.eacces); return none
+		}
+	}
+	mut res := this.resource
+	security.mac_require(mut res, access)?
+}
+
+pub fn (mut this Handle) read(buf voidptr, count u64) ?i64 {
+	this.mac_check(proc.mac_read)?
+	// Directories are enumerated with getdents, never exposed as byte files.
+	// This also applies to zero-count and kernel-buffer reads.
+	if stat.isdir(this.resource.stat.mode) {
+		errno.set(errno.eisdir)
+		return none
+	}
+	if stream_mode(this.resource.stat.mode) {
+		ret := this.resource.read(voidptr(this), buf, 0, count)?
+		// A read of the keyboard may have waited across a change of seat.
+		// What it then got was typed for someone else: it is not delivered.
+		if this.seat_gated && !proc.seat_allows(this.seat_owner) {
+			errno.set(errno.eacces)
+			return none
+		}
+		return ret
+	}
+	this.l.acquire()
+	defer {
+		this.l.release()
+	}
+	start := u64(this.loc)
+	ret := this.resource.read(voidptr(this), buf, start, count) or { return none }
+	if stat.isreg(this.resource.stat.mode) { proc.account_file_transfer(ret, false) }
+	this.loc += ret
+	if ret > 0 && stat.isreg(this.resource.stat.mode) {
+		this.sequential_read(start, u64(ret))
+	}
+	return ret
+}
+
+// The successful read has released the resource's locks; the open description
+// remains pinned and locked. Hints cannot change its return value or errno.
+fn (mut this Handle) sequential_read(start u64, count u64) {
+	if this.read_advice == 1 { return }
+	if start != this.read_next {
+		this.read_streak = 0
+		this.read_ahead_end = 0
+	}
+	this.read_next = start + count
+	if this.read_streak < 2 { this.read_streak++ }
+	if this.read_streak < 2 || this.read_next < this.read_ahead_end { return }
+	size := if this.resource.stat.size > 0 { u64(this.resource.stat.size) } else { u64(0) }
+	if this.read_next >= size { return }
+	window := if this.read_advice == 2 { u64(256 * 1024) } else { u64(128 * 1024) }
+	length := if size - this.read_next < window { size - this.read_next } else { window }
+	old_errno := errno.get()
+	mut res := this.resource
+	resource.advise_resource(mut res, voidptr(this), this.read_next, length, 3) or {}
+	errno.set(old_errno)
+	this.read_ahead_end = this.read_next + length
+}
+
+// The largest piece of a read or write that goes through one kernel buffer.
+const user_io_chunk = u64(64 * 1024)
+
+// The most taken at once from what hands over a message: a socket or a pipe.
+// No socket family takes a message longer than this (socket.unix.sock_buf).
+const user_io_message_max = u64(1024 * 1024)
+
+// A resource's read() and write() are given kernel memory, always. What a
+// process reads or writes goes through a kernel buffer here, and to or from
+// the process through usercopy, which is what tells a pointer that leads
+// nowhere, or into the kernel, from one that is the process's own. A resource
+// also must not touch a user page while it holds filesystem or device locks: a
+// missing page faults in the middle of that critical section, and the fault
+// handler may need the same resource to page it in.
+pub fn (mut this Handle) read_to_user(address u64, count u64) ?i64 {
+	if count == 0 {
+		return this.read(unsafe { nil }, 0)
+	}
+	if !usercopy.user_range(address, count) {
+		errno.set(errno.efault)
+		return none
+	}
+	mode := this.resource.stat.mode
+	// Reject the type before probing a destination or allocating scratch:
+	// Linux's directory read operation never touches the user buffer.
+	if stat.isdir(mode) {
+		this.mac_check(proc.mac_read)?
+		errno.set(errno.eisdir)
+		return none
+	}
+	// What a pipe, a socket or a device gives up is gone from it: find out
+	// that there is nowhere to put it before taking it.
+	if !stat.isreg(mode) && !usercopy.writable(address) {
+		errno.set(errno.efault)
+		return none
+	}
+	// Streams return one available piece. Another read may wait for more
+	// input or combine separate messages.
+	once := stream_mode(mode)
+	limit := if once { user_io_message_max } else { user_io_chunk }
+	size := if count < limit { count } else { limit }
+	// Own this temporary explicitly: the compiler can move a fixed array
+	// whose address reaches a resource to the heap, even inside unsafe.
+	scratch := proc.reserve_kernel(.scratch, size * 2 + 128)?
+	defer { kbudget.release(scratch) }
+	buffer := unsafe { malloc(size) } @[freed]
+	if buffer == unsafe { nil } {
+		errno.set(errno.enomem)
+		return none
+	}
+	defer {
+		krandom.explicit_bzero(buffer, u32(size))
+		unsafe { free(buffer) }
+	}
+	// A file or disk can be read in chunks. A stream supplies one piece;
+	// asking again could block after already consuming the caller's data.
+	mut done := u64(0)
+	for done < count {
+		chunk := if count - done < size { count - done } else { size }
+		read := this.read(buffer, chunk) or {
+			if done != 0 { return i64(done) }
+			return none
+		}
+		if read <= 0 {
+			return i64(done)
+		}
+		if !usercopy.copy_to_user(address + done, buffer, u64(read)) {
+			errno.set(errno.efault)
+			if done != 0 { return i64(done) }
+			return none
+		}
+		done += u64(read)
+		if once || u64(read) < chunk { break }
+	}
+	return i64(done)
+}
+
+fn limited_write_count(res &resource.Resource, location u64, count u64) ?u64 {
+	if !stat.isreg(res.stat.mode) || count == 0 {
+		return count
+	}
+	limit := proc.soft_limit(proc.current_thread().process, proc.rlimit_fsize)
+	if limit == proc.rlim_infinity {
+		return count
+	}
+	if location >= limit {
+		errno.set(errno.efbig)
+		return none
+	}
+	return if count > limit - location { limit - location } else { count }
+}
+
+pub fn (mut this Handle) write(buf voidptr, count u64) ?i64 {
+	this.mac_check(proc.mac_write)?
+	block_token := security.begin_user_device_write(mut this.resource)?
+	defer { security.end_user_device_write(block_token) }
+	if stream_mode(this.resource.stat.mode) {
+		return this.resource.write(voidptr(this), buf, 0, count)
+	}
+	this.l.acquire()
+	defer {
+		this.l.release()
+	}
+	// Recheck file policy for every operation, including descriptions opened
+	// before chattr sealed the inode. All write/writev/sendfile/splice paths
+	// pass through here; testing only at open lets an old FD bypass the seal.
+	mut res := this.resource
+	bits := resource.attributes(mut res)
+	if bits & resource.attribute_immutable != 0
+		|| (bits & resource.attribute_append != 0 && this.flags & resource.o_append == 0) {
+		errno.set(errno.eperm)
+		return none
+	}
+	// O_APPEND chooses the end of the file for every write, rather than only
+	// setting the descriptor's initial offset. Go's builder relies on this when
+	// it adds native objects to the archive produced by the compiler.
+	mut ret := i64(0)
+	if this.flags & resource.o_append != 0 && stat.isreg(this.resource.stat.mode) {
+		limit := proc.soft_limit(proc.current_thread().process, proc.rlimit_fsize)
+		appended := resource.append_write(mut res, voidptr(this), buf, count, limit)?
+		ret = appended.written
+		this.loc = i64(appended.end)
+	} else {
+		allowed := limited_write_count(this.resource, u64(this.loc), count)?
+		ret = this.resource.write(voidptr(this), buf, u64(this.loc), allowed)?
+		this.loc += ret
+	}
+	if stat.isreg(this.resource.stat.mode) { proc.account_file_transfer(ret, true) }
+	if this.flags & resource.o_dsync != 0 {
+		resource.sync_resource(mut res, voidptr(this)) or { return none }
+	}
+	return ret
+}
+
+// write(2)'s side of read_to_user(). A long write goes in pieces, which is all
+// a stream promises. A socket's pieces are one byte longer than the longest
+// message any family takes: a stream takes them as it takes any, and a
+// datagram too long to send is refused by its family, with EMSGSIZE, rather
+// than cut in two here.
+pub fn (mut this Handle) write_from_user(address u64, count u64) ?i64 {
+	if count == 0 {
+		return this.write(unsafe { nil }, 0)
+	}
+	if !usercopy.user_range(address, count) {
+		errno.set(errno.efault)
+		return none
+	}
+	limit := if stat.issock(this.resource.stat.mode) {
+		user_io_message_max + 1
+	} else {
+		user_io_chunk
+	}
+	size := if count < limit { count } else { limit }
+	// Own this temporary explicitly: the compiler can move a fixed array
+	// whose address reaches a resource to the heap, even inside unsafe.
+	scratch := proc.reserve_kernel(.scratch, size * 2 + 128)?
+	defer { kbudget.release(scratch) }
+	buffer := unsafe { malloc(size) } @[freed]
+	if buffer == unsafe { nil } {
+		errno.set(errno.enomem)
+		return none
+	}
+	defer {
+		krandom.explicit_bzero(buffer, u32(size))
+		unsafe { free(buffer) }
+	}
+	mut done := u64(0)
+	for done < count {
+		chunk := if count - done < size { count - done } else { size }
+		if !usercopy.copy_from_user(buffer, address + done, chunk) {
+			errno.set(errno.efault)
+			if done != 0 { return i64(done) }
+			return none
+		}
+		written := this.write(buffer, chunk) or {
+			if done != 0 { return i64(done) }
+			return none
+		}
+		if written <= 0 { return i64(done) }
+		done += u64(written)
+		if u64(written) < chunk { break }
+	}
+	return i64(done)
+}
+
+pub fn (mut this Handle) ioctl(request u64, argp voidptr) ?int {
+	this.mac_check(proc.mac_ioctl)?
+	return this.resource.ioctl(voidptr(this), request, argp)
+}
+
+pub struct FD {
+pub mut:
+	kernel_charge kbudget.Charge
+	handle &Handle = unsafe { nil }
+	flags  int
+	// The descriptor table's reference, plus one for every syscall that has
+	// the descriptor from fd_from_fdnum(). close() drops the table's, so a
+	// syscall still running on a descriptor another thread closed keeps what
+	// it is using until it lets go.
+	refcount int = 1
+}
+
+// Give back the reference fd_from_fdnum() took, on the descriptor and on the
+// open file behind it. The descriptor goes once nothing holds it.
+pub fn (mut this FD) unref() {
+	mut handle := this.handle
+	handle.unref()
+	this.release_descriptor()
+}
+
+// Drop only the reference on the descriptor object, for a caller that keeps
+// the open-file reference fd_from_fdnum() took -- a descriptor being passed
+// over a socket.
+pub fn (mut this FD) release_descriptor() {
+	if !katomic.dec(mut &this.refcount) {
+		kbudget.release(this.kernel_charge)
+		unsafe { free(voidptr(this)) }
+	}
+}
+
+pub fn fdnum_close(_process &proc.Process, fdnum int, do_lock bool) ? {
+	mut process := &proc.Process(unsafe { nil })
+	if voidptr(_process) == unsafe { nil } {
+		process = proc.current_thread().process
+	} else {
+		process = unsafe { _process }
+	}
+
+	if fdnum < 0 || fdnum >= proc.max_fds {
+		errno.set(errno.ebadf)
+		return none
+	}
+
+	if do_lock {
+		process.fds_lock.acquire()
+	}
+	mut fd := if fdnum < process.fds.len { unsafe { &FD(process.fds[fdnum]) } } else { unsafe { nil } }
+	if fd == unsafe { nil } {
+		if do_lock {
+			process.fds_lock.release()
+		}
+		errno.set(errno.ebadf)
+		return none
+	}
+	process.fds[fdnum] = unsafe { nil }
+	// Out of the table, the descriptor is this call's alone, and what closing
+	// it sets going -- a pipe or a socket torn down, a file's pages freed -- is
+	// done without the table held. Exec and exit close descriptor after
+	// descriptor, and /proc/<pid>/fd, which a runtime reads of every process it
+	// starts, gives up on a table that stays held.
+	if do_lock {
+		process.fds_lock.release()
+	}
+	mut handle := fd.handle
+	// POSIX record locks are process-owned and closing any descriptor for the
+	// inode releases that process' locks, even when another dup remains open.
+	release_posix_locks(handle.resource, process.pid)
+	handle.unref()
+	fd.release_descriptor()
+}
+
+pub fn fdnum_create_from_fd(_process &proc.Process, fd &FD, oldfd int, specific bool) ?int {
+	mut process := &proc.Process(unsafe { nil })
+	if voidptr(_process) == unsafe { nil } {
+		process = proc.current_thread().process
+	} else {
+		process = unsafe { _process }
+	}
+
+	process.fds_lock.acquire()
+	defer {
+		process.fds_lock.release()
+	}
+
+	limit := if process.rlimits[proc.rlimit_nofile].cur < u64(proc.max_fds) {
+		int(process.rlimits[proc.rlimit_nofile].cur)
+	} else {
+		proc.max_fds
+	}
+	if oldfd < 0 {
+		errno.set(errno.einval)
+		return none
+	}
+	if !descriptor_mount_admitted(fd) {
+		errno.set(errno.ebusy)
+		return none
+	}
+	if specific == false {
+		// The lowest free number from oldfd up: in the table, or the first
+		// one past its end, which the table grows to hold.
+		mut i := oldfd
+		for ; i < limit && i < process.fds.len; i++ {
+			if process.fds[i] == unsafe { nil } {
+				process.fds[i] = voidptr(fd)
+				return i
+			}
+		}
+		if i >= limit || !grow_fd_table(mut process, i) {
+			errno.set(errno.emfile)
+			return none
+		}
+		process.fds[i] = voidptr(fd)
+		return i
+	} else {
+		if oldfd >= limit {
+			errno.set(errno.ebadf)
+			return none
+		}
+		if oldfd >= process.fds.len && !grow_fd_table(mut process, oldfd) {
+			errno.set(errno.emfile)
+			return none
+		}
+		fdnum_close(process, oldfd, false) or {}
+		process.fds[oldfd] = voidptr(fd)
+		return oldfd
+	}
+}
+
+// Adopt two privately constructed descriptors together. On refusal neither
+// table slot changes and the caller still owns both references; on success
+// the table owns them. Both borrowed output words are kernel scratch.
+pub fn fdnum_create_pair(_process &proc.Process, first &FD, second &FD, numbers &i32) bool {
+	mut process := if _process == unsafe { nil } { proc.current_thread().process } else { unsafe { _process } }
+	process.fds_lock.acquire()
+	defer { process.fds_lock.release() }
+	if !descriptor_mount_admitted(first) || !descriptor_mount_admitted(second) {
+		errno.set(errno.ebusy)
+		return false
+	}
+	limit := if process.rlimits[proc.rlimit_nofile].cur < u64(proc.max_fds) {
+		int(process.rlimits[proc.rlimit_nofile].cur)
+	} else { proc.max_fds }
+	mut first_num := -1
+	mut second_num := -1
+	for number in 0 .. limit {
+		if number < process.fds.len && process.fds[number] != unsafe { nil } { continue }
+		if first_num < 0 { first_num = number } else { second_num = number; break }
+	}
+	if second_num < 0 || (second_num >= process.fds.len && !grow_fd_table(mut process, second_num)) {
+		errno.set(errno.emfile)
+		return false
+	}
+	process.fds[first_num] = voidptr(first)
+	process.fds[second_num] = voidptr(second)
+	unsafe { numbers[0] = i32(first_num); numbers[1] = i32(second_num) }
+	return true
+}
+
+// Make room in a descriptor table for `fdnum`, doubling it until there is. The
+// caller holds fds_lock, which everything that reads the table while another
+// thread may make descriptors holds too.
+fn grow_fd_table(mut process proc.Process, fdnum int) bool {
+	if fdnum >= proc.max_fds {
+		return false
+	}
+	mut length := if process.fds.len > 0 { process.fds.len } else { proc.initial_fds }
+	for length <= fdnum {
+		length *= 2
+	}
+	if length > proc.max_fds {
+		length = proc.max_fds
+	}
+	new_bytes := u64(length) * sizeof(voidptr) * 2
+	if !proc.grow_kernel(mut process.fd_table_charge, new_bytes) { return false }
+	mut bigger := unsafe { []voidptr{len: length} } @[freed]
+	if bigger.len != length {
+		kbudget.shrink(mut process.fd_table_charge, new_bytes)
+		return false
+	}
+	for i in 0 .. process.fds.len {
+		bigger[i] = process.fds[i]
+	}
+	mut old := unsafe { process.fds }
+	process.fds = bigger
+	old_bytes := u64(old.len) * sizeof(voidptr) * 2
+	unsafe { old.free() }
+	kbudget.shrink(mut process.fd_table_charge, old_bytes)
+	return true
+}
+
+// The descriptors a process has open, and their flags, read in one go under
+// the table's lock: what fork copies into the child.
+pub struct FDNumberSnapshot {
+pub mut:
+	 nums []int
+	 charge kbudget.Charge
+}
+
+pub fn (mut snapshot FDNumberSnapshot) dispose() {
+	unsafe { snapshot.nums.free() }
+	kbudget.release(snapshot.charge)
+}
+
+pub fn open_fdnums(process &proc.Process) ?FDNumberSnapshot {
+	mut target := unsafe { process }
+	target.fds_lock.acquire()
+	defer {
+		target.fds_lock.release()
+	}
+	mut count := 0
+	for slot in target.fds {
+		if slot != unsafe { nil } {
+			count++
+		}
+	}
+	// The snapshot owns both the allocation and its temporary reservation.
+	charge := proc.reserve_kernel(.scratch, u64(count) * sizeof(int) * 2 + 128)?
+	mut open := []int{cap: count} @[freed]
+	for i, slot in target.fds {
+		if slot != unsafe { nil } {
+			open << i
+		}
+	}
+	return FDNumberSnapshot{nums: open, charge: charge}
+}
+
+pub fn fd_create_from_resource(mut res resource.Resource, flags int) ?&FD {
+	katomic.inc(mut &res.refcount)
+	return fd_create_adopting_resource(mut res, flags)
+}
+
+// Openable endpoints may return a reference retained under their lookup lock.
+// Adopt it exactly once. Construction failure returns it using the same
+// flags as a real Handle; a table failure drops it through FD.unref.
+pub fn fd_create_from_opened(opened resource.OpenedResource, flags int) ?&FD {
+	mut res := opened.resource
+	if !opened.owned { katomic.inc(mut &res.refcount) }
+	return fd_create_adopting_resource(mut res, flags)
+}
+
+fn fd_create_adopting_resource(mut res resource.Resource, flags int) ?&FD {
+	handle_charge := proc.reserve_kernel(.file, 1024) or { release_unopened_resource(mut res, flags); return none }
+	fd_charge := proc.reserve_kernel(.descriptor, 128) or {
+		kbudget.release(handle_charge)
+		release_unopened_resource(mut res, flags)
+		return none
+	}
+	mut new_handle := &Handle{kernel_charge: handle_charge}
+	new_handle.resource = unsafe { res }
+	new_handle.refcount = 1
+	new_handle.flags = flags & resource.file_status_flags_mask
+
+	mut new_fd := &FD{kernel_charge: fd_charge}
+	new_fd.handle = new_handle
+	new_fd.flags = flags & resource.file_descriptor_flags_mask
+
+	return new_fd
+}
+
+pub fn fdnum_create_from_resource(_process &proc.Process, mut res resource.Resource, flags int, oldfd int, specific bool) ?int {
+	new_fd := fd_create_from_resource(mut res, flags) or { return none }
+	return fdnum_create_from_fd(_process, new_fd, oldfd, specific) or {
+		new_fd.unref()
+		return none
+	}
+}
+
+pub fn fd_from_fdnum(_process &proc.Process, fdnum int) ?&FD {
+	mut process := &proc.Process(unsafe { nil })
+	if voidptr(_process) == unsafe { nil } {
+		process = proc.current_thread().process
+	} else {
+		process = unsafe { _process }
+	}
+
+	if fdnum >= proc.max_fds || fdnum < 0 {
+		errno.set(errno.ebadf)
+		return none
+	}
+
+	process.fds_lock.acquire()
+	defer {
+		process.fds_lock.release()
+	}
+
+	if fdnum >= process.fds.len {
+		errno.set(errno.ebadf)
+		return none
+	}
+	mut ret := unsafe { &FD(process.fds[fdnum]) }
+	if voidptr(ret) == unsafe { nil } {
+		errno.set(errno.ebadf)
+		return none
+	}
+
+	katomic.inc(mut &ret.handle.refcount)
+	katomic.inc(mut &ret.refcount)
+
+	return ret
+}
+
+pub fn fdnum_dup(_old_process &proc.Process, oldfdnum int, _new_process &proc.Process, newfdnum int, flags int, specific bool, cloexec bool) ?int {
+	mut old_process := &proc.Process(unsafe { nil })
+	if voidptr(_old_process) == unsafe { nil } {
+		old_process = proc.current_thread().process
+	} else {
+		old_process = unsafe { _old_process }
+	}
+
+	mut new_process := &proc.Process(unsafe { nil })
+	if voidptr(_new_process) == unsafe { nil } {
+		new_process = proc.current_thread().process
+	} else {
+		new_process = unsafe { _new_process }
+	}
+
+	if specific && oldfdnum == newfdnum && voidptr(old_process) == voidptr(new_process) {
+		errno.set(errno.einval)
+		return none
+	}
+
+	mut oldfd := fd_from_fdnum(old_process, oldfdnum) or { return none }
+	defer {
+		oldfd.unref()
+	}
+
+	charge := proc.reserve_kernel_for(new_process.kernel_owner, .descriptor, 128)?
+	mut new_fd := unsafe { &FD(malloc(sizeof(FD))) }
+	unsafe { C.memcpy(new_fd, oldfd, sizeof(FD)) }
+	new_fd.kernel_charge = charge
+	new_fd.refcount = 1
+	katomic.inc(mut &oldfd.handle.refcount)
+
+	// Finalize the descriptor while it is still owned by this call. Once
+	// inserted, another thread may close it or fork a snapshot of its flags.
+	new_fd.flags = flags & resource.file_descriptor_flags_mask
+	if cloexec {
+		new_fd.flags |= resource.o_cloexec
+	}
+
+	new_fdnum := fdnum_create_from_fd(new_process, new_fd, newfdnum, specific) or {
+		new_fd.unref()
+		return none
+	}
+
+	return new_fdnum
+}
+
+pub fn syscall_dup3(_ voidptr, oldfdnum int, newfdnum int, flags int) (u64, u64) {
+	mut t := proc.current_thread()
+	mut process := t.process
+
+	C.printf(c'\n\e[32m%s\e[m: dup3(%d, %d, %d)\n', process.name.str, oldfdnum, newfdnum, flags)
+	defer {
+		C.printf(c'\e[32m%s\e[m: returning\n', process.name.str)
+	}
+
+	// dup2 quietly returns oldfd here; dup3 is required to refuse.
+	if oldfdnum == newfdnum {
+		return errno.err, errno.einval
+	}
+
+	new_fdnum := fdnum_dup(unsafe { nil }, oldfdnum, unsafe { nil }, newfdnum, flags, true, false) or { return errno.err, errno.get() }
+
+	return u64(new_fdnum), 0
+}
+
+// close_range(first, last, flags): close every descriptor in the range, or mark
+// it close-on-exec when CLOSE_RANGE_CLOEXEC is given. Used by libcs and daemons
+// to shed inherited descriptors without walking /proc.
+pub fn syscall_close_range(_ voidptr, first u32, last u32, flags u32) (u64, u64) {
+	if first > last || flags & ~u32(close_range_cloexec) != 0 {
+		return errno.err, errno.einval
+	}
+
+	mut process := proc.current_thread().process
+
+	// No further than the table reaches; it only grows, and a descriptor
+	// made past its end while this runs is not one it was asked to close.
+	if process.fds.len == 0 {
+		return 0, 0
+	}
+	mut top := u64(last)
+	if top >= u64(process.fds.len) {
+		top = u64(process.fds.len) - 1
+	}
+
+	for i := u64(first); i <= top; i++ {
+		if flags & close_range_cloexec != 0 {
+			mut fd := fd_from_fdnum(process, int(i)) or { continue }
+			fd.flags |= resource.o_cloexec
+			fd.unref()
+			continue
+		}
+		fdnum_close(process, int(i), true) or { continue }
+	}
+
+	return 0, 0
+}
+
+// fsync/fdatasync flush dirty pages through the resource's optional sync hook.
+// In-memory resources need no callback; streams cannot be synchronized.
+pub fn syscall_fsync(_ voidptr, fdnum int) (u64, u64) {
+	mut fd := fd_from_fdnum(unsafe { nil }, fdnum) or { return errno.err, errno.ebadf }
+	defer { fd.unref() }
+	mut handle := fd.handle
+	handle.mac_check(proc.mac_write) or { return errno.err, errno.get() }
+	handle.l.acquire()
+	defer { handle.l.release() }
+	if handle.flags & resource.o_path != 0 {
+		return errno.err, errno.ebadf
+	}
+	mut res := handle.resource
+	mode := res.stat.mode
+	if !stat.isreg(mode) && !stat.isdir(mode) && !stat.isblk(mode) {
+		return errno.err, errno.einval
+	}
+	resource.sync_resource(mut res, voidptr(handle)) or { return errno.err, errno.get() }
+	return 0, 0
+}
+
+// ftruncate(fd, length): set the file's size, zero-filling when it grows.
+pub fn syscall_ftruncate(_ voidptr, fdnum int, length i64) (u64, u64) {
+	if length < 0 {
+		return errno.err, errno.einval
+	}
+
+	mut fd := fd_from_fdnum(unsafe { nil }, fdnum) or { return errno.err, errno.ebadf }
+	defer {
+		fd.unref()
+	}
+
+	mut handle := fd.handle
+	if handle.flags & resource.o_path != 0 { return errno.err, errno.ebadf }
+	mut res := handle.resource
+	access := handle.flags & resource.o_accmode
+	if !stat.isreg(res.stat.mode) || (access != resource.o_wronly && access != resource.o_rdwr) {
+		return errno.err, errno.einval
+	}
+	handle.mac_check(proc.mac_write) or { return errno.err, errno.get() }
+	// An immutable or append-only file cannot be truncated.
+	if resource.is_protected(mut res) {
+		return errno.err, errno.eperm
+	}
+
+	res.grow(voidptr(handle), u64(length)) or { return errno.err, errno.get() }
+
+	return 0, 0
+}
+
+// pread64/pwrite64 operate at an explicit offset without changing the open
+// file description's position.  Keeping the operation under Handle.l makes
+// this atomic with ordinary read/write/lseek on a shared descriptor.
+pub fn syscall_pread(_ voidptr, fdnum int, buf voidptr, count u64, offset i64) (u64, u64) {
+	return pread(fdnum, buf, count, offset, true)
+}
+
+// pread(2) into the kernel's own buffer, for sendfile(2).
+pub fn pread_to_kernel(fdnum int, buf voidptr, count u64, offset i64) (u64, u64) {
+	return pread(fdnum, buf, count, offset, false)
+}
+
+fn pread(fdnum int, buf voidptr, count u64, offset i64, to_user bool) (u64, u64) {
+	if offset < 0 || count > u64(0x7fffffffffffffff) - u64(offset) {
+		return errno.err, errno.einval
+	}
+	if to_user && !usercopy.user_range(u64(buf), count) {
+		return errno.err, errno.efault
+	}
+
+	mut fd := fd_from_fdnum(unsafe { nil }, fdnum) or { return errno.err, errno.get() }
+	defer {
+		fd.unref()
+	}
+	return pread_pinned_descriptor(mut fd, buf, count, offset, to_user)
+}
+
+// Borrow a descriptor held by the caller for the complete positioned operation.
+// The caller has already validated the offset and buffer range. In particular,
+// a vector syscall must not resolve the descriptor number for each segment.
+pub fn pread_pinned_descriptor(mut fd FD, buf voidptr, count u64, offset i64, to_user bool) (u64, u64) {
+	mut handle := fd.handle
+	if handle.flags & resource.o_path != 0 { return errno.err, errno.ebadf }
+	handle.mac_check(proc.mac_read) or { return errno.err, errno.get() }
+
+	mode := handle.resource.stat.mode
+	if stat.ischr(mode) || stat.isifo(mode) || stat.issock(mode) || mode & stat.ifmt == stat.ifpipe {
+		return errno.err, errno.espipe
+	}
+	if stat.isdir(mode) {
+		return errno.err, errno.eisdir
+	}
+	access := handle.flags & resource.o_accmode
+	if access != resource.o_rdonly && access != resource.o_rdwr {
+		return errno.err, errno.ebadf
+	}
+
+	if count == 0 {
+		return 0, 0
+	}
+	if !to_user {
+		handle.l.acquire()
+		read := handle.resource.read(voidptr(handle), buf, u64(offset), count) or {
+			handle.l.release()
+			return errno.err, errno.get()
+		}
+		if stat.isreg(mode) { proc.account_file_transfer(read, false) }
+		if read > 0 && stat.isreg(mode) { handle.sequential_read(u64(offset), u64(read)) }
+		handle.l.release()
+		return u64(read), 0
+	}
+	scratch := proc.reserve_kernel(.scratch, (if count < user_io_chunk { count } else { user_io_chunk }) * 2 + 128) or { return errno.err, errno.get() }
+ defer { kbudget.release(scratch) }
+ buffer := unsafe { malloc(if count < user_io_chunk { count } else { user_io_chunk }) }
+	if buffer == unsafe { nil } {
+		return errno.err, errno.enomem
+	}
+	defer { krandom.explicit_bzero(buffer, u32(if count < user_io_chunk { count } else { user_io_chunk })); unsafe { free(buffer) } }
+	mut done := u64(0)
+	for done < count {
+		chunk := if count - done < user_io_chunk { count - done } else { user_io_chunk }
+		handle.l.acquire()
+		read := handle.resource.read(voidptr(handle), buffer, u64(offset) + done, chunk) or {
+			handle.l.release()
+			if done != 0 { return done, 0 }
+			return errno.err, errno.get()
+		}
+		if stat.isreg(mode) { proc.account_file_transfer(read, false) }
+		if read > 0 && stat.isreg(mode) { handle.sequential_read(u64(offset) + done, u64(read)) }
+		handle.l.release()
+		if read <= 0 { break }
+		if !usercopy.copy_to_user(u64(buf) + done, buffer, u64(read)) {
+			if done != 0 { return done, 0 }
+			return errno.err, errno.efault
+		}
+		done += u64(read)
+		if u64(read) < chunk { break }
+	}
+	return done, 0
+}
+
+pub fn syscall_pwrite(_ voidptr, fdnum int, buf voidptr, count u64, offset i64) (u64, u64) {
+	if offset < 0 || count > u64(0x7fffffffffffffff) - u64(offset) {
+		return errno.err, errno.einval
+	}
+	if !usercopy.user_range(u64(buf), count) {
+		return errno.err, errno.efault
+	}
+
+	mut fd := fd_from_fdnum(unsafe { nil }, fdnum) or { return errno.err, errno.get() }
+	defer {
+		fd.unref()
+	}
+	return pwrite_pinned_descriptor(mut fd, buf, count, offset)
+}
+
+// Same borrowed ownership and validated-range contract as the read helper.
+pub fn pwrite_pinned_descriptor(mut fd FD, buf voidptr, count u64, offset i64) (u64, u64) {
+	mut handle := fd.handle
+	if handle.flags & resource.o_path != 0 { return errno.err, errno.ebadf }
+	handle.mac_check(proc.mac_write) or { return errno.err, errno.get() }
+
+	mut res := handle.resource
+	mode := res.stat.mode
+	if stat.ischr(mode) || stat.isifo(mode) || stat.issock(mode) || mode & stat.ifmt == stat.ifpipe {
+		return errno.err, errno.espipe
+	}
+	if stat.isdir(mode) {
+		return errno.err, errno.eisdir
+	}
+	access := handle.flags & resource.o_accmode
+	if access != resource.o_wronly && access != resource.o_rdwr {
+		return errno.err, errno.ebadf
+	}
+	// pwrite names an offset, which an append-only file does not take, nor an
+	// immutable one any write at all. An O_APPEND file would otherwise be
+	// overwritten in place through this, past Handle.write's append.
+	if resource.is_protected(mut res) {
+		return errno.err, errno.eperm
+	}
+	if !security.user_device_write_allowed(mut res) { return errno.err, errno.get() }
+
+	allowed := limited_write_count(res, u64(offset), count) or {
+		return errno.err, errno.get()
+	}
+	if allowed == 0 { return 0, 0 }
+	scratch := proc.reserve_kernel(.scratch, (if allowed < user_io_chunk { allowed } else { user_io_chunk }) * 2 + 128) or { return errno.err, errno.get() }
+ defer { kbudget.release(scratch) }
+ buffer := unsafe { malloc(if allowed < user_io_chunk { allowed } else { user_io_chunk }) }
+	if buffer == unsafe { nil } {
+		return errno.err, errno.enomem
+	}
+	defer { krandom.explicit_bzero(buffer, u32(if allowed < user_io_chunk { allowed } else { user_io_chunk })); unsafe { free(buffer) } }
+	mut done := u64(0)
+	for done < allowed {
+		chunk := if allowed - done < user_io_chunk { allowed - done } else { user_io_chunk }
+		if !usercopy.copy_from_user(buffer, u64(buf) + done, chunk) {
+			if done != 0 { return done, 0 }
+			return errno.err, errno.efault
+		}
+		block_token := security.begin_user_device_write(mut res) or {
+			if done != 0 { return done, 0 }
+			return errno.err, errno.get()
+		}
+		handle.l.acquire()
+		written := res.write(voidptr(handle), buffer, u64(offset) + done, chunk) or {
+			handle.l.release()
+			security.end_user_device_write(block_token)
+			if done != 0 { return done, 0 }
+			return errno.err, errno.get()
+		}
+		if stat.isreg(mode) { proc.account_file_transfer(written, true) }
+		handle.l.release()
+		security.end_user_device_write(block_token)
+		if written <= 0 { break }
+		done += u64(written)
+		if u64(written) < chunk { break }
+	}
+	if handle.flags & resource.o_dsync != 0 {
+		resource.sync_resource(mut res, voidptr(handle)) or { return errno.err, errno.get() }
+	}
+	return done, 0
+}
+
+// fallocate(mode=0) guarantees that the requested range exists.  Vinix has no
+// delayed allocation or hole-punching yet, so extending the resource provides
+// that guarantee; unsupported Linux mode bits are rejected explicitly.
+pub fn syscall_fallocate(_ voidptr, fdnum int, mode int, offset i64, length i64) (u64, u64) {
+	if mode != 0 {
+		return errno.err, errno.eopnotsupp
+	}
+	if offset < 0 || length <= 0 || u64(length) > u64(0x7fffffffffffffff) - u64(offset) {
+		return errno.err, errno.einval
+	}
+
+	mut fd := fd_from_fdnum(unsafe { nil }, fdnum) or { return errno.err, errno.get() }
+	defer {
+		fd.unref()
+	}
+
+	mut handle := fd.handle
+	handle.mac_check(proc.mac_write) or { return errno.err, errno.get() }
+	access := handle.flags & resource.o_accmode
+	if access != resource.o_wronly && access != resource.o_rdwr {
+		return errno.err, errno.ebadf
+	}
+	mut res := handle.resource
+	if !stat.isreg(res.stat.mode) {
+		if stat.isdir(res.stat.mode) {
+			return errno.err, errno.eisdir
+		}
+		if stat.isifo(res.stat.mode) || res.stat.mode & stat.ifmt == stat.ifpipe {
+			return errno.err, errno.espipe
+		}
+		return errno.err, errno.enodev
+	}
+	// An immutable or append-only file is not grown this way either; Linux's
+	// vfs_fallocate refuses both.
+	if resource.is_protected(mut res) {
+		return errno.err, errno.eperm
+	}
+
+	end := u64(offset) + u64(length)
+	if end > u64(res.stat.size) {
+		res.grow(voidptr(handle), end) or { return errno.err, errno.get() }
+	}
+	return 0, 0
+}
+
+// Dispatch cache advice when supported; other resources may ignore hints.
+pub fn syscall_fadvise64(_ voidptr, fdnum int, offset i64, length i64, advice int) (u64, u64) {
+	if offset < 0 || length < 0 || advice < 0 || advice > 5 {
+		return errno.err, errno.einval
+	}
+
+	mut fd := fd_from_fdnum(unsafe { nil }, fdnum) or { return errno.err, errno.get() }
+	defer {
+		fd.unref()
+	}
+	fd.handle.mac_check(proc.mac_read) or { return errno.err, errno.get() }
+
+	mut handle := fd.handle
+	if handle.flags & resource.o_path != 0 {
+		return errno.err, errno.ebadf
+	}
+	mut res := handle.resource
+	mode := res.stat.mode
+	if stat.isifo(mode) || stat.issock(mode) || mode & stat.ifmt == stat.ifpipe {
+		return errno.err, errno.espipe
+	}
+	if advice <= 2 {
+		handle.l.acquire()
+		handle.read_advice = advice
+		handle.read_streak = 0
+		handle.read_ahead_end = 0
+		handle.l.release()
+	}
+	resource.advise_resource(mut res, voidptr(handle), u64(offset), u64(length), advice) or {
+		return errno.err, errno.get()
+	}
+	return 0, 0
+}
+
+pub fn syscall_sync_file_range(_ voidptr, fdnum int, offset i64, count i64, flags u32) (u64, u64) {
+	if offset < 0 || count < 0 || flags & ~u32(0x7) != 0
+		|| u64(count) > u64(0x7fffffffffffffff) - u64(offset) {
+		return errno.err, errno.einval
+	}
+
+	mut fd := fd_from_fdnum(unsafe { nil }, fdnum) or { return errno.err, errno.get() }
+	defer {
+		fd.unref()
+	}
+	fd.handle.mac_check(proc.mac_write) or { return errno.err, errno.get() }
+	access := fd.handle.flags & resource.o_accmode
+	if access != resource.o_wronly && access != resource.o_rdwr {
+		return errno.err, errno.ebadf
+	}
+	if !stat.isreg(fd.handle.resource.stat.mode) {
+		return errno.err, errno.espipe
+	}
+	// A synchronous whole-resource flush is a conservative implementation of
+	// range writeback until resources expose independent writeback ranges.
+	if flags != 0 {
+		mut res := fd.handle.resource
+		resource.sync_resource(mut res, voidptr(fd.handle)) or { return errno.err, errno.get() }
+	}
+	return 0, 0
+}
+
+pub fn syscall_fcntl(_ voidptr, fdnum int, cmd int, arg u64) (u64, u64) {
+	mut t := proc.current_thread()
+	mut process := t.process
+
+	C.printf(c'\n\e[32m%s\e[m: fcntl(%d, %d, %lld)\n', process.name.str, fdnum, cmd, arg)
+	defer {
+		C.printf(c'\e[32m%s\e[m: returning\n', process.name.str)
+	}
+
+	mut fd := fd_from_fdnum(unsafe { nil }, fdnum) or { return errno.err, errno.ebadf }
+
+	mut handle := fd.handle
+
+	mut ret := u64(0)
+
+	if handle.flags & resource.o_path != 0 {
+		match cmd {
+			f_dupfd, f_dupfd_cloexec, f_dupfd_query, f_created_query,
+			f_getfd, f_setfd, f_getfl {}
+			else {
+				fd.unref()
+				return errno.err, errno.ebadf
+			}
+		}
+	}
+
+	if cmd == f_getlk || cmd == f_ofd_getlk {
+		fd.handle.mac_check(proc.mac_inspect) or { failure := errno.get(); fd.unref(); return errno.err, failure }
+	}
+	if cmd == f_setlk || cmd == f_setlkw || cmd == f_ofd_setlk || cmd == f_ofd_setlkw {
+		fd.handle.mac_check(proc.mac_metadata) or { failure := errno.get(); fd.unref(); return errno.err, failure }
+	}
+	if cmd == f_add_seals {
+		fd.handle.mac_check(proc.mac_metadata) or { failure := errno.get(); fd.unref(); return errno.err, failure }
+	}
+	if cmd == f_get_seals {
+		fd.handle.mac_check(proc.mac_inspect) or { failure := errno.get(); fd.unref(); return errno.err, failure }
+	}
+	match cmd {
+		f_created_query {
+			ret = if handle.created { u64(1) } else { u64(0) }
+			fd.unref()
+		}
+		f_dupfd_query {
+			// Compare open descriptions, including O_PATH and descriptions
+			// inherited through fork. Retain both descriptions until the
+			// comparison; either missing descriptor returns EBADF.
+			mut other := fd_from_fdnum(unsafe { nil }, int(u32(arg))) or {
+				fd.unref()
+				return errno.err, errno.ebadf
+			}
+			ret = if voidptr(other.handle) == voidptr(handle) { u64(1) } else { u64(0) }
+			other.unref()
+			fd.unref()
+		}
+		f_dupfd {
+			ret = u64(fdnum_dup(unsafe { nil }, fdnum, unsafe { nil }, int(arg), 0, false, false) or {
+				fd.unref()
+				return errno.err, errno.get()
+			})
+			// fd_from_fdnum() retained the source open-file description for
+			// this syscall. The duplicate has its own descriptor reference;
+			// release the temporary lookup just as the other fcntl paths do.
+			fd.unref()
+		}
+		f_dupfd_cloexec {
+			ret = u64(fdnum_dup(unsafe { nil }, fdnum, unsafe { nil }, int(arg), 0, false, true) or {
+				fd.unref()
+				return errno.err, errno.get()
+			})
+			fd.unref()
+		}
+		f_getpipe_sz {
+			if !stat.isifo(handle.resource.stat.mode) {
+				fd.unref()
+				return errno.err, errno.ebadf
+			}
+			mut res := handle.resource
+			ret = resource.pipe_capacity(mut res) or {
+				fd.unref()
+				return errno.err, errno.ebadf
+			}
+			fd.unref()
+		}
+		f_setpipe_sz {
+			if !stat.isifo(handle.resource.stat.mode) {
+				fd.unref()
+				return errno.err, errno.ebadf
+			}
+			mut res := handle.resource
+			ret = resource.set_pipe_capacity(mut res, arg) or {
+				saved_errno := errno.get()
+				fd.unref()
+				return errno.err, saved_errno
+			}
+			fd.unref()
+		}
+		f_getfd {
+			ret = if fd.flags & resource.o_cloexec != 0 { u64(fd_cloexec) } else { 0 }
+			fd.unref()
+		}
+		f_setfd {
+			fd.flags = if arg & fd_cloexec != 0 { resource.o_cloexec } else { 0 }
+			fd.unref()
+		}
+		f_getfl {
+			ret = u64(handle.flags)
+			fd.unref()
+		}
+		f_setfl {
+			// Only the status flags are settable. Taking the argument whole
+			// would drop the access mode the file was opened with, leaving a
+			// writable handle looking read-only.
+			handle.flags = (handle.flags & ~resource.file_settable_flags_mask) | (int(arg) & resource.file_settable_flags_mask)
+			fd.unref()
+		}
+		f_add_seals {
+			mut res := handle.resource
+			resource.add_seals(mut res, u32(arg)) or {
+				saved := errno.get()
+				fd.unref()
+				return errno.err, if saved == 0 { errno.einval } else { saved }
+			}
+			fd.unref()
+		}
+		f_get_seals {
+			mut res := handle.resource
+			ret = u64(resource.get_seals(mut res) or {
+				fd.unref()
+				return errno.err, errno.einval
+			})
+			fd.unref()
+		}
+		f_ofd_getlk, f_ofd_setlk, f_ofd_setlkw {
+			lock_ret, lock_errno := fcntl_lock(mut handle, cmd, arg)
+			fd.unref()
+			if lock_errno != 0 {
+				return lock_ret, lock_errno
+			}
+			ret = lock_ret
+		}
+		// nginx gives its master's channel to each worker this way.
+		f_setown {
+			// A negative id names a process group.
+			id := int(i32(u32(arg)))
+			if id == -2147483648 {
+				fd.unref()
+				return errno.err, errno.einval
+			}
+			target := if id < 0 { -id } else { id }
+			global := proc.pid_number_id(target)
+			if target != 0 && global == 0 {
+				fd.unref()
+				return errno.err, errno.esrch
+			}
+			handle.l.acquire()
+			handle.owner_type = if id < 0 { f_owner_pgrp } else { f_owner_pid }
+			handle.owner_id = global
+			handle.l.release()
+			fd.unref()
+		}
+		f_getown {
+			handle.l.acquire()
+			kind := handle.owner_type
+			global := handle.owner_id
+			handle.l.release()
+			target := proc.pid_owner_number(global, kind)
+			ret = if kind == f_owner_pgrp {
+				u64(-i64(target))
+			} else {
+				u64(target)
+			}
+			fd.unref()
+		}
+		f_setown_ex, f_getown_ex {
+			// struct f_owner_ex: an int kind, then a pid_t.
+			mut owner := [2]i32{}
+			if cmd == f_setown_ex {
+				if !usercopy.copy_from_user(voidptr(&owner[0]), arg, 8) {
+					fd.unref()
+					return errno.err, errno.efault
+				}
+				if owner[0] < f_owner_tid || owner[0] > f_owner_pgrp {
+					fd.unref()
+					return errno.err, errno.einval
+				}
+				global := proc.pid_number_id(int(owner[1]))
+				if owner[1] != 0 && global == 0 {
+					fd.unref()
+					return errno.err, errno.esrch
+				}
+				handle.l.acquire()
+				handle.owner_type = int(owner[0])
+				handle.owner_id = global
+				handle.l.release()
+			} else {
+				handle.l.acquire()
+				kind := handle.owner_type
+				global := handle.owner_id
+				handle.l.release()
+				owner[0] = i32(kind)
+				owner[1] = i32(proc.pid_owner_number(global, kind))
+				if !usercopy.copy_to_user(arg, voidptr(&owner[0]), 8) {
+					fd.unref()
+					return errno.err, errno.efault
+				}
+			}
+			fd.unref()
+		}
+		f_setsig {
+			if arg > 64 {
+				fd.unref()
+				return errno.err, errno.einval
+			}
+			handle.signal = int(arg)
+			fd.unref()
+		}
+		f_getsig {
+			ret = u64(handle.signal)
+			fd.unref()
+		}
+		f_getlk, f_setlk, f_setlkw {
+			lock_ret, lock_errno := fcntl_lock(mut handle, cmd, arg)
+			fd.unref()
+			if lock_errno != 0 {
+				return lock_ret, lock_errno
+			}
+			ret = lock_ret
+		}
+		else {
+			C.kprintf(c'\nfcntl: Unhandled command: %lld\n', i64(cmd))
+			fd.unref()
+			return errno.err, errno.einval
+		}
+	}
+
+	return ret, 0
+}
+
+pub fn syscall_mmap(_ voidptr, addr voidptr, length u64, prot_and_flags u64, fdnum int, offset i64) (u64, u64) {
+	mut current_thread := proc.current_thread()
+	mut process := current_thread.process
+
+	C.printf(c'\n\e[32m%s\e[m: mmap(0x%llx, 0x%llx, 0x%llx, %d, %lld)\n', process.name.str, addr, length, prot_and_flags, fdnum, offset)
+	defer {
+		C.printf(c'\e[32m%s\e[m: returning\n', process.name.str)
+	}
+
+	mut resource_ := &resource.Resource(unsafe { nil })
+	mut fd := &FD(unsafe { nil })
+	prot := int((prot_and_flags >> 32) & 0xffffffff)
+	flags := int(prot_and_flags & 0xffffffff)
+	file_backed := flags & mmap.map_anonymous == 0
+
+	// MAP_ANONYMOUS ignores fd entirely, including invalid descriptors and
+	// upper register bits left by Linux libc. File descriptors are C ints.
+	if file_backed {
+		fd = fd_from_fdnum(unsafe { nil }, int(i32(fdnum))) or { return errno.err, errno.get() }
+		resource_ = fd.handle.resource
+	}
+
+	defer {
+		if file_backed {
+			fd.unref()
+		}
+	}
+
+	sharing := flags & (mmap.map_shared | mmap.map_private)
+	if sharing != mmap.map_shared && sharing != mmap.map_private {
+		return errno.err, errno.einval
+	}
+
+	if flags & mmap.map_anonymous == 0 && voidptr(resource_) == unsafe { nil } {
+		return errno.err, errno.ebadf
+	}
+	mut map_flags := flags & ~mmap.map_internal_mask
+	if flags & mmap.map_anonymous == 0 {
+		if mount_policy_flags != unsafe { nil }
+			&& mount_policy_flags(&fd.handle.mount) & u64(0x8) != 0 {
+			if prot & mmap.prot_exec != 0 { return errno.err, errno.eperm }
+			map_flags |= mmap.map_no_exec
+		}
+		fd.handle.mac_check(proc.mac_read) or { return errno.err, errno.get() }
+		// Device-open factories can return another resource class. Preserve
+		// both the requested protections and their maxima from the origin.
+		fd.handle.mac_check(proc.mac_execute) or {
+			if prot & mmap.prot_exec != 0 { return errno.err, errno.get() }
+			map_flags |= mmap.map_no_exec
+		}
+		if flags & mmap.map_shared != 0 {
+			fd.handle.mac_check(proc.mac_write) or {
+				if prot & mmap.prot_write != 0 { return errno.err, errno.get() }
+				map_flags |= mmap.map_no_write
+			}
+		}
+		// O_PATH opens a file without any permission to it, and so lent its
+		// contents to anyone mapping it, as Linux does not.
+		if fd.handle.flags & resource.o_path != 0 {
+			return errno.err, errno.ebadf
+		}
+		access := fd.handle.flags & resource.o_accmode
+		if access == resource.o_wronly {
+			return errno.err, errno.eacces
+		}
+		if flags & mmap.map_shared != 0 && access != resource.o_rdwr {
+			if prot & mmap.prot_write != 0 {
+				return errno.err, errno.eacces
+			}
+			// Nor may mprotect() make it writable later.
+			map_flags |= mmap.map_no_write
+		}
+	}
+
+	mut mapping_handle := voidptr(0)
+	if file_backed {
+		mapping_handle = voidptr(fd.handle)
+	}
+	ret := mmap.mmap(process.pagemap, addr, length, prot, map_flags, resource_, offset, mapping_handle, retain_mmap_handle, release_mmap_handle) or {
+		return errno.err, errno.get()
+	}
+
+	return u64(ret), 0
+}
+
+// Apply descriptor and status flags to an already-open fd. accept4(2) and
+// pipe2(2) take them alongside the operation itself rather than needing a
+// separate fcntl.
+pub fn set_fd_flags(fdnum int, flags int) {
+	mut fd := fd_from_fdnum(unsafe { nil }, fdnum) or { return }
+	defer {
+		fd.unref()
+	}
+
+	if flags & resource.o_cloexec != 0 {
+		fd.flags |= resource.o_cloexec
+	}
+	if flags & resource.o_nonblock != 0 {
+		mut handle := fd.handle
+		handle.flags |= resource.o_nonblock
+	}
+}
+
+// Adopt a Handle reference acquired by fd_from_fdnum, without copying the
+// source descriptor's charge. SCM_RIGHTS keeps this charge until delivered or
+// discarded, even after the sender exits.
+pub fn adopt_passed_handle(handle &Handle) ?&FD {
+	charge := proc.reserve_kernel(.descriptor, 256)?
+	// FD.release_descriptor frees it on receipt, close or queued-rights discard.
+	fd := &FD{handle: unsafe { handle }, kernel_charge: charge} @[freed]
+	return fd
+}
+
+fn release_unopened_resource(mut res resource.Resource, flags int) {
+	// FIFO open counted an end and an owned device open may have side effects.
+	// Use caller-stack Handle storage while returning that adopted reference.
+	handle := unsafe { &Handle(C.vinix_stack_alloc(sizeof(Handle))) }
+	unsafe { *handle = Handle{flags: flags & resource.file_status_flags_mask} }
+	res.unref(voidptr(handle)) or {}
+}

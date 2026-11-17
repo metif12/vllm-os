@@ -1,0 +1,1055 @@
+@[has_globals]
+module sched
+
+import kbudget
+import cpuidle
+import cpufreq
+import x86.cpu
+import x86.cpu.local as cpulocal
+import x86.idt
+import x86.apic
+import katomic
+import proc
+import memory
+import memory.mmap
+import elf
+import lib
+import errno
+import time
+import krandom
+import klock
+
+fn C.vinix_call_void_fn(f voidptr)
+@[noreturn]
+fn C.vinix_x86_resume_context(frame &cpulocal.GPRState, cpu_number u64)
+fn C.vinix_linuxkpi_workqueue_task_sleep(task voidptr)
+fn C.vinix_linuxkpi_workqueue_task_resume(task voidptr)
+
+__global (
+	// Hardware that this kernel drives without interrupts -- a network card --
+	// polled from the scheduler. See set_device_poll_callback().
+	device_poll_callback voidptr
+	device_poll_lock     klock.Lock
+)
+
+// How long an idle CPU sleeps before it looks at the run queue again, and how
+// long CPU 0 does when there is a device to poll: a received frame waits in its
+// ring until a CPU comes round, and every round trip on the network pays for
+// that twice. Any CPU can run the poll, so one waking often is enough; the rest
+// keep the slow tick rather than all costing their host a thousand wakeups a
+// second.
+const idle_max_wakeup_us = u64(20000)
+const idle_poll_wakeup_us = u64(1000)
+
+// Have the scheduler call `cb` on every pass it makes, on whichever CPU makes
+// it, and wake an idle CPU often enough that it keeps being called. This is
+// the counterpart of arm64's platform poll, which drives VirtIO networking
+// from that scheduler's idle loop and timer tick.
+pub fn set_device_poll_callback(cb voidptr) {
+	device_poll_callback = cb
+}
+
+// One CPU at a time runs the poll: what it drives is not reentrant. A CPU that
+// finds another already polling has nothing to add and goes on scheduling.
+fn poll_devices() {
+	if device_poll_callback == voidptr(0) {
+		return
+	}
+	if !device_poll_lock.test_and_acquire() {
+		return
+	}
+	C.vinix_call_void_fn(device_poll_callback)
+	device_poll_lock.release()
+}
+
+pub fn initialise() {
+	configure_cpu_capacities()
+	time.register_deadline_wakeup(timer_deadline_changed)
+	scheduler_vector = idt.allocate_vector()
+	C.kprintf(c'sched: Scheduler interrupt vector is 0x%llx\n', u64(scheduler_vector))
+
+	interrupt_table[scheduler_vector] = voidptr(scheduler_isr)
+	idt.set_ist(scheduler_vector, 1)
+
+	initialise_tlb_shootdown()
+
+	// The kernel acts with every capability: file permissions are lifted by
+	// capabilities, not by a uid of zero, and kernel threads create files
+	// wherever the initramfs puts them.
+	kernel_process = &proc.Process{
+		pagemap: &kernel_pagemap
+		caps:    proc.full_capabilities()
+		fds:     unsafe { []voidptr{len: proc.initial_fds} }
+	}
+	memory.kernel_stack_selftest()
+	selftest_thread_stacks()
+	katomic.store(mut &scheduler_ready, true)
+}
+
+// The scheduler's clock: the monotonic clock, which the timer tick advances.
+@[inline]
+fn clock_ns() u64 {
+	return time.monotonic_ns()
+}
+
+@[inline]
+fn interrupts_off() {
+	asm volatile amd64 {
+		cli
+	}
+}
+
+// See cgroup_holds_thread_back(). `state` is where the thread would resume.
+fn cgroup_parks(t &proc.Thread, state &cpulocal.GPRState) bool {
+	return cgroup_holds_thread_back(t, !in_userspace(state))
+}
+
+// Whether `state` resumes userspace: a code segment of privilege 3, which an
+// LDT's can be as well as the GDT's.
+@[inline]
+fn in_userspace(state &cpulocal.GPRState) bool {
+	return state.cs & 3 == 3
+}
+
+fn get_next_thread() &proc.Thread {
+ mut cpu_local := cpulocal.current()
+ return pick_next_thread(cpu_local.cpu_number, int(cpu_local.numa_node), &cpu_local.last_run_queue_index)
+}
+
+__global (
+	user_signal_hook voidptr
+	preemption_guard voidptr
+)
+
+type UserSignalHook = fn (&proc.Thread, &cpulocal.GPRState)
+type PreemptionGuard = fn () bool
+
+// A compatibility subsystem can defer a timer switch while holding a Linux
+// spinlock. Registered at boot; the callback runs with interrupts disabled.
+pub fn register_preemption_guard(guard voidptr) {
+	preemption_guard = guard
+}
+
+// userland registers what an interrupt returning to userspace has to do for
+// the thread; it cannot be imported. As on arm64.
+pub fn register_user_signal_hook(hook voidptr) {
+	user_signal_hook = hook
+}
+
+fn scheduler_isr(_ u32, gpr_state &cpulocal.GPRState) {
+	apic.lapic_timer_stop()
+
+	mut cpu_local := cpulocal.current()
+	// If this interrupt ended an idle, that is where the idle's time stops: the
+	// loop that started it is not returned to. See cpuidle/driver_amd64.v.
+	cpuidle.idle_interrupted(cpu_local.cpu_number)
+	// A frequency request for this CPU is written here, on it: its registers
+	// can be written nowhere else. See cpufreq/driver_amd64.v.
+	cpufreq.cpu_tick(cpu_local.cpu_number)
+
+	// Only our own IRQ may surround a switch. A timer interrupt nested in an
+	// IRQ-enabled hardware handler must leave that handler on its CPU.
+	if cpu_local.maskable_irq_depth != 1 {
+		if cpu_local.maskable_irq_depth == 0 {
+			lib.kpanic(unsafe { nil }, c'sched: scheduler without a maskable IRQ entry')
+		}
+		if cpu_local.maskable_irq_scheduler_deferrals == u64(-1) {
+			lib.kpanic(unsafe { nil }, c'sched: IRQ deferral count overflow')
+		}
+		cpu_local.maskable_irq_scheduler_deferrals++
+		apic.lapic_eoi()
+		apic.lapic_timer_oneshot(mut cpu_local, scheduler_vector, 1000)
+		return
+	}
+	consume_reschedule(cpu_local.cpu_number)
+	katomic.store(mut &cpu_local.is_idle, false)
+	if preemption_guard != unsafe { nil } {
+		guard := unsafe { PreemptionGuard(preemption_guard) }
+		if !guard() {
+			apic.lapic_eoi()
+			apic.lapic_timer_oneshot(mut cpu_local, scheduler_vector, 1000)
+			return
+		}
+	}
+
+	// The LAPIC is also armed for the earliest timer deadline. Expire that
+	// deadline here before choosing another one-shot: otherwise an overdue
+	// timer keeps rearming it for 1 us. On a fast single-vCPU KVM guest those
+	// scheduler IRQs starve the lower-priority PIT, which was the only path
+	// expiring timers, and neither sleeping tasks nor input handlers run.
+	time.timer_handler()
+
+	// Before the run queue is read, so a thread that the poll wakes -- one
+	// waiting on a socket -- can be picked straight away.
+	poll_devices()
+
+	// The same reading bills the outgoing thread and starts the incoming one,
+	// so a switch neither loses time between the two nor counts it twice.
+	now_ns := clock_ns()
+	// When each tick lands, to the cycle, is what the generator reseeds from.
+	krandom.add_event(now_ns)
+
+	mut current_thread := proc.current_thread()
+	from_idle := current_thread == unsafe { nil }
+
+	// Charge the turn that has just ended against the real-time entitlements it
+	// was spending, and against its cgroup's cpu.max, before the pick below: a
+	// thread that has just run out is passed over on the scan it ran out on.
+	account_realtime_time(cpu_local.cpu_number, current_thread, now_ns)
+	if unsafe { current_thread != 0 } {
+		proc.charge_cgroup_cpu(mut current_thread, now_ns)
+		proc.tick_cpu_time(mut current_thread, now_ns)
+		$if linuxkpi ? {
+			// Notify at the actual switch boundary. IRQ restoration after a
+			// Linux task dequeues can preempt it before its explicit park call.
+			// The preemption guard has excluded compatibility lock holders;
+			// neither the native queue nor the task wait lock is held here.
+			if !katomic.load(&current_thread.is_in_queue) {
+				C.vinix_linuxkpi_workqueue_task_sleep(voidptr(&current_thread.linuxkpi_task[0]))
+			}
+		}
+	}
+
+	mut next_thread := get_next_thread()
+
+	if unsafe { current_thread != 0 } {
+		// Let a yield() waiting on this lock go on, with a plain store rather
+		// than release(): release() puts back the interrupt flag of whoever
+		// took the lock last, and that was yield() itself, with interrupts on
+		// -- or, when the thread was not yielding at all, an earlier yield().
+		// Interrupts turned on here, on the scheduler's IST stack, let the next
+		// scheduler interrupt land on the same stack and write its frame over
+		// this one: the thread interrupted here was later resumed with another
+		// context's registers, or the CPU kept returning to its own iretq.
+		katomic.store(mut &current_thread.yield_await.l, false)
+
+		// A thread whose context resume_saved_context() preset is not resumed
+		// where it was interrupted, but from that context.
+		preset := current_thread.context_preset
+		entitled := katomic.load(&current_thread.is_in_queue)
+			&& may_run_here(current_thread, cpu_local.cpu_number)
+			&& !cgroup_parks(current_thread, gpr_state)
+		mut keeps_cpu := unsafe { next_thread == nil } && entitled
+		if unsafe { next_thread != nil } && entitled {
+			// Something else is runnable, but whether it takes the CPU is the
+			// policies' business: a FIFO thread is not interrupted by an equal,
+			// and no thread at all is interrupted by something ranked below it.
+			throttled := realtime_throttled(cpu_local.cpu_number, now_ns)
+			if !should_preempt(mut current_thread, next_thread, now_ns, throttled) {
+				// Hand back the thread the scan took for us. Taken here, its
+				// lock gives interrupts back off.
+				next_thread.l.release()
+				next_thread = unsafe { nil }
+				keeps_cpu = true
+			}
+		}
+		if keeps_cpu && !preset {
+			publish_dispatch_priority(cpu_local.cpu_number, current_thread, now_ns)
+			$if linuxkpi ? {
+				// A wake can re-enqueue the thread after the blocked
+				// notification and before entitlement is checked below.
+				C.vinix_linuxkpi_workqueue_task_resume(voidptr(&current_thread.linuxkpi_task[0]))
+			}
+			current_thread.yield_requested = false
+			// An LDT another thread of the process has made since, which
+			// set_ldt_entry() may be waiting for this CPU to take up.
+			load_process_ldt(mut cpu_local, current_thread.process)
+			apic.lapic_eoi()
+			apic.lapic_timer_oneshot(mut cpu_local, scheduler_vector, time.next_wakeup_us(effective_timeslice(current_thread)))
+			return
+		}
+		current_thread.yield_requested = false
+		// Past the early return above this thread really is coming off the
+		// CPU, so the turn it has just had is charged to its process. The
+		// monotonic clock is the tick source here rather than a counter read,
+		// which puts the resolution at one timer tick.
+		proc.account_context_switch(current_thread, !katomic.load(&current_thread.is_in_queue))
+		proc.charge_cpu_time(mut current_thread, now_ns)
+		if preset {
+			current_thread.context_preset = false
+		} else {
+			unsafe {
+				current_thread.gpr_state = *gpr_state
+			}
+		}
+		current_thread.gs_base = cpu.get_kernel_gs_base()
+		current_thread.fs_base = cpu.get_fs_base()
+		save_fs_gs(mut current_thread)
+		current_thread.cr3 = cpu.read_cr3()
+		fpu_save(current_thread.fpu_storage)
+		$if linuxkpi ? {
+			if next_thread != unsafe { nil } {
+				// The outgoing GS view still names this CPU here. After
+				// running_on is cleared, native lock helpers cannot use it.
+				C.vinix_linuxkpi_workqueue_task_resume(voidptr(&next_thread.linuxkpi_task[0]))
+			}
+		}
+		// From here GS finds this CPU rather than the thread, as it does on an
+		// idle one: gs:[0] has to go on naming the CPU until the next thread
+		// is in place. A lock taken on the way there answers a TLB shootdown
+		// while it spins, and asks GS which CPU it is on. Left on the thread,
+		// it read the -1 stored below and stopped the kernel on an index out
+		// of range, or, once another CPU had taken the thread up, answered
+		// for that CPU instead of this one.
+		// This path abandons the thunk instead of returning to its exit.
+		cpulocal.maskable_irq_exit(u32(scheduler_vector))
+		cpu.set_gs_base(u64(&cpu_local.cpu_number))
+		// The saved CR3 belongs to the outgoing thread, but this CPU must stop
+		// translating through it before another CPU can observe the thread as
+		// stopped and retire its map. Tagged contexts remain cached for reuse.
+		if cpu.read_cr3() != u64(kernel_pagemap.top_level) {
+			kernel_pagemap.switch_to()
+		}
+		katomic.store(mut &current_thread.running_on, u64(-1))
+		// Capture the destination before releasing the thread: another CPU can
+		// take it immediately after the unlock. An earlier affinity IPI may have
+		// found its scheduling lock still held and gone back to sleep.
+		mut migration_cpu := u32(-1)
+		if katomic.load(&current_thread.is_in_queue)
+			&& !may_run_here(current_thread, cpu_local.cpu_number) {
+			for entry in cpu_locals {
+				if katomic.load(&entry.online) != 0
+					&& may_run_here(current_thread, entry.cpu_number) {
+					migration_cpu = u32(entry.cpu_number)
+					break
+				}
+			}
+		}
+		current_thread.l.release()
+		if migration_cpu != u32(-1) {
+			wake_cpu(migration_cpu)
+		}
+	} else {
+		// Dispatch and idle from an idle CPU also abandon their thunk.
+		cpulocal.maskable_irq_exit(u32(scheduler_vector))
+	}
+
+	if unsafe { next_thread == nil } {
+		publish_dispatch_priority(cpu_local.cpu_number, unsafe { nil }, now_ns)
+		apic.lapic_eoi()
+		cpu.set_gs_base(u64(&cpu_local.cpu_number))
+		cpu.set_kernel_gs_base(u64(&cpu_local.cpu_number))
+		katomic.store(mut &cpu_local.is_idle, true)
+		kernel_pagemap.switch_to()
+		memory.note_active_pagemap(cpu_local.cpu_number, u64(kernel_pagemap.top_level))
+		cpu_local.tss.ist3 = cpu_local.idle_pf_stack
+		cpu_local.tss.rsp0 = cpu_local.idle_int_stack
+		// No LDT for an idle CPU, so that one being freed is not held up
+		// waiting for this CPU to run something.
+		load_process_ldt(mut cpu_local, unsafe { nil })
+		reap_dead_threads(mut cpu_local)
+		await()
+	}
+
+	// Include dispatch from idle: it may retain a previous process's predictor
+	// state. Run before hooks or context restoration consume the new thread.
+	current_thread = next_thread
+	publish_dispatch_priority(cpu_local.cpu_number, current_thread, now_ns)
+	$if linuxkpi ? {
+		if from_idle {
+			C.vinix_linuxkpi_workqueue_task_resume(voidptr(&current_thread.linuxkpi_task[0]))
+		}
+	}
+	proc.begin_cpu_time(mut current_thread, now_ns)
+
+	// The first CPU to run a thread claims it for its node, so that the pages
+	// the thread goes on to fault in and the CPU it keeps returning to are on
+	// the same side of the machine.
+	if current_thread.numa_node < 0 {
+		current_thread.numa_node = int(cpu_local.numa_node)
+	}
+
+	// Its TLS descriptors and LDT, before anything checks a segment of its
+	// frame against them.
+	load_segment_tables(mut cpu_local, mut current_thread)
+
+	// A thread going back to userspace with a signal it has to take, or an exit
+	// a sibling asked for, is sent to take care of it first; the hook points
+	// the frame into the kernel. So is one whose code or stack segment is gone.
+	// See userland.interrupt_return().
+	if in_userspace(&current_thread.gpr_state) && user_signal_hook != unsafe { nil } {
+		hook := unsafe { UserSignalHook(user_signal_hook) }
+		// The thread is named: GS still finds the one leaving, or none.
+		hook(current_thread, &current_thread.gpr_state)
+	}
+
+	cpu_local.tss.ist3 = current_thread.pf_stack
+	// Interrupts and exceptions from user mode enter on this thread's own
+	// kernel stack, the one its syscalls use, rather than one shared by every
+	// thread on this CPU. Their handlers can then enable interrupts, be
+	// preempted and block, as syscalls do, without a thread switched in
+	// meanwhile starting its own entry on top of their live frames. Restore
+	// the persistent CPU stack for contexts without a thread entry stack.
+	cpu_local.tss.rsp0 = if current_thread.kernel_stack != 0 {
+		current_thread.kernel_stack
+	} else {
+		cpu_local.idle_int_stack
+	}
+	reap_dead_threads(mut cpu_local)
+
+	// Recorded before it is loaded; see memory.note_active_pagemap().
+	memory.note_active_pagemap(cpu_local.cpu_number, current_thread.cr3)
+	if cpu.read_cr3() != current_thread.cr3 {
+		memory.switch_cr3(current_thread.cr3)
+	}
+
+	fpu_restore(current_thread.fpu_storage)
+
+	katomic.store(mut &current_thread.running_on, cpu_local.cpu_number)
+
+	apic.lapic_eoi()
+	apic.lapic_timer_oneshot(mut cpu_local, scheduler_vector, time.next_wakeup_us(effective_timeslice(current_thread)))
+
+	// The SWAPGS below leaves GS on the thread for the kernel, and the
+	// thread's own base parked in KERNEL_GS_BASE, whichever mode it returns
+	// to; in userspace the two are the other way round. A user thread resumed
+	// inside a syscall used to lose the GS base it had set with arch_prctl.
+	//
+	// Last, as nothing past this point may use GS: for a thread resumed in
+	// the kernel it holds the thread's own base until the SWAPGS. Freeing the
+	// thread that died here used to come after it, and anything on the way
+	// that looked at GS -- a lock answering a TLB shootdown asks which CPU it
+	// is on -- read address 0, and its fault handler faulted for good.
+	fs_base, user_gs_base := load_fs_gs(current_thread)
+	if in_userspace(&current_thread.gpr_state) {
+		cpu.set_gs_base(u64(current_thread))
+		cpu.set_kernel_gs_base(user_gs_base)
+	} else {
+		cpu.set_gs_base(user_gs_base)
+		cpu.set_kernel_gs_base(u64(current_thread))
+	}
+	cpu.set_fs_base(fs_base)
+
+	// Assembly also applies the local return policy and overwrites the RSB.
+	C.vinix_x86_resume_context(&current_thread.gpr_state, cpu_local.cpu_number)
+
+	for {
+	}
+}
+
+// Wake a specific boot-online CPU, including a target whose affinity was
+// just published while its thread is still running elsewhere.
+pub fn wake_cpu(number u32) bool {
+	if number >= u32(cpu_locals.len) || katomic.load(&cpu_locals[number].online) == 0 {
+		return false
+	}
+	apic.lapic_send_ipi(cpu_locals[number].lapic_id, scheduler_vector)
+	return true
+}
+
+fn send_reschedule(number u64) bool {
+	return wake_cpu(u32(number))
+}
+
+pub fn enqueue_thread(t &proc.Thread, by_signal bool) bool {
+ if katomic.load(&t.not_started) { return false }
+ if by_signal { katomic.store(mut unsafe { &t.enqueued_by_signal }, true) }
+ return queue_enqueue(t, true)
+}
+
+pub fn dequeue_thread(t &proc.Thread) bool {
+ return queue_dequeue(t)
+}
+
+// Who gives back a dead thread's stacks: the thread itself, from its own CPU
+// once it is off them, or the sibling that stopped it for good.
+const reap_claim_self = 1
+const reap_claim_stopped = 2
+
+// Take a thread of another CPU for good, for exit_group() or execve() in one
+// of its siblings: it is off every CPU when this returns, and never runs
+// again. The caller has marked it dead, so no wakeup can put it back. A thread
+// that is already on its way out through dequeue_and_die() is left to go by
+// itself: its own CPU has claimed reaping after the final switch. Otherwise
+// its stacks are buried here.
+pub fn stop_thread_for_good(_thread &proc.Thread) {
+	mut t := unsafe { _thread }
+	if voidptr(t) == voidptr(proc.current_thread()) {
+		return
+	}
+	mut kicked_cpu := u64(-1)
+	for {
+		if katomic.load(&t.reap_claim) == u32(reap_claim_self) {
+			return
+		}
+		dequeue_thread(t)
+		on := katomic.load(&t.running_on)
+		if on == u64(-1) {
+			// Off every CPU, unless one is just picking it up: it takes the
+			// lock before it says where the thread runs.
+			if !t.l.is_held() {
+				break
+			}
+		} else if on != kicked_cpu {
+			// Send that CPU to the scheduler, once per CPU it is found on.
+			apic.lapic_send_ipi(u8(cpu_locals[on].lapic_id), scheduler_vector)
+			kicked_cpu = on
+		}
+		answer_tlb_shootdown()
+		asm volatile amd64 {
+			pause
+			; ; ; memory
+		}
+	}
+	if katomic.cas(mut &t.reap_claim, u32(0), u32(reap_claim_stopped)) {
+		proc.linuxkpi_mark_task_dead(mut t)
+		bury_thread(t)
+	}
+}
+
+// Like dequeue_thread(), but it stops it immediately
+pub fn intercept_thread(_thread &proc.Thread) ? {
+	mut t := unsafe { _thread }
+
+	if voidptr(t) == voidptr(proc.current_thread()) {
+		return none
+	}
+
+	dequeue_thread(t)
+
+	running_on := t.running_on
+
+	if running_on == u64(-1) {
+		return
+	}
+
+	apic.lapic_send_ipi(u8(cpu_locals[running_on].lapic_id), scheduler_vector)
+
+	t.l.acquire()
+	t.l.release()
+}
+
+pub fn yield(save_ctx bool) {
+	asm volatile amd64 {
+		cli
+	}
+	require_task_context()
+
+	apic.lapic_timer_stop()
+
+	mut cpu_local := cpulocal.current()
+
+	mut current_thread := proc.current_thread()
+
+	if save_ctx == true {
+		current_thread.yield_await.acquire()
+	} else {
+		cpu.set_gs_base(u64(&cpu_local.cpu_number))
+		cpu.set_kernel_gs_base(u64(&cpu_local.cpu_number))
+	}
+
+	apic.lapic_send_ipi(u8(cpu_local.lapic_id), scheduler_vector)
+
+	asm volatile amd64 {
+		sti
+	}
+
+	if save_ctx == true {
+		current_thread.yield_await.acquire()
+		current_thread.yield_await.release()
+	} else {
+		for {
+			asm volatile amd64 {
+				hlt
+			}
+		}
+	}
+}
+
+pub fn dequeue_and_yield() {
+	asm volatile amd64 {
+		cli
+	}
+	require_task_context()
+	dequeue_thread(proc.current_thread())
+	yield(true)
+}
+
+// Leave the CPU for good, as a thread whose exit a sibling tearing the process
+// down has already taken charge of (see proc.claim_thread_exit). That sibling's
+// stop_thread_for_good() and dequeue_and_die() settle between them, through
+// reap_claim, which gives back the stacks.
+@[noreturn]
+pub fn park_stopped_thread() {
+	dequeue_and_die()
+}
+
+@[noreturn]
+pub fn dequeue_and_die() {
+	asm volatile amd64 {
+		cli
+	}
+	require_task_context()
+	mut t := proc.current_thread()
+	t.is_dead = true
+	proc.linuxkpi_mark_task_dead(mut t)
+	// A sibling's exit_group() may be stopping this thread at the same time.
+	// Whichever of the two claims it gives back its stacks.
+	claimed := katomic.cas(mut &t.reap_claim, u32(0), u32(reap_claim_self))
+	dequeue_thread(t)
+	// This thread leaves the CPU here rather than through the switch in
+	// scheduler_isr, so its last turn is charged here or not at all.
+	proc.charge_cpu_time(mut t, time.monotonic_ns())
+	// Its stacks are still in use until the switch; the scheduler gives them
+	// back once it is past it.
+	if claimed {
+		mut cpu_local := cpulocal.current()
+		cpu_local.dying_thread = voidptr(t)
+	}
+	yield(false)
+	for {
+	}
+}
+
+// Give up the CPU, leaving the current thread to resume from the context in
+// its gpr_state, which the caller has just rewritten: a signal handler's entry,
+// or what a sigreturn restores. The registers of the syscall in progress are
+// not the thread's to keep, which is the difference from a timer switch;
+// scheduler_isr saves everything else a switch saves and leaves the registers
+// alone. It is also what lets go of the thread's lock, once this CPU is on the
+// scheduler's own stack. Letting go here, while still running on the thread's
+// kernel stack, let another CPU pick the thread up, run its handler and take
+// its next syscall on that same stack underneath this CPU, whose interrupts
+// then landed in the middle of the other's frames.
+pub fn resume_saved_context() {
+	asm volatile amd64 {
+		cli
+	}
+	require_task_context()
+	mut t := proc.current_thread()
+	t.context_preset = true
+	yield(true)
+	// scheduler_isr never comes back to a thread whose context was preset.
+	for {
+	}
+}
+
+// Give up the rest of this thread's timeslice without leaving the run queue.
+// This mirrors the ARM scheduler helper used by shared kernel wait loops.
+pub fn reschedule() {
+	yield(true)
+}
+
+pub fn new_kernel_thread(pc voidptr, arg voidptr, autoenqueue bool) &proc.Thread {
+	t := try_new_kernel_thread(pc, arg) or { panic('Cannot allocate guarded kernel thread') }
+	if autoenqueue { enqueue_thread(t, false) }
+	return t
+}
+
+pub fn new_user_thread(_process &proc.Process, want_elf bool, pc voidptr, arg voidptr, _stack u64, argv []string, envp []string, auxval &elf.Auxval, autoenqueue bool) ?&proc.Thread {
+	mut process := unsafe { _process }
+	charge := proc.reserve_kernel_for(process.kernel_owner, .thread,
+		2 * stack_size + u64(sizeof(proc.Thread)) * 2 + 16384) or { errno.set(errno.eagain); return none }
+	mut charge_transferred := false
+	defer { if !charge_transferred { kbudget.release(charge) } }
+
+	mut stack_vma := u64(0)
+	mut stack_bottom_vma := u64(0)
+
+	if _stack == 0 {
+		stack_vma, stack_bottom_vma = reserve_main_stack(mut process, want_elf)?
+	} else {
+		stack_vma = _stack
+	}
+
+	kernel_stack_base := memory.kernel_stack_alloc(stack_size)
+	if kernel_stack_base == unsafe { nil } { errno.set(errno.enomem); return none }
+	kernel_stack := u64(kernel_stack_base) + stack_size
+
+	pf_stack_base := memory.kernel_stack_alloc(stack_size)
+	if pf_stack_base == unsafe { nil } {
+		memory.kernel_stack_free(u64(kernel_stack_base))
+		errno.set(errno.enomem); return none
+	}
+	pf_stack := u64(pf_stack_base) + stack_size
+
+	gpr_state := cpulocal.GPRState{
+		cs:     user_code_seg
+		ds:     user_data_seg
+		es:     user_data_seg
+		ss:     user_data_seg
+		rflags: 0x202
+		rip:    u64(pc)
+		rdi:    u64(arg)
+		rsp:    u64(stack_vma)
+	}
+
+	fpu_phys := memory.pmm_alloc_fallible(lib.div_roundup(fpu_storage_size, page_size))
+	if fpu_phys == unsafe { nil } {
+		memory.kernel_stack_free(u64(pf_stack_base))
+		memory.kernel_stack_free(u64(kernel_stack_base))
+		errno.set(errno.enomem); return none
+	}
+	thread_mem := memory.malloc_packed_fallible(sizeof(proc.Thread))
+	if thread_mem == unsafe { nil } {
+		memory.pmm_free(fpu_phys, lib.div_roundup(fpu_storage_size, page_size))
+		memory.kernel_stack_free(u64(pf_stack_base))
+		memory.kernel_stack_free(u64(kernel_stack_base))
+		errno.set(errno.enomem); return none
+	}
+	mut t := unsafe { &proc.Thread(thread_mem) }
+	unsafe { *t = proc.Thread{
+		kernel_charge: charge
+		no_new_privs: proc.no_new_privs_state(proc.current_thread())
+		securebits: proc.securebits_state(proc.current_thread())
+		process:      process
+		sched_nice_override: initial_user_nice(process)
+		sched_has_nice_override: true
+		cr3:          process.pagemap.tagged_root()
+		gpr_state:    gpr_state
+		timeslice:    5000
+		running_on:   u64(-1)
+		kernel_stack: kernel_stack
+		pf_stack:     pf_stack
+		fpu_storage:  voidptr(u64(fpu_phys) + higher_half)
+	} }
+	charge_transferred = true
+
+	mut attached := false
+	defer {
+		if !attached { free_thread_memory(t) }
+	}
+
+	t.self = voidptr(t)
+	t.gs_base = u64(0)
+	t.fs_base = u64(0)
+
+	// Set up FPU control word and MXCSR as defined in the sysv ABI
+	fpu_restore(t.fpu_storage)
+
+	default_fcw := u16(0b1100111111)
+
+	asm volatile amd64 {
+		fldcw default_fcw
+		; ; m (default_fcw)
+		; memory
+	}
+
+	default_mxcsr := u32(0b1111110000000)
+
+	asm volatile amd64 {
+		ldmxcsr default_mxcsr
+		; ; m (default_mxcsr)
+		; memory
+	}
+
+	fpu_save(t.fpu_storage)
+
+	// SIG_DFL, which Linux spells as zero.
+	for mut sa in t.sigactions {
+		sa.sa_sigaction = voidptr(0)
+	}
+
+	if want_elf == true {
+		t.gpr_state.rsp = build_initial_stack(mut process, stack_vma, stack_bottom_vma, argv, envp,
+			auxval) or {
+			return none
+		}
+	}
+
+	// Published processes (proc.allocate_pid()/new_process()) can be visible
+	// to another CPU -- e.g. syscall_kill's kill(-1, sig) broadcast, which
+	// reads process.threads directly -- before their first thread lands
+	// here, and start_program()'s exec path replaces this same slice under
+	// the identical lock; attach_thread() holds it across the append. The
+	// thread is numbered before it can run, so gettid() never sees it bare.
+	attach_thread(mut process, mut t) or {
+		errno.set(errno.eagain)
+		return none
+	}
+	attached = true
+	proc.linuxkpi_init_task(mut t, unsafe { nil })
+
+	if autoenqueue == true {
+		publish_user_thread(mut process, t)
+	}
+
+	return t
+}
+
+// Number a thread and add it to its process. Threads are numbered from the
+// pid space, as on Linux and on arm64: the first thread of a process takes the
+// pid as its tid, every other one an id no process can have while it lives.
+// gettid(), tgkill() and the scheduling calls find a thread by that number.
+// A thread for clone(CLONE_THREAD), or the one thread of a process
+// clone()/fork() makes: it resumes where `source` made the syscall, from the
+// registers in `state`, with 0 as the syscall's result and `child_sp` as its
+// stack pointer. `tls`, when `set_tls` asks for it, is its FS base -- where
+// musl keeps the thread pointer. The caller enqueues it.
+pub fn new_cloned_thread(_process &proc.Process, _source &proc.Thread, state &cpulocal.GPRState, child_sp u64, tls u64, set_tls bool) ?&proc.Thread {
+	mut process := unsafe { _process }
+	charge := proc.reserve_kernel_for(process.kernel_owner, .thread,
+		2 * stack_size + u64(sizeof(proc.Thread)) * 2 + 16384) or { errno.set(errno.eagain); return none }
+	mut charge_transferred := false
+	defer { if !charge_transferred { kbudget.release(charge) } }
+	mut source := unsafe { _source }
+
+	kernel_stack_base := memory.kernel_stack_alloc(stack_size)
+	if kernel_stack_base == unsafe { nil } { errno.set(errno.enomem); return none }
+	pf_stack_base := memory.kernel_stack_alloc(stack_size)
+	if pf_stack_base == unsafe { nil } {
+		memory.kernel_stack_free(u64(kernel_stack_base))
+		errno.set(errno.enomem); return none
+	}
+	fpu_pages := lib.div_roundup(fpu_storage_size, page_size)
+	fpu_phys := memory.pmm_alloc_fallible(fpu_pages)
+	if fpu_phys == unsafe { nil } {
+		memory.kernel_stack_free(u64(pf_stack_base))
+		memory.kernel_stack_free(u64(kernel_stack_base))
+		errno.set(errno.enomem); return none
+	}
+	thread_mem := memory.malloc_packed_fallible(sizeof(proc.Thread))
+	if thread_mem == unsafe { nil } {
+		memory.pmm_free(fpu_phys, fpu_pages)
+		memory.kernel_stack_free(u64(pf_stack_base))
+		memory.kernel_stack_free(u64(kernel_stack_base))
+		errno.set(errno.enomem); return none
+	}
+
+	mut t := unsafe { &proc.Thread(thread_mem) }
+	unsafe { *t = proc.Thread{
+		kernel_charge: charge
+		no_new_privs: proc.no_new_privs_state(source)
+		securebits: proc.securebits_state(source)
+		process:        process
+		cr3:            process.pagemap.tagged_root()
+		gpr_state:      *state
+		not_started:    true
+		timeslice:      source.timeslice
+		running_on:     u64(-1)
+		kernel_stack:   u64(kernel_stack_base) + stack_size
+		pf_stack:       u64(pf_stack_base) + stack_size
+		fpu_storage:    voidptr(u64(fpu_phys) + higher_half)
+		sigactions:     source.sigactions
+		masked_signals: source.masked_signals
+		affinity_mask:  source.affinity_mask
+		sched:          inherited_sched_params(source)
+		sched_nice_override: inherited_nice(source)
+		sched_has_nice_override: true
+		timer_slack_ns: source.timer_slack_ns
+		comm:           source.comm.clone()
+		comm_named:     source.comm_named
+	} }
+	charge_transferred = true
+
+	t.self = voidptr(t)
+	// In a syscall the user's GS base is the one swapgs put aside.
+	t.gs_base = cpu.get_kernel_gs_base()
+	t.fs_base = if set_tls { tls } else { cpu.get_fs_base() }
+	// Its selectors and TLS descriptors too, as Linux copies them. A TLS
+	// pointer is a 64-bit FS base, which a selector would replace.
+	t.fs_selector = if set_tls { u16(0) } else { cpu.fs_selector() }
+	t.gs_selector = cpu.gs_selector()
+	t.tls = source.tls
+
+	// The saved copy is from the last switch; the child has to start with
+	// the FPU state the caller has at this syscall.
+	fpu_save(source.fpu_storage)
+	unsafe { C.memcpy(t.fpu_storage, source.fpu_storage, fpu_storage_size) }
+
+	t.gpr_state.rax = 0
+	t.gpr_state.rsp = child_sp
+
+	attach_thread(mut process, mut t) or {
+		// No tid, process-list entry, runqueue slot or event published t.
+		free_thread_memory(t)
+		errno.set(errno.eagain)
+		return none
+	}
+	proc.linuxkpi_init_task(mut t, source)
+
+	return t
+}
+
+pub fn await() {
+	asm volatile amd64 {
+		cli
+	}
+	require_task_context()
+	mut cpu_local := cpulocal.current()
+	// Nothing to run and not meant to run anything: this processor is being
+	// taken out of the scheduler for a sleep that powers it down.
+	if parking(cpu_local.cpu_number) {
+		park_here(mut cpu_local)
+	}
+	wakeup := if device_poll_callback != voidptr(0) && cpu_local.cpu_number == 0 {
+		idle_poll_wakeup_us
+	} else {
+		idle_max_wakeup_us
+	}
+	sleep_us := idle_wakeup_us(wakeup)
+	apic.lapic_timer_oneshot(mut cpu_local, scheduler_vector, sleep_us)
+	// With a table of idle states the wait is cpuidle's: it chooses one,
+	// keeps the same `sti; hlt` (or its MWAIT counterpart) and does not come
+	// back. Interrupts stay off from the CLI above until it halts.
+	//
+	// It waits on this CPU's own idle stack, not on the one it was called on.
+	// The loop below keeps nothing on its stack across the HLT, and cpuidle's
+	// does: the CPU's number, when its timer is due. When the caller is the
+	// scheduler's interrupt handler the stack is that vector's IST stack,
+	// which the processor starts again from the top on every scheduler
+	// interrupt -- including one that arrives inside another device's
+	// handler, is turned away, and returns into the wait it interrupted.
+	// The frames it wrote on the way would lie where the wait's are.
+	if cpuidle.active() && cpu_local.cpu_number < max_preemption_cpus {
+		C.vinix_enter_idle(cpu_local.idle_int_stack, voidptr(await_in_idle_states), voidptr(sleep_us))
+	}
+	// Without one, as ever. STI takes effect after the instruction that
+	// follows it, so there is no moment with interrupts on and the CPU not
+	// yet halted: an interrupt that came while they were off ends the HLT.
+	asm volatile amd64 {
+		sti
+		1:
+		hlt
+		jmp b1
+		; ; ; memory
+	}
+}
+
+// await(), continued on the idle stack with interrupts off and the timer
+// armed for `sleep_us`.
+fn await_in_idle_states(sleep_us voidptr) {
+	cpu_number := cpulocal.current().cpu_number
+	cpuidle.idle_loop(cpu_number, u64(sleep_us), &cpu_reschedule_pending[cpu_number])
+	// Only a CPU cpuidle keeps no record for comes back, and await() sends
+	// none here.
+	asm volatile amd64 {
+		sti
+		1:
+		hlt
+		jmp b1
+		; ; ; memory
+	}
+}
+
+fn C.vinix_enter_idle(stack_top u64, entry voidptr, arg voidptr)
+
+@[noreturn]
+pub fn enter_idle() {
+	asm volatile amd64 { cli }
+	require_task_context()
+	top := cpulocal.current().idle_int_stack
+	C.vinix_enter_idle(top, voidptr(await), unsafe { nil })
+	for {}
+}
+
+// Call with IRQs disabled, before queue, task, GS or stack ownership changes.
+fn require_task_context() {
+	if cpulocal.current().maskable_irq_depth != 0 {
+		lib.kpanic(unsafe { nil }, c'sched: blocking or exiting from a maskable IRQ')
+	}
+}
+
+// ITIMER_REAL is counted down by the clock tick here: see sched/itimer.v.
+fn itimer_armed() {
+	if katomic.cas(mut &itimer_hook_claimed, u32(0), u32(1)) {
+		if !time.register_tick_hook(tick_itimers) {
+			katomic.store(mut &itimer_hook_claimed, u32(0))
+		}
+	}
+}
+
+__global (
+	// Set once by whichever set_itimer_real() gets to register the tick hook.
+	// A word, as katomic.cas needs 4 or 8 bytes.
+	itimer_hook_claimed u32
+)
+
+// ── giving back the stacks of dead threads ──────────────────────────────────
+
+// Every thread owns a guarded kernel stack, a guarded page fault stack and its FPU
+// area. They used to be kept forever, so every process and thread a program
+// started cost 4 MiB for the rest of the machine's life: a session of shell
+// prompts, compiles and git clones ran a 4 GiB machine out of memory.
+
+__global (
+	// Threads a sibling's exit_group() or execve() stopped. Their stacks go
+	// when that sibling's own do.
+	graveyard      []&proc.Thread
+	graveyard_lock klock.Lock
+)
+
+// Hand over a thread that will never run again: one exit_group() or execve()
+// took off the CPU for good.
+pub fn bury_thread(t &proc.Thread) {
+	graveyard_lock.acquire()
+	graveyard << unsafe { t }
+	graveyard_lock.release()
+}
+
+// The Thread owns each mapping through its top until the last CPU leaves it.
+fn free_thread_stacks(mut t proc.Thread) {
+	if t.kernel_stack != 0 {
+		memory.kernel_stack_free(t.kernel_stack - stack_size)
+		t.kernel_stack = 0
+	}
+	if t.pf_stack != 0 {
+		memory.kernel_stack_free(t.pf_stack - stack_size)
+		t.pf_stack = 0
+	}
+	if t.fpu_storage != unsafe { nil } {
+		memory.pmm_free(voidptr(u64(t.fpu_storage) - higher_half), lib.div_roundup(fpu_storage_size,
+			page_size))
+		t.fpu_storage = unsafe { nil }
+	}
+}
+
+// The stacks, and then the Thread, of a thread that died by itself: it left
+// the tid table, its process and every event it waited on before it died.
+fn free_thread_memory(t &proc.Thread) {
+	mut thr := unsafe { t }
+	proc.seccomp_release(mut thr)
+	$if linuxkpi ? {
+		if thr.linuxkpi_iowait_cpu_plus_one != 0 {
+			lib.kpanic(unsafe { nil }, c'linuxkpi: reclaiming counted I/O task')
+		}
+	}
+	free_thread_stacks(mut thr)
+	kbudget.release(t.exec_scratch)
+ kbudget.release(t.kernel_charge)
+	unsafe {
+		thr.comm.free()
+		free(voidptr(thr))
+	}
+}
+
+// Called by scheduler_isr once this CPU is on its own stacks and its IST3
+// points at the thread it is about to run, or at its idle stack: the thread
+// that died on this CPU is off its stacks by then, and goes, as on arm64. One
+// a sibling stopped keeps its Thread, as events it was waiting on may still
+// point at it, and only gives its stacks back.
+fn reap_dead_threads(mut cpu_local cpulocal.Local) {
+	if cpu_local.dying_thread == unsafe { nil } {
+		return
+	}
+	mut dead := unsafe { &proc.Thread(cpu_local.dying_thread) }
+	cpu_local.dying_thread = unsafe { nil }
+	// yield(false) clears GS before the interrupt, so the outgoing-thread
+	// branch cannot release this lock. We are now on the scheduler's stack.
+	katomic.store(mut &dead.running_on, u64(-1))
+	katomic.store(mut &dead.l.l, false)
+	reap_thread(dead)
+
+	// The threads it stopped on its way out were taken off their CPUs before
+	// it went on to die itself, so by now nothing can be on their stacks.
+	if !graveyard_lock.test_and_acquire() {
+		return
+	}
+	mut i := 0
+	for i < graveyard.len {
+		mut buried := graveyard[i]
+		if katomic.load(&buried.running_on) == u64(-1) && !buried.l.is_held() {
+			free_thread_stacks(mut buried)
+			graveyard.delete(i)
+		} else {
+			i++
+		}
+	}
+	graveyard_lock.release()
+}
+
+// The CPU features a program is told of in AT_HWCAP and AT_HWCAP2; see
+// build_initial_stack().
+fn user_hwcaps() (u64, u64) {
+	return cpu.user_hwcaps()
+}

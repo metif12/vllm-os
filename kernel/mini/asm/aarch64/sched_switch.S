@@ -1,0 +1,193 @@
+// sched_switch_context(gpr_state *GPRState, kernel_stack u64)
+// Restores ARM64 GPR state from the GPRState struct and returns via eret.
+// GPRState layout: x0(0) x1(8) .. x28(224) x29(232) x30(240) sp(248) pc(256) pstate(264)
+// Called with x0 = pointer to GPRState, x1 = kernel stack top. Does NOT return.
+
+.global sched_switch_context
+sched_switch_context:
+    // x0 = GPRState pointer, x1 = kernel_stack
+
+    // Keep the target pointers in callee-saved temporaries while the optional
+    // diagnostic hook uses the normal AAPCS. They are overwritten with the
+    // target thread's own x19/x20 values before eret, so the outgoing values
+    // do not need to be restored.
+    mov x19, x0
+    mov x20, x1
+    mov x1, #0
+    bl scheduler_gpu_context_trace
+    mov x0, x19
+    mov x1, x20
+
+    // Restore ELR_EL1 (return PC) first. Under VHE these EL1 register names
+    // access the corresponding EL2 host registers, which is exactly where the
+    // eventual eret takes its state from.
+    ldr x2, [x0, #256]
+    msr elr_el1, x2
+
+    // A saved mode of EL0t is exact and must remain EL0t. A non-zero mode
+    // denotes kernel context, but its exception level cannot be hard-coded:
+    // QEMU/OVMF enters Vinix at EL1 while Apple Silicon enters it as a VHE EL2
+    // host. Returning to EL1h from the latter is illegal when HCR_EL2.TGE is
+    // set, producing EC=0x0e at the first instruction of a new thread.
+    // Preserve every flag above M[3:0] and synthesize current-EL handler mode:
+    // CurrentEL is EL << 2, and the low bit selects SP_ELx.
+    ldr x2, [x0, #264]
+    and x3, x2, #0xf
+    cbz x3, .write_spsr
+    mrs x3, CurrentEL
+    and x3, x3, #0xc
+    orr x3, x3, #1
+    bic x2, x2, #0xf
+    orr x2, x2, x3
+.write_spsr:
+    msr spsr_el1, x2
+
+    mov x0, x19
+    mov x1, #1
+    bl scheduler_gpu_context_trace
+    mov x0, x19
+    mov x1, x20
+
+    // Set the appropriate stack pointer based on target EL.
+    // Check saved SPSR.M[3:0]: 0 = EL0t; non-zero = kernel context.
+    ldr x3, [x0, #264]         // pstate
+    ands xzr, x3, #0xF
+    b.ne .set_kernel_sp
+
+    // User thread (EL0t):
+    // 1. Set SP_EL1 to the kernel stack for exception handling.
+    // 2. Set SP_EL0 to the user stack via SPSel trick.
+    //    (`msr SP_EL0, xN` hangs under HVF, but SPSel works.)
+    // ISB after SPSel ensures pipeline sees the new SP alias.
+    mov sp, x1                  // SP_EL1 = kernel stack
+    ldr x2, [x0, #248]         // x2 = user SP
+    msr SPSel, #0               // now SP refers to SP_EL0
+    isb
+    mov sp, x2                  // SP_EL0 = user stack
+    msr SPSel, #1               // back to SP_EL1 (= kernel stack)
+    isb
+
+    // Restore TPIDR_EL0 (user TLS pointer)
+    ldr x2, [x0, #272]
+    msr tpidr_el0, x2
+
+    b .restore_gprs
+
+.set_kernel_sp:
+    // Kernel thread (EL1h under QEMU, EL2h under Apple VHE): set SP_ELx.
+    // HVF workaround: eret may restore SP_EL0 instead of SP_EL1,
+    // so set BOTH to the same value via SPSel trick.
+    ldr x2, [x0, #248]
+    msr SPSel, #0               // now SP refers to SP_EL0
+    isb
+    mov sp, x2                  // SP_EL0 = thread's SP
+    msr SPSel, #1               // back to SP_EL1
+    isb
+    mov sp, x2                  // SP_EL1 = thread's SP
+
+.restore_gprs:
+    mov x0, x19
+    mov x1, #2
+    bl scheduler_gpu_context_trace
+    mov x0, x19
+
+    // Restore general purpose registers (from GPRState, not stack)
+    ldp x2, x3, [x0, #16]
+    ldp x4, x5, [x0, #32]
+    ldp x6, x7, [x0, #48]
+    ldp x8, x9, [x0, #64]
+    ldp x10, x11, [x0, #80]
+    ldp x12, x13, [x0, #96]
+    ldp x14, x15, [x0, #112]
+    ldp x16, x17, [x0, #128]
+    ldp x18, x19, [x0, #144]
+    ldp x20, x21, [x0, #160]
+    ldp x22, x23, [x0, #176]
+    ldp x24, x25, [x0, #192]
+    ldp x26, x27, [x0, #208]
+    ldr x28, [x0, #224]
+    ldr x29, [x0, #232]
+    ldr x30, [x0, #240]
+
+    // Restore x0 and x1 last (x0 is the pointer itself)
+    ldp x0, x1, [x0, #0]
+
+    isb
+    eret
+
+// yield_dispatch(handler_fn_ptr)
+// Saves the current kernel context into a GPRState on the stack, then calls
+// the scheduler timer handler (x0 = handler fn ptr).
+//
+// If the scheduler switches to another thread (via sched_switch_context -> eret),
+// this function "pauses". When the thread is later rescheduled, sched_switch_context
+// is called with the saved GPRState (pstate=EL1h), which erets back to EL1h at
+// the saved LR, effectively making this function return normally.
+//
+// If the scheduler has no thread to switch to, the handler returns and this
+// function cleans up and returns normally.
+.global yield_dispatch
+yield_dispatch:
+    // x0 = scheduler_timer_handler function pointer
+
+    // Save all GPRs into a GPRState frame on the stack
+    sub sp, sp, #288
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    stp x18, x19, [sp, #144]
+    stp x20, x21, [sp, #160]
+    stp x22, x23, [sp, #176]
+    stp x24, x25, [sp, #192]
+    stp x26, x27, [sp, #208]
+    stp x28, x29, [sp, #224]
+    str x30, [sp, #240]
+
+    // SP = original SP (before sub)
+    add x2, sp, #288
+    str x2, [sp, #248]
+
+    // PC = LR (return address -> resumes at caller after eret)
+    str x30, [sp, #256]
+
+    // A non-zero saved mode marks this as kernel context. sched_switch_context
+    // replaces EL1h with the current EL's handler mode before every eret.
+    // With PAN where the machine has it on: a thread that sleeps in the kernel
+    // comes back as protected as it went.
+    mov x2, #0x5
+    adrp x3, kernel_pstate_pan
+    ldr x3, [x3, #:lo12:kernel_pstate_pan]
+    orr x2, x2, x3
+    str x2, [sp, #264]
+
+    // Call handler(gpr_state_ptr): x0 = GPRState*, handler = saved x0
+    mov x1, x0          // x1 = handler fn ptr
+    mov x0, sp          // x0 = GPRState pointer
+    blr x1
+
+    // Handler returned (no context switch happened). Clean up.
+    // Restore x30 (LR) from saved GPRState — blr clobbered it.
+    ldr x30, [sp, #240]
+    add sp, sp, #288
+    ret
+
+// vinix_enter_idle(stack_top, entry, thread)
+// x0 = stack top (16-byte aligned), x1 = function to run there,
+// x2 = argument passed to it after changing stacks.
+//
+// Abandon the current stack and continue at `entry` on `stack_top`. Used when a
+// CPU has just released the thread whose stack it is standing on -- another CPU
+// may already be running that thread, so there is nothing here to return to.
+// Does not return.
+.global vinix_enter_idle
+.type vinix_enter_idle, %function
+vinix_enter_idle:
+    mov sp, x0
+    mov x0, x2
+    br x1

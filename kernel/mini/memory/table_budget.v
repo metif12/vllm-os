@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+module memory
+
+import kbudget
+import errno
+import vmstorage
+
+fn user_table_levels() int {
+	$if aarch64 {
+		return 3
+	}
+	$if amd64 {
+		return if la57 { 5 } else { 4 }
+	}
+}
+
+fn table_page_count(table &u64, levels int, root bool) u64 {
+	if table == unsafe { nil } { return 0 }
+	mut count := u64(1)
+	if levels == 1 { return count }
+	mut entries := page_size / 8
+	$if amd64 {
+		if root { entries = 256 }
+	}
+	for i := u64(0); i < entries; i++ {
+		entry := unsafe { *(&u64(u64(table) + higher_half + i * 8)) }
+		if entry & 1 != 0 {
+			count += table_page_count(voidptr(entry & pte_flags_mask), levels - 1, false)
+		}
+	}
+	return count
+}
+
+pub fn pagemap_storage_bytes(capacity int) ?u64 {
+	if capacity < 0 { errno.set(errno.einval); return none }
+	object := vmstorage.allocation_bytes(u64(sizeof(Pagemap))) or { errno.set(errno.enomem); return none }
+	buffer := vmstorage.allocation_bytes(u64(capacity) * u64(sizeof(voidptr))) or { errno.set(errno.enomem); return none }
+	return object + buffer
+}
+
+// Adopt a standalone address space built before its Process existed. An
+// embedded shadow is already charged by its enclosing global range.
+// Only unattached or locked page maps are passed here.
+pub fn account_pagemap(mut pagemap Pagemap, owner kbudget.Owner) ? {
+	if owner.slot == 0 || pagemap.kernel_charge.owner.slot != 0 { return }
+	bytes := table_page_count(pagemap.top_level, user_table_levels(), true) * page_size + pagemap_storage_bytes(pagemap.mmap_ranges.cap)?
+	pagemap.kernel_charge = kbudget.reserve(owner, .mapping, bytes) or {
+		errno.set(errno.enomem)
+		return none
+	}
+	pagemap.kernel_owner = owner
+}
+
+fn reserve_table_page(mut pagemap Pagemap) bool {
+	if pagemap.kernel_owner.slot == 0 { return true }
+	account_pagemap(mut pagemap, pagemap.kernel_owner) or { return false }
+	if !kbudget.grow(mut pagemap.kernel_charge, page_size) {
+		errno.set(errno.enomem)
+		return false
+	}
+	// Never invoke the OOM killer under the page-map lock. A fault/syscall
+	// retries or settles physical exhaustion once those locks are unwound.
+	if !user_room(1) {
+		kbudget.shrink(mut pagemap.kernel_charge, page_size)
+		return false
+	}
+	return true
+}
+
+fn release_table_page(mut pagemap Pagemap) {
+	if pagemap.kernel_charge.owner.slot != 0 {
+		kbudget.shrink(mut pagemap.kernel_charge, page_size)
+	}
+}
+
+pub fn ensure_table_root(mut pagemap Pagemap) ? {
+	if pagemap.top_level != unsafe { nil } { return }
+	if !reserve_table_page(mut pagemap) { return none }
+	root := pmm_alloc_fallible(1)
+	if root == unsafe { nil } {
+		release_table_page(mut pagemap)
+		errno.set(errno.enomem)
+		return none
+	}
+	pagemap.top_level = root
+}
+
+// Empty shadow maps describe sparse reservations without allocating tables.
+// Callers serialize allocating lookups with the same lock as lower levels.
+fn (pagemap &Pagemap) lookup_root(allocate bool) ?&u64 {
+	if pagemap.top_level == unsafe { nil } {
+		if !allocate { return none }
+		mut writable := unsafe { pagemap }
+		ensure_table_root(mut writable)?
+	}
+	return pagemap.top_level
+}
+
+fn dispose_table(table &u64, levels int, root bool) {
+	if table == unsafe { nil } { return }
+	if levels > 1 {
+		mut entries := page_size / 8
+		$if amd64 {
+			if root { entries = 256 }
+		}
+		for i := u64(0); i < entries; i++ {
+			entry := unsafe { *(&u64(u64(table) + higher_half + i * 8)) }
+			if entry & 1 != 0 { dispose_table(voidptr(entry & pte_flags_mask), levels - 1, false) }
+		}
+	}
+	pmm_free(table, 1)
+}
+
+// The address space is detached and every data leaf has been unmapped. Walk
+// any empty tables left by a failed allocation, in addition to its root.
+pub fn free_pagemap_tables(mut pagemap Pagemap) {
+	dispose_table(pagemap.top_level, user_table_levels(), true)
+	pagemap.top_level = unsafe { nil }
+}
+
+// Standalone test/adoption callers may release the complete reservation here.
+// Heap owners free their object/arrays before releasing the saved charge.
+pub fn dispose_pagemap_tables(mut pagemap Pagemap) {
+	free_pagemap_tables(mut pagemap)
+	kbudget.release(pagemap.kernel_charge)
+	pagemap.kernel_charge = kbudget.Charge{}
+}

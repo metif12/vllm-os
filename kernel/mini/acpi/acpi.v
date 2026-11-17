@@ -1,0 +1,142 @@
+@[has_globals]
+module acpi
+
+import limine
+
+pub struct SDT {
+	signature        [4]u8
+	length           u32
+	revision         u8
+	checksum         u8
+	oem_id           [6]u8
+	oem_table_id     [8]u8
+	oem_revision     u32
+	creator_id       u32
+	creator_revision u32
+}
+
+pub struct RSDP {
+	signature    [8]u8
+	checksum     u8
+	oem_id       [6]u8
+	revision     u8
+	rsdt_addr    u32
+	length       u32
+	xsdt_addr    u64
+	ext_checksum u8
+	reserved     [3]u8
+}
+
+struct RSDT {
+	header     SDT
+	ptrs_start u8
+}
+
+__global (
+	rsdp &RSDP
+	rsdt &RSDT
+)
+
+fn use_xsdt() bool {
+	return rsdp.revision >= 2 && rsdp.xsdt_addr != 0
+}
+
+@[_linker_section: '.requests']
+@[cinit]
+__global (
+	volatile rsdp_req = limine.LimineRSDPRequest{
+		response: unsafe { nil }
+	}
+)
+
+pub fn initialise() {
+	if rsdp_req.response == unsafe { nil } {
+		panic('acpi: ACPI not supported on this machine.')
+	}
+	rsdp_ptr := rsdp_req.response.address
+
+	if rsdp_ptr == 0 {
+		panic('acpi: ACPI not supported on this machine.')
+	}
+
+	rsdp = unsafe { rsdp_ptr }
+
+	if use_xsdt() == true {
+		rsdt = unsafe { &RSDT(byteptr(u32(rsdp.xsdt_addr)) + higher_half) }
+	} else {
+		rsdt = unsafe { &RSDT(byteptr(u32(rsdp.rsdt_addr)) + higher_half) }
+	}
+
+	C.kprintf(c'acpi: Revision:  %llu\n', u64(rsdp.revision))
+	C.kprintf(c'acpi: Use XSDT:  %s\n', if use_xsdt() { c'true' } else { c'false' })
+	C.kprintf(c'acpi: R/XSDT at: 0x%llx\n', u64(voidptr(rsdt)))
+
+	// We won't support HW reduced ACPI systems
+	if fadt := find_sdt('FACP', 0) {
+		if unsafe { &SDT(fadt).length >= 116 } {
+			fadt_flags := unsafe { (&u32(fadt))[28] }
+			if fadt_flags & (1 << 20) != 0 {
+				panic('acpi: OS does not support HW reduced ACPI systems.')
+			}
+		}
+	}
+
+	madt_init()
+}
+
+// No caller reads why a table is missing, and an error() would be allocated.
+pub fn find_sdt(signature string, index int) ?voidptr {
+	mut count := 0
+
+	entry_count := (rsdt.header.length - sizeof(SDT)) / u32(if use_xsdt() { 8 } else { 4 })
+
+	for i := 0; i < entry_count; i++ {
+		ptr := if use_xsdt() == true {
+			unsafe { &SDT(byteptr(u32(&u64(&rsdt.ptrs_start)[i])) + higher_half) }
+		} else {
+			unsafe { &SDT(byteptr(u32(&u32(&rsdt.ptrs_start)[i])) + higher_half) }
+		}
+		if unsafe { C.memcmp(voidptr(&ptr.signature), signature.str, 4) == 0 } {
+			if count != index {
+				count++
+				continue
+			}
+			C.kprintf(c'acpi: Found "%.*s" at 0x%llx\n', i32(signature.len), signature.str,
+				u64(voidptr(ptr)))
+			return voidptr(ptr)
+		}
+	}
+
+	return none
+}
+
+// Firmware's tables one by one, for whoever has to tell whether they are the
+// tables a kernel was using before the machine was last switched off: where
+// the root pointer is, how many tables the root table names, and each of
+// them. A table's length is the second field of its header.
+pub fn root_address() u64 {
+	return u64(voidptr(rsdp))
+}
+
+pub fn table_count() int {
+	if rsdt == unsafe { nil } || rsdt.header.length < sizeof(SDT) {
+		return 0
+	}
+	return int((rsdt.header.length - sizeof(SDT)) / u32(if use_xsdt() { 8 } else { 4 }))
+}
+
+// The `index`th table the root table names, or nil.
+pub fn table_at(index int) voidptr {
+	if index < 0 || index >= table_count() {
+		return unsafe { nil }
+	}
+	address := if use_xsdt() {
+		unsafe { u64(&u64(&rsdt.ptrs_start)[index]) }
+	} else {
+		unsafe { u64(&u32(&rsdt.ptrs_start)[index]) }
+	}
+	if address == 0 {
+		return unsafe { nil }
+	}
+	return voidptr(address + higher_half)
+}

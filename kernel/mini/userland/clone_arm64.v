@@ -1,0 +1,325 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (c) 2026 Alexander Medvednikov
+module userland
+
+// Linux process and thread lifecycle syscalls: clone/clone3, wait4/waitid,
+// exit/exit_group and the tid/robust-list bookkeeping they depend on.
+
+import aarch64.cpu.local as cpulocal
+import errno
+import event
+import event.eventstruct
+import file
+import fs
+import futex
+import katomic
+import lib
+import memory.mmap
+import posixtimer
+import proc
+import sched
+import term
+import time
+import usercopy
+
+// ── clone ────────────────────────────────────────────────────────────────────
+
+// clone(flags, child_stack, parent_tid, tls, child_tid). AArch64 selects
+// CLONE_BACKWARDS, so tls comes before child_tid — the order musl's __clone
+// marshals its arguments into.
+pub fn syscall_clone(_gpr_state voidptr, flags u64, child_stack u64, parent_tid u64, tls u64, child_tid u64) (u64, u64) {
+	state := unsafe { &cpulocal.GPRState(_gpr_state) }
+	if !valid_clone_pidfd(flags, parent_tid, parent_tid) {
+		return errno.err, errno.einval
+	}
+
+	return do_clone(state, flags, child_stack, parent_tid, tls, child_tid)
+}
+
+// clone3(&clone_args, size).
+pub fn syscall_clone3(_gpr_state voidptr, uargs u64, size u64) (u64, u64) {
+	state := unsafe { &cpulocal.GPRState(_gpr_state) }
+
+	mut args := CloneArgs{}
+	failure := import_clone3_args(mut args, uargs, size)
+	if failure != 0 {
+		return errno.err, failure
+	}
+	tid_failure := import_clone3_tid_vector(unsafe { &args }, size)
+	if tid_failure != 0 {
+		return errno.err, tid_failure
+	}
+	if !valid_clone3_flags(args.flags) {
+		return errno.err, errno.einval
+	}
+	if !valid_clone3_exit_signal(args.flags, args.exit_signal) {
+		return errno.err, errno.einval
+	}
+
+	// Unlike clone, clone3 is handed the low end of the stack plus its length
+	// and has to derive the initial stack pointer itself.
+	mut child_sp := u64(0)
+	if args.stack != 0 {
+		// Check the range before adding; Linux does not require mapped pages here.
+		if args.stack_size == 0 || !usercopy.user_range(args.stack, args.stack_size) {
+			return errno.err, errno.einval
+		}
+		child_sp = lib.align_down(args.stack + args.stack_size, 16)
+	} else if args.stack_size != 0 {
+		return errno.err, errno.einval
+	}
+
+	if !valid_clone_pidfd(args.flags, args.pidfd, args.parent_tid) {
+		return errno.err, errno.einval
+	}
+
+	// Contradictory sharing precedes cgroup descriptor lookup in Linux.
+	if !valid_clone_sharing(args.flags) {
+		return errno.err, errno.einval
+	}
+
+	// Init cannot create siblings, even when the cgroup descriptor is invalid.
+	if !valid_clone_parent(args.flags) {
+		return errno.err, errno.einval
+	}
+
+	if !valid_clone_pid_namespace(args.flags) {
+		return errno.err, errno.einval
+	}
+
+	// Namespace creation is authorized before cgroup lookup. NEWUSER changes
+	// the child's capability domain and must use its own admission path.
+	if args.flags & proc.clone_newuser == 0
+		&& args.flags & proc.clone_namespace_flags != 0
+		&& !proc.current_has_capability(proc.cap_sys_admin) {
+		return errno.err, errno.eperm
+	}
+
+	ipc_failure := clone_ipc_failure(args.flags)
+	if ipc_failure != 0 {
+		return errno.err, ipc_failure
+	}
+
+	mut cgroup := voidptr(unsafe { nil })
+	if args.flags & clone_into_cgroup != 0 {
+		mut cgroup_fd := file.fd_from_fdnum(unsafe { nil }, int(args.cgroup)) or {
+			return errno.err, errno.ebadf
+		}
+		node := unsafe { &fs.VFSNode(cgroup_fd.handle.node) }
+		cgroup_fd.unref()
+		cgroup = fs.cgroup_from_node(node) or { return errno.err, errno.ebadf }
+	}
+
+	return do_clone_into(state, args.flags, child_sp, args.parent_tid, args.tls, args.child_tid,
+		args.flags & clone_into_cgroup != 0, cgroup)
+}
+
+fn do_clone(state &cpulocal.GPRState, flags u64, child_stack u64, parent_tid u64, tls u64, child_tid u64) (u64, u64) {
+	return do_clone_into(state, flags & 0xffffffff, child_stack, parent_tid, tls, child_tid,
+		false, unsafe { nil })
+}
+
+fn do_clone_into(state &cpulocal.GPRState, flags u64, child_stack u64, parent_tid u64, tls u64, child_tid u64, into_cgroup bool, cgroup voidptr) (u64, u64) {
+	if !valid_clone_sharing(flags) { return errno.err, errno.einval }
+	if !valid_clone_parent(flags) { return errno.err, errno.einval }
+	if !valid_clone_pid_namespace(flags) { return errno.err, errno.einval }
+	ipc_failure := clone_ipc_failure(flags)
+	if ipc_failure != 0 { return errno.err, ipc_failure }
+	if !supported_clone_sharing(flags) { return errno.err, errno.enotsup }
+	// Returning a PID while leaving the requested pidfd word untouched would
+	// falsely report success. Descriptor construction/rollback is unsupported.
+	if flags & clone_pidfd != 0 { return errno.err, errno.einval }
+	if flags & proc.unsupported_namespace_flags != 0 { return errno.err, errno.einval }
+	// A new namespace other than a user namespace takes CAP_SYS_ADMIN, and none
+	// can be made for a thread, which shares its process' namespaces.
+	if flags & proc.clone_namespace_flags != 0 {
+		if flags & clone_thread != 0 {
+			return errno.err, errno.einval
+		}
+		if flags & proc.clone_namespace_flags & ~proc.clone_newuser != 0
+			&& !proc.current_has_capability(proc.cap_sys_admin) {
+			return errno.err, errno.eperm
+		}
+	}
+	// pids.max counts threads and processes alike. A group at its limit refuses
+	// one more, and the clone fails with EAGAIN, as on Linux.
+	if into_cgroup {
+		if !proc.cgroup_account_may_add_task(fs.cgroup_account_of(cgroup)) {
+			return errno.err, errno.eagain
+		}
+	} else if !proc.cgroup_may_add_task(proc.current_thread().process) {
+		return errno.err, errno.eagain
+	}
+	// CLONE_VM shares the map independently of CLONE_THREAD's task identity.
+	if flags & clone_thread != 0 {
+		return clone_thread_of_current(state, flags, child_stack, parent_tid, tls,
+			child_tid)
+	}
+
+	return clone_new_process(state, flags, child_stack, parent_tid, tls, child_tid, into_cgroup,
+		cgroup)
+}
+
+// CLONE_THREAD: another thread inside the calling process, sharing its address
+// space, descriptors and pending-child bookkeeping.
+fn clone_thread_of_current(state &cpulocal.GPRState, flags u64, child_stack u64, parent_tid u64, tls u64, child_tid u64) (u64, u64) {
+	mut current_thread := proc.current_thread()
+	mut process := current_thread.process
+
+	if child_stack == 0 {
+		// Two threads cannot share one stack; there is nothing sensible to do.
+		return errno.err, errno.einval
+	}
+
+	mut new_thread := sched.new_cloned_thread(process, current_thread, state, child_stack,
+		tls, flags & clone_settls != 0) or { return errno.err, errno.eagain }
+	inherit_clone_altstack(mut new_thread, current_thread, flags)
+
+	if flags & clone_child_cleartid != 0 {
+		new_thread.clear_child_tid = child_tid
+	}
+
+	tid := u32(proc.own_tid(new_thread))
+
+	// Both tid words live in the address space we share with the new thread, so
+	// they can be written here, before it is allowed to run. As on Linux, a
+	// write that does not land is not worth failing the whole clone over.
+	if flags & clone_parent_settid != 0 && parent_tid != 0 {
+		usercopy.copy_to_user(parent_tid, voidptr(&tid), sizeof(u32))
+	}
+	if flags & clone_child_settid != 0 && child_tid != 0 {
+		usercopy.copy_to_user(child_tid, voidptr(&tid), sizeof(u32))
+	}
+
+	sched.publish_cloned_thread(new_thread)
+
+	return u64(tid), 0
+}
+
+// A separate process, with a shared or forked map as requested.
+fn clone_new_process(state &cpulocal.GPRState, flags u64, child_stack u64, parent_tid u64, tls u64, child_tid u64, into_cgroup bool, cgroup voidptr) (u64, u64) {
+	mut old_thread := proc.current_thread()
+	mut old_process := old_thread.process
+
+	mut new_process := sched.new_process_with_vm(old_process, unsafe { nil }, if into_cgroup { fs.cgroup_account_of(cgroup) } else { old_process.cgroup_account }, flags & clone_vm != 0) or {
+		return errno.err, errno.get()
+	}
+
+	new_process.name = proc.process_name(old_process.name, new_process.pid)
+	fs.fork_namespaces(mut new_process, flags)
+	if into_cgroup {
+		new_process.cgroup = cgroup
+		new_process.cgroup_account = fs.cgroup_account_of(cgroup)
+	}
+
+	// Duplicate the descriptor table, preserving each fd's O_CLOEXEC flag. The
+	// open numbers are read under the table's lock: another thread of the
+	// parent may make a descriptor meanwhile, and grow the table as it does.
+	mut snapshot := file.open_fdnums(old_process) or {
+		failure := errno.get()
+		abandon_new_process(mut new_process)
+		return errno.err, failure
+	}
+	for i in snapshot.nums {
+		mut old_fd := file.fd_from_fdnum(old_process, i) or { continue }
+		fd_flags := old_fd.flags
+		old_fd.unref()
+		file.fdnum_dup(old_process, i, new_process, i, fd_flags, true, false) or {
+			failure := errno.get()
+			// The parent may close this slot after the snapshot.
+			if failure == errno.ebadf { continue }
+			snapshot.dispose()
+			abandon_new_process(mut new_process)
+			return errno.err, failure
+		}
+	}
+	snapshot.dispose()
+
+	mut child_sp := state.sp
+	if child_stack != 0 {
+		child_sp = child_stack
+	}
+
+	// Numbered once its pid namespace is settled, and before its first thread
+	// is, which takes the process's number.
+	proc.number_process(mut new_process, old_process)
+
+	mut new_thread := sched.new_cloned_thread(new_process, old_thread, state, child_sp,
+		tls, flags & clone_settls != 0) or {
+		abandon_new_process(mut new_process)
+		return errno.err, errno.eagain
+	}
+	inherit_clone_altstack(mut new_thread, old_thread, flags)
+	reset_clone_sighand(mut new_thread, flags)
+
+	if flags & clone_child_cleartid != 0 {
+		new_thread.clear_child_tid = child_tid
+	}
+
+	// The parent's word gets the child's tid as the parent sees it, the child's
+	// as the child does: in a new pid namespace the child is 1.
+	viewer := old_process.numbered_in
+	tid := u32(proc.tid_in(new_thread, viewer))
+	child_view_tid := u32(proc.own_tid(new_thread))
+
+	if flags & clone_parent_settid != 0 && parent_tid != 0 {
+		usercopy.copy_to_user(parent_tid, voidptr(&tid), sizeof(u32))
+	}
+	// The child's pages were copied eagerly, so its tid word has to be written
+	// through its own pagemap rather than ours.
+	if flags & clone_child_settid != 0 && child_tid != 0 {
+		usercopy.copy_to_pagemap(new_process.pagemap, child_tid, voidptr(&child_view_tid),
+			sizeof(u32))
+	}
+
+	publish_clone_child(mut new_process, old_process, flags & clone_parent != 0)
+
+	// Another parent thread can reap the child as soon as it runs.
+	pid := proc.pid_in(new_process, viewer)
+	if flags & clone_vfork != 0 {
+		new_process.vfork_pending = true
+		proc.pin_process(new_process)
+	}
+	sched.publish_user_thread(mut new_process, new_thread)
+	if flags & clone_vfork != 0 { await_vfork(mut new_process) }
+
+	return u64(pid), 0
+}
+
+// What exit gives back of the process' x86 segments: nothing, on arm64.
+fn release_process_segments(mut _ proc.Process) {}
+
+// Whether `t`, stopped by a sibling tearing the process down, was inside the
+// kernel -- a syscall, or a page fault -- rather than in userspace: its saved
+// PSTATE says EL1. See kill_sibling_threads() in exit.v.
+fn thread_in_kernel(t &proc.Thread) bool {
+	return t.gpr_state.pstate & 0xf != 0
+}
+
+// Take `victim`, stopped in userspace and claimed for exit by a sibling
+// tearing the process down, off the CPUs for good and give back what it
+// holds. See kill_sibling_threads() in exit.v.
+fn stop_claimed_thread(mut victim proc.Thread) {
+	// Marked first so that an event trigger racing with us cannot put the
+	// thread back on the run queue behind our back.
+	katomic.store(mut &victim.is_dead, true)
+	sched.stop_thread_for_good(victim)
+	futex.release_pi_owner(victim, victim.process.pagemap)
+	// A thread that split off its own root and mount namespace -- runc keeps
+	// one in the container's namespace for opening mount sources -- holds a
+	// reference that would otherwise keep the namespace, and every directory it
+	// has something mounted on, alive for good.
+	fs.release_thread_fs(mut victim)
+	proc.free_tid(victim.tid)
+}
+
+fn abandon_new_process(mut new_process proc.Process) {
+	proc.lock_table()
+	mut doomed := new_process.pagemap
+	new_process.pagemap = unsafe { nil }
+	proc.unlock_table()
+	if doomed != unsafe { nil } { mmap.delete_pagemap(mut doomed) or {} }
+	for i in 0 .. new_process.fds.len { file.fdnum_close(&new_process, i, true) or {} }
+	fs.release_process_namespaces(mut new_process)
+	proc.free_pid(new_process.pid)
+}

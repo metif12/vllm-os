@@ -72,6 +72,29 @@ Drop: framebuffer shell/DE, USB HID, audio, most syscalls, userland shell.
 Gate: kernel boots on `qemu-system-x86_64 -display none -serial stdio`,
 prints `[vllm-os] boot ok`, answers TCP SYN on :8000.
 
+Status 2026-11-17: fork builds and boots to the init handoff under QEMU
+(serial log: ACPI/SMP/scheduler/RNG/lwIP+e1000+DHCP, tmpfs/devtmpfs/
+procfs/sysfs mount, initramfs unpack, console/tty/serial; then the
+expected `V panic: Could not start init process` — no userland yet).
+Toolchain fixes against pinned V `7490a8f` (all in `kernel/mini/`, each
+marked `NOTE(vllm-os)`): `uint` is not a builtin (per-module phantom
+type) → `u32` internally, `u64` + `C.size_t` at C `size_t` boundaries;
+`@type` on C structs (e.g. lwIP `ip_addr`) mangles to `_v_type` →
+`c/vinix_ip_type.{h,c}` accessors; `&` on function-pointer values is
+dropped (copies callee code) → `c/net_driver_abi.h` store helpers;
+`u32(ptr)` address truncation → `u64` cursors; `is <interface>` with
+zero implementors compiles to a non-nil check → forced-false fallbacks
+(MountSpecifier, RenamePublication, FallibleFileSystemStatResource,
+MappingAttributesResource, StatSnapshotResource, MetadataUpdateResource,
+PrivateMountOptions); `name.str` map-key closure + fixed-array literal
+spill worked around; heap_benchmark sampler dropped (its generator
+needs newer-V spread syntax). Trimmed away: aarch64/powerpc/apple/drm/gpu/linuxkpi, ath10k/hda/xhci/
+mouse/fbdev/nvme/rtl8169/pointerdev, nfs/smb2/ninep (+top files),
+block/verity, agx_fake ×2, heapbench (+its sampler); `main_amd64.v`
+unwired to e1000+AHCI+serial, framebuffer stubbed. Kept: ext2 (sysdisk
+probe path). Vinix upstream master is
+red since ~Nov 11 (same breakage class; PRs #267/#269/#254 unmerged).
+
 ## Phase 4 — Bare-metal inference
 
 * Build `src/infer` with `-gc none -freestanding`, arena KV-cache.

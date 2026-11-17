@@ -1,0 +1,10 @@
+/freestnd-c-hdrs
+/cc-runtime*
+/c/flanterm
+/c/nanoprintf*
+/c/uacpi
+/uacpi-repository
+/lwip-repository
+/c/lwip
+/bin
+/obj
