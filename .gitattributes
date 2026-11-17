@@ -4,3 +4,5 @@ scripts/*.sh text eol=lf
 # vinix-mini fork: V sources + GNUmakefiles must stay LF (make breaks on
 # CRLF, and the kernel builds in WSL). No checkout conversion here.
 kernel/mini/** text eol=lf
+# mini init is compiled in WSL too; keep its source LF as well.
+kernel/init/** text eol=lf

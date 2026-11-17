@@ -1,6 +1,9 @@
 // kernel/init/init.c — vinix-mini first userland (/sbin/init).
 //
-// Raw Linux syscalls only, no libc: `gcc -static -nostdlib -O2 -o init init.c`.
+// Raw Linux syscalls only, no libc:
+// `gcc -static -nostdlib -ffreestanding -fno-builtin -O2 -o init init.c`
+// (-fno-builtin: gcc would otherwise turn the byte-count loop into a
+// strlen call, which -nostdlib cannot resolve.)
 // Prints `[vllm-os] boot ok`, listens on :8000, answers every connection
 // with a stub JSON body. This closes the Phase-3 boot gate (serial shows
 // boot ok, TCP SYN on :8000 answered); the inference server replaces the
@@ -51,8 +54,28 @@ static u64 slen(const char *s) {
 	return n;
 }
 
+static long sc4(long n, long a, long b, long c, long d) {
+	register long r10 __asm__("r10") = d;
+	long r;
+	__asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c), "r"(r10) : "rcx", "r11", "memory");
+	return r;
+}
+
+// Serial mirror: on amd64 /dev/console is the framebuffer (invisible with
+// -display none), while the boot log lives on COM1. Best effort: -1 when
+// the device is absent.
+static long serial_fd = -1;
+
+static void emit(const char *s) {
+	u64 n = slen(s);
+	sc3(1 /* write */, 1, (long)s, (long)n);
+	if (serial_fd >= 0) {
+		sc3(1 /* write */, serial_fd, (long)s, (long)n);
+	}
+}
+
 static void puts1(const char *s) {
-	sc3(1 /* write */, 1, (long)s, (long)slen(s));
+	emit(s);
 }
 
 // u16 -> network byte order without libc htons.
@@ -73,6 +96,9 @@ static void fail(const char *msg) {
 }
 
 void _start(void) {
+	// openat(AT_FDCWD, /dev/com1, O_WRONLY): serial mirror for the boot
+	// marker; the framebuffer /dev/console is headless under -display none.
+	serial_fd = sc4(257 /* openat */, -100, (long)"/dev/com1", 1, 0);
 	puts1("[vllm-os] boot ok\n");
 
 	long fd = sc3(41 /* socket */, 2 /* AF_INET */, 1 /* SOCK_STREAM */, 0);

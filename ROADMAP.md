@@ -98,10 +98,24 @@ red since ~Nov 11 (same breakage class; PRs #267/#269/#254 unmerged).
 Status 2026-11-18: mini init written (`kernel/init/init.c`, raw-syscall
 static `/sbin/init`: prints `[vllm-os] boot ok`, listens :8000, stub JSON
 per connection; only write/socket/setsockopt/bind/listen/accept/read/
-close/exit_group — all in the fork's Linux-compat table). Natively
+close/openat/exit_group — all in the fork's Linux-compat table). Natively
 verified in WSL (static SYSV ELF, no PT_INTERP, HTTP 200 + matching
-Content-Length 33). Pending: pack into initramfs.tar.gz, rebuild ISO,
-QEMU boot gate (`[vllm-os] boot ok` + SYN answer on :8000).
+Content-Length 33). amd64 `/dev/console` is the framebuffer (serial
+mirror is a no-op), so init also emits the boot lines to `/dev/com1`
+(openat, best effort). Build notes: `-fno-builtin` required (gcc turns
+the byte-count loop into an unresolvable strlen under `-nostdlib`).
+
+Gate GREEN 2026-11-18: Limine BIOS+UEFI ISO (xorriso 1.5.6 via dpkg -x,
+limine-binary 12.9.3, initramfs.tar carries `./sbin/init` mode 755)
+boots under `qemu-system-x86_64 -m 2G -display none -serial file` with
+e1000 on SLIRP user-net: serial shows `[vllm-os] boot ok` + `listening
+on :8000`, no init panic; host connects via hostfwd, gets HTTP 200
+`{"model":"mini-stub","boot":"ok"}` (Content-Length 33 exact), and init
+loops back to accept. Flake found + fixed in the harness: the host-side
+TCP connect can complete at QEMU's hostfwd layer before the guest gets
+its DHCP lease — the gate must wait for `DHCP lease` in the serial log
+before connecting. (Repro/tool paths live in WSL: `~/isowork/staging`,
+`~/.local/xorroot`, `~/isowork/limine-tool`; not yet committed scripts.)
 
 ## Phase 4 — Bare-metal inference
 
