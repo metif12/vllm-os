@@ -138,6 +138,21 @@ V runtime startup (mmap/brk), GC, and devtmpfs open/write/close all
 work for userland V. Build: utility V 0.5.2 (`~/vlinux/v/v`) with
 `-cc gcc -cflags '-static'` (V has no `-static` flag).
 
+Step 2 done 2026-11-18: real inference in-guest, bit-identical to host.
+`tools/infer_smoke.v` (greedy prefill + 8 decodes, `temp: 0.0`,
+`VLLM_THREADS=1`) runs on the host as reference and as `/sbin/vllm` in
+the guest (C init passes model path + prompt + n as argv; weights +
+tokenizer ride in the initramfs via `--initramfs-extra`, guest boots
+with `-m 4G`). Guest serial shows the same tokens as the host run:
+`tok_ids=[0, 1096, 374, 264, 4285, 3110, 315, 1246]`,
+`! This is a simple example of how`, `INFER-SMOKE-OK`. Output goes
+through a stdout + `/dev/com1` mirror (`emit`), since guest stdout is
+the headless framebuffer. Build note: `src` needs `-path` on the V
+command line (`-path "$R/src|@vlib|@vmodules"`); keep image work dirs
+on ext4 (`--work /tmp/...`), 9p is too slow for the 400 MB tar+gzip.
+Next: serve loop — `/v1/chat/completions` over the :8000 socket in
+`/sbin/vllm` instead of the C stub, still userland.
+
 * Build `src/infer` with `-gc none -freestanding`, arena KV-cache.
 * mmap GGUF from baked partition (no `os` file APIs in kernel).
 * Single accept loop + N worker threads on the trimmed scheduler.

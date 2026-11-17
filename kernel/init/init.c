@@ -105,7 +105,10 @@ void _start(void) {
 	// absent (or fails) do we fall through to the stub listener below.
 	{
 		static char path[] = "/sbin/vllm";
-		static char *argv[] = { path, 0 };
+		static char arg1[] = "/models/model.gguf";
+		static char arg2[] = "Hello world";
+		static char arg3[] = "8";
+		static char *argv[] = { path, arg1, arg2, arg3, 0 };
 		static char *envp[] = { 0 };
 		sc3(59 /* execve */, (long)path, (long)argv, (long)envp);
 		puts1("[vllm-os] no /sbin/vllm, stub mode\n");
