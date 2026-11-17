@@ -95,6 +95,14 @@ unwired to e1000+AHCI+serial, framebuffer stubbed. Kept: ext2 (sysdisk
 probe path). Vinix upstream master is
 red since ~Nov 11 (same breakage class; PRs #267/#269/#254 unmerged).
 
+Status 2026-11-18: mini init written (`kernel/init/init.c`, raw-syscall
+static `/sbin/init`: prints `[vllm-os] boot ok`, listens :8000, stub JSON
+per connection; only write/socket/setsockopt/bind/listen/accept/read/
+close/exit_group — all in the fork's Linux-compat table). Natively
+verified in WSL (static SYSV ELF, no PT_INTERP, HTTP 200 + matching
+Content-Length 33). Pending: pack into initramfs.tar.gz, rebuild ISO,
+QEMU boot gate (`[vllm-os] boot ok` + SYN answer on :8000).
+
 ## Phase 4 — Bare-metal inference
 
 * Build `src/infer` with `-gc none -freestanding`, arena KV-cache.
