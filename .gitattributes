@@ -1,0 +1,3 @@
+# Keep shell scripts LF so the shebang survives Windows checkouts.
+scripts/*.sh text eol=lf
+*.sh text eol=lf

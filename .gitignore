@@ -13,6 +13,11 @@ models/
 bench/results_*/
 qemu/*.iso
 qemu/*.img
+qemu/*.log
+qemu/*.out
+qemu/*.err
+qemu/*.pid
+qemu/*.gz
 qemu/test.log
 qemu_boot.log
 .v_cache/
