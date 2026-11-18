@@ -29,6 +29,20 @@ Why the pin is load-bearing, not cosmetic:
 - Formatting authority is the **release binary ONLY**. Never run a
   weekly's `v fmt -w` on this tree.
 
+### Toolchain exception: `gui/`
+
+The ISO-builder desktop app (`gui/`, vlang/ui2) is the one place the
+pin does not reach: ui2's working copy imports `json2`, which the
+0.5.2 release does not ship. Rules for that directory:
+
+- Build it ONLY with a json2-capable V (`D:\MyProjects\v\v.exe` on this
+  host). Never point that binary at `src/` or `tools/`.
+- It stays out of the release CI lanes (`v vet`/`fmt -verify` cover
+  `src tools`; the test-file list is explicit) — a weekly `fmt -w`
+  there would still be caught by nothing, so format by hand.
+- `gui/compose` (pure logic, no ui2 import) must keep passing `v test`
+  on the pinned release too; that is the contract the app cannot break.
+
 ## Host tooling
 
 New automation is a **V script (`.vsh`) first**: repo tooling that only
