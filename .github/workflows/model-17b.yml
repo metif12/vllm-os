@@ -113,6 +113,16 @@ jobs:
       - name: Boot to a real 1.7B completion
         timeout-minutes: 150
         run: |
+          # KVM needs rw on /dev/kvm; stock runner perms deny it, so take
+          # it explicitly (ephemeral runner, no persistence concern).
+          # Without this the job falls back to TCG and cannot finish the
+          # 1.1 GB unpack + 1.7B prefill inside any sane timeout.
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm 2>/dev/null || true
+            ls -la /dev/kvm
+          else
+            echo 'NO-KVM-DEVICE (pure TCG expected)'
+          fi
           # KVM when the runner offers it, TCG otherwise (much slower).
           # Two -accel flags = fallback chain (kvm first, then tcg).
           ACCEL="-accel kvm -accel tcg"
