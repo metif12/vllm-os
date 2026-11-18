@@ -16,7 +16,7 @@ bench/results_*/
 kernel/init/.work/
 /vllm-mini.iso
 # `make image` outputs (Phase 5)
-/vllm-os.iso
+/vllm-os*.iso
 build/
 qemu/*.iso
 qemu/*.img

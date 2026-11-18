@@ -34,3 +34,15 @@ preemptive scheduler + mutexes are load-bearing and NOT trimmed.
 2. Feature-flag `VLLM_MINI` to exclude dropped drivers at compile time.
 3. First gate binary: kernel that prints boot line over serial and
    answers TCP SYN — no inference yet.
+
+## Reproducing the fork build (done in CI, see model-17b.yml)
+
+`kernel/mini/get-deps` is upstream's script verbatim (byte-identical to
+`vlang/vinix` at `kernel/upstream.pin`) — it vendors the C third-party
+tree (freestnd headers, cc-runtime, flanterm, nanoprintf, uACPI, lwIP)
+that `.gitignore` keeps out of the repo. With those outputs in place,
+the fork builds standalone with the pinned kernel V
+(`~/vkernel`, `7490a8f`, `HOST_CC=gcc`): `make -C kernel/mini
+V=<vkernel-v>`. No upstream checkout needed (all test-only
+`../tests`/`../build-support` references sit behind flags that default
+OFF).

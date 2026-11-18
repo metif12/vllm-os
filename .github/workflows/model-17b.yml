@@ -1,0 +1,151 @@
+name: model-1.7b
+
+# Heavyweight 1.7B gate, off main CI: downloads the ungated Qwen3-1.7B
+# weights (~1 GB, Apache-2.0 via unsloth — no license wall), validates
+# the golden table, builds the full boot chain (pinned kernel V, fork,
+# release-V userland server, ISO) and boots QEMU to a real chat
+# completion. Weekly + manual only: far too heavy for every push.
+#
+# Evidence lands in the workflow artifact (serial log), never in the
+# repo. Read-only permissions: this workflow never pushes.
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-17b
+  cancel-in-progress: false
+
+env:
+  V_VERSION: 0.5.2
+  VKERNEL_REF: 7490a8ff04d91dc60eec12b0d9923b4d1bc87960
+  MODEL_URL: https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_0.gguf
+  MODEL_SIZE: "1056782912"
+  TOKENIZER_URL: https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json
+  TOKENIZER_SIZE: "11422654"
+
+jobs:
+  boot-17b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc make curl python3 git \
+            qemu-system-x86 seabios xorriso
+          gcc --version | head -1
+          qemu-system-x86_64 --version | head -1
+
+      - name: Kernel V (pinned, built from source)
+        run: |
+          git init vkernel
+          cd vkernel
+          git remote add origin https://github.com/vlang/v
+          git fetch --depth 1 origin "$VKERNEL_REF"
+          git checkout FETCH_HEAD
+          HOST_CC=gcc make -j"$(nproc)"
+          ./v version
+
+      - name: Release V (userland server)
+        run: |
+          curl -sL -o /tmp/v_linux.zip \
+            "https://github.com/vlang/v/releases/download/${V_VERSION}/v_linux.zip"
+          unzip -q /tmp/v_linux.zip -d /tmp
+          echo /tmp/v >> "$GITHUB_PATH"
+          /tmp/v/v version
+
+      - name: Fetch 1.7B weights + tokenizer (size-asserted)
+        run: |
+          mkdir -p models
+          python3 - <<'EOF'
+          import os, urllib.request
+          def fetch(url, path, want):
+              if os.path.exists(path) and os.path.getsize(path) == int(want):
+                  print(f"ok: {path}")
+                  return
+              print(f"fetching {path} ...", flush=True)
+              urllib.request.urlretrieve(url, path)
+              got = os.path.getsize(path)
+              assert got == int(want), f"size mismatch: want {want}, got {got}"
+              print(f"ok: {path} ({got} bytes)")
+          fetch(os.environ["MODEL_URL"], "models/Qwen3-1.7B-Q4_0.gguf",
+                os.environ["MODEL_SIZE"])
+          fetch(os.environ["TOKENIZER_URL"], "models/tokenizer.json",
+                os.environ["TOKENIZER_SIZE"])
+          EOF
+
+      - name: Golden table on the real 1.7B file
+        run: |
+          v test src/infer/gguf_golden_test.v
+
+      - name: Fork deps + kernel build
+        timeout-minutes: 60
+        run: |
+          sh kernel/mini/get-deps
+          make -C kernel/mini V="$PWD/vkernel/v"
+          ls -la kernel/mini/bin/vinix
+
+      - name: ISO with 1.7B baked in
+        timeout-minutes: 30
+        run: |
+          export VLLM_CACHE="$PWD/.cache/vllm-os"
+          make -f GNUmakefile image MODEL=models/Qwen3-1.7B-Q4_0.gguf \
+            KERNEL=kernel/mini/bin/vinix V=v OUT=vllm-os-1.7b.iso
+          ls -la vllm-os-1.7b.iso
+
+      - name: Boot to a real 1.7B completion
+        timeout-minutes: 150
+        run: |
+          # KVM when the runner offers it, TCG otherwise (much slower).
+          ACCEL=kvm:tcg
+          qemu-system-x86_64 -cdrom vllm-os-1.7b.iso -m 4G -smp 2 \
+            -display none -serial file:boot-17b.log -accel $ACCEL \
+            -netdev user,id=n0,hostfwd=tcp::18000-:8000 \
+            -device e1000,netdev=n0 &
+          QEMU=$!
+          cleanup() { kill $QEMU 2>/dev/null; }
+          trap cleanup EXIT
+          echo "waiting for guest stack + server (up to 30 min) ..."
+          for i in $(seq 1 180); do
+            sleep 10
+            kill -0 $QEMU 2>/dev/null || { echo QEMU-EXITED-EARLY; exit 1; }
+            grep -q 'DHCP lease' boot-17b.log 2>/dev/null || continue
+            grep -q 'openai-compat api' boot-17b.log 2>/dev/null && break
+          done
+          grep -q 'openai-compat api' boot-17b.log || { echo NO-SERVE; exit 1; }
+          echo "SERVE-READY"
+          python3 - <<'EOF'
+          import json, urllib.request
+          base = 'http://127.0.0.1:18000'
+          m = json.load(urllib.request.urlopen(base + '/v1/models', timeout=120))
+          print('MODELS:', json.dumps(m)[:160])
+          assert m['data'][0]['id'] == 'qwen3-1.7b', m
+          body = json.dumps({'model': 'qwen3-1.7b',
+                             'messages': [{'role': 'user', 'content': 'Hello'}],
+                             'max_tokens': 2}).encode()
+          req = urllib.request.Request(base + '/v1/chat/completions', data=body,
+                                       headers={'Content-Type': 'application/json'})
+          r = json.load(urllib.request.urlopen(req, timeout=2700))
+          print('CHAT:', json.dumps(r)[:300])
+          txt = r['choices'][0]['message']['content']
+          assert isinstance(txt, str) and txt, 'empty completion'
+          print('GUEST-1.7B-OK')
+          EOF
+          echo '--- serial asserts ---'
+          grep -c '\[vllm-os\] boot ok' boot-17b.log
+          grep -c 'boot ok: Qwen3-1.7B' boot-17b.log
+          ! grep -q 'Could not start init process' boot-17b.log
+
+      - name: Upload serial evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-17b-serial
+          path: boot-17b.log
