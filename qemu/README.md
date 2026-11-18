@@ -66,8 +66,13 @@ Logs: server output → `qemu/test.log`, guest serial → `qemu/guest.log`
 (both gitignored). If `:8000` is already serving, the scripts assert
 against it read-only and exclude boot time (noted in output).
 
-## Phase-3 upgrade
+## Phase-3 gate (done 2026-11-18)
 
-Once `kernel/` boots, the guest leg switches to
+The bootable image path replaced the Linux-guest leg:
+`make image` (WSL) emits `vllm-os.iso`, and
+`scripts/mini_boot_gate.ps1` boots
 `qemu-system-x86_64 -cdrom vllm-os.iso -m 4G -display none -serial stdio`
-and waits for `[vllm-os] boot ok` instead of a Linux guest image.
+(+ SLIRP hostfwd), waits for the guest DHCP lease, then asserts serial
+`[vllm-os] boot ok` + TCP SYN answered on `:8000` with a full HTTP
+round trip (`MINI-BOOT-GATE PASS`, exit 0). The OpenWrt failsafe leg
+above stays as the host-server network-path check.
