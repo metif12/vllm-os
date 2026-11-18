@@ -23,6 +23,11 @@ concurrency:
 env:
   V_VERSION: 0.5.2
   VKERNEL_REF: 7490a8ff04d91dc60eec12b0d9923b4d1bc87960
+  # vlang/vc snapshot the pinned V was verified against. V's makefile
+  # clones vc@master (moving target) — a newer vc rejects the old
+  # sources (parenthesized-if) — so we pre-seed this hash and build
+  # with local=1, which uses vc/ as-is.
+  VC_REF: 21490f7811a2dd366c3daa39bef8e53c1e3e5727
   MODEL_URL: https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_0.gguf
   MODEL_SIZE: "1056782912"
   TOKENIZER_URL: https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json
@@ -50,7 +55,12 @@ jobs:
           git remote add origin https://github.com/vlang/v
           git fetch --depth 1 origin "$VKERNEL_REF"
           git checkout FETCH_HEAD
-          HOST_CC=gcc make -j"$(nproc)"
+          git init vc && cd vc
+          git remote add origin https://github.com/vlang/vc
+          git fetch --depth 1 origin "$VC_REF"
+          git checkout -q FETCH_HEAD
+          cd ..
+          make local=1 HOST_CC=gcc -j"$(nproc)"
           ./v version
 
       - name: Release V (userland server)
