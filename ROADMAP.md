@@ -153,6 +153,20 @@ on ext4 (`--work /tmp/...`), 9p is too slow for the 400 MB tar+gzip.
 Next: serve loop — `/v1/chat/completions` over the :8000 socket in
 `/sbin/vllm` instead of the C stub, still userland.
 
+Step 3 done 2026-11-18, Phase 4 gate GREEN: the full host server
+(`src`, built `-prod -cflags -static`) runs as `/sbin/vllm` in the
+guest. C init now `dup2`s `/dev/com1` onto fds 1+2 (server logs land
+on serial) and execves with
+`[/sbin/vllm --model /models/model.gguf]` + `VLLM_THREADS=1`.
+QEMU `-m 4G` from the 387 MB ISO: serial shows
+`boot ok: Qwen3-0.6B format=gguf tensors=310` + `openai-compat api`,
+host gets `/v1/models` → `qwen3-1.7b` and a real chat completion
+(`Hello! How can I assist you today`) — non-stub, from the ISO.
+Harness notes: python on WSL must bypass the LAN proxy for 127.0.0.1
+(`no_proxy`); keep weights in `~/vllm-assets` (`/tmp` is wiped between
+logins); `net.listen_tcp(.ip6, …)` accepts IPv4 on the fork's lwIP
+dual-stack socket with no changes.
+
 * Build `src/infer` with `-gc none -freestanding`, arena KV-cache.
 * mmap GGUF from baked partition (no `os` file APIs in kernel).
 * Single accept loop + N worker threads on the trimmed scheduler.

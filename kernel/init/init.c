@@ -9,9 +9,10 @@
 // boot ok, TCP SYN on :8000 answered); the inference server replaces the
 // reply path in Phase 4.
 //
-// Syscalls used — write socket setsockopt bind listen accept read close
-// exit_group — all present in kernel/mini's Linux-compat table
-// (syscall/table/linux_table_amd64.v: 1/41/54/49/50/43/231).
+// Syscalls used — write open dup2 socket setsockopt bind listen accept
+// read close execve exit_group — all present in kernel/mini's
+// Linux-compat table (syscall/table/linux_table_amd64.v:
+// 1/2/33/41/54/49/50/43/59/231).
 typedef unsigned long u64;
 typedef unsigned int u32;
 typedef unsigned short u16;
@@ -61,21 +62,10 @@ static long sc4(long n, long a, long b, long c, long d) {
 	return r;
 }
 
-// Serial mirror: on amd64 /dev/console is the framebuffer (invisible with
-// -display none), while the boot log lives on COM1. Best effort: -1 when
-// the device is absent.
-static long serial_fd = -1;
-
-static void emit(const char *s) {
+static void puts1(const char *s) {
 	u64 n = slen(s);
 	sc3(1 /* write */, 1, (long)s, (long)n);
-	if (serial_fd >= 0) {
-		sc3(1 /* write */, serial_fd, (long)s, (long)n);
-	}
-}
-
-static void puts1(const char *s) {
-	emit(s);
+	sc3(1 /* write */, 2, (long)s, (long)n);
 }
 
 // u16 -> network byte order without libc htons.
@@ -96,20 +86,32 @@ static void fail(const char *msg) {
 }
 
 void _start(void) {
-	// openat(AT_FDCWD, /dev/com1, O_WRONLY): serial mirror for the boot
-	// marker; the framebuffer /dev/console is headless under -display none.
-	serial_fd = sc4(257 /* openat */, -100, (long)"/dev/com1", 1, 0);
+	// On amd64 /dev/console is the framebuffer (invisible with
+	// -display none) while the boot log lives on COM1: move the serial
+	// port onto fds 1+2 so everything the server prints (stdout/stderr)
+	// lands on serial. Best effort: without COM1 the lines go to the
+	// console as before.
+	{
+		long com = sc3(2 /* open */, (long)"/dev/com1", 1 /* O_WRONLY */, 0);
+		if (com >= 0) {
+			sc2(33 /* dup2 */, com, 1);
+			sc2(33 /* dup2 */, com, 2);
+			if (com > 2) {
+				sc1(3 /* close */, com);
+			}
+		}
+	}
 	puts1("[vllm-os] boot ok\n");
 	// Phase-4 handoff: the real server lives at /sbin/vllm (a normal V
 	// userland binary). execve replaces us (pid 1); only when it is
 	// absent (or fails) do we fall through to the stub listener below.
 	{
 		static char path[] = "/sbin/vllm";
-		static char arg1[] = "/models/model.gguf";
-		static char arg2[] = "Hello world";
-		static char arg3[] = "8";
-		static char *argv[] = { path, arg1, arg2, arg3, 0 };
-		static char *envp[] = { 0 };
+		static char arg1[] = "--model";
+		static char arg2[] = "/models/model.gguf";
+		static char env0[] = "VLLM_THREADS=1";
+		static char *argv[] = { path, arg1, arg2, 0 };
+		static char *envp[] = { env0, 0 };
 		sc3(59 /* execve */, (long)path, (long)argv, (long)envp);
 		puts1("[vllm-os] no /sbin/vllm, stub mode\n");
 	}
