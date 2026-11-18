@@ -11,7 +11,8 @@ records partial numbers):
      (downloads it when missing) plus its tokenizer.json sidecar;
   2. runs scripts/bench.py --force (shared CI boxes are always "loaded")
      with the kernel bench, NumPy baseline and --forward probe;
-  3. runs scripts/perf_update_md.py on the produced results.json.
+  3. runs the markdown rewrite (scripts/perf_update_md.vsh) on the
+     produced results.json.
 
 Writes bench/<out> (gitignored) and rewrites docs/perf.md in place.
 The workflow commits docs/perf.md with [skip ci]; raw results.json
@@ -94,15 +95,17 @@ def main():
         raise SystemExit(f"bench.py failed: {r.returncode}")
 
     results = os.path.join(outdir, "results.json")
-    cmd = [sys.executable, os.path.join(ROOT, "scripts",
-                                        "perf_update_md.py"),
+    # vsh-first tooling rule: the markdown rewrite is a V script, run with
+    # the pinned toolchain (V_BIN override for machines without v on PATH).
+    v = os.environ.get("V_BIN", "v")
+    cmd = [v, "run", os.path.join(ROOT, "scripts", "perf_update_md.vsh"),
            results, "--doc", args.doc]
     if args.run_url:
         cmd += ["--run-url", args.run_url]
     log("+ " + " ".join(cmd))
     r = subprocess.run(cmd, cwd=ROOT)
     if r.returncode != 0:
-        raise SystemExit(f"perf_update_md.py failed: {r.returncode}")
+        raise SystemExit(f"perf_update_md.vsh failed: {r.returncode}")
 
     with open(results) as f:
         n = len(json.load(f)["records"])

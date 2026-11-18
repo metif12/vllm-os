@@ -29,6 +29,21 @@ Why the pin is load-bearing, not cosmetic:
 - Formatting authority is the **release binary ONLY**. Never run a
   weekly's `v fmt -w` on this tree.
 
+## Host tooling
+
+New automation is a **V script (`.vsh`) first**: repo tooling that only
+glues repo commands together belongs in the repo's own language —
+`v run scripts/<name>.vsh`, pinned-toolchain only, no new runtimes.
+Shell stays for what is genuinely shell (build-image ISO assembly,
+QEMU harnesses); Python stays for what is genuinely Python (NumPy
+baselines, HuggingFace downloads). Everything else migrates on touch.
+
+Landed: `scripts/perf_update_md.vsh` (byte-identical output to the
+`.py` it replaced — section-identical modulo line endings, exit 2 on
+bad markers, idempotent; verified against the `.py` by fixture, not
+faith). Backlog, in port order: `perf_ci.py` (thin orchestrator),
+`bench.py` (fingerprint + parsers), `build_iso.py` (argparse + JSON).
+
 ## Test suite
 
 ```sh

@@ -5,7 +5,7 @@ Runs the V kernel bench, the NumPy baseline, (optionally) the
 full-decode forward probe and a pinned llama-bench matrix, then writes
 results.json + results.csv next to a machine fingerprint.
 docs/perf.md stays the curated log; this script produces the raw data
-it quotes (and scripts/perf_update_md.py refreshes the CI section).
+it quotes (and scripts/perf_update_md.vsh refreshes the CI section).
 
 Quiet-box protocol (enforced unless --force): refuse when the box is
 loaded, sleep --cooldown between timed sections, repeat short benches
