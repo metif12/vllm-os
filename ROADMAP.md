@@ -201,10 +201,12 @@ arch, model weights, and serving config, get a tested `vllm-os.iso`.
   files OK, `cfg.load` fills the rest). Then drives `make image`
   (MODEL / TOKENIZER / CONFIG / KERNEL passthrough) and optionally
   boots the result under QEMU for a smoke chat.
-* GUI: thin stretch on the same backend — local single-page form
-  (arch dropdown, file pickers, config fields, build log view). No
-  Electron/Tauri runtime in the OS image; it only ever emits the same
-  `make image` invocation the CLI runs.
+* GUI: landed as `scripts/build_iso.html` — a local single-page form
+  on the same backend (arch dropdown with arm64 refusal, file picker
+  for live size checks, all config knobs, boot command). No backend,
+  no uploads, no Electron/Tauri runtime in the OS image: it composes
+  the exact `build_iso.py` invocation (same range checks as the CLI)
+  for copy-paste. Validation sets fixture-tested to mirror the CLI.
 * Gate: tool-built ISO for a non-default model boots fresh in QEMU and
   serves `/v1/chat/completions` (reuse `scripts/mini_boot_gate.ps1`
   asserts); `--dry-run` prints the exact `make` invocation without
@@ -216,7 +218,8 @@ Refuses arm64 / missing weights / missing sidecar (unless
 weights, generates `config.json` from knobs (verified through the real
 server `--print-config`: `cfg.load` + `validate` green), drives
 `make image`, prints the QEMU boot line. Fixture-tested (10 refusal
-cases + happy path + stub hatch). GUI stretch still open.
+cases + happy path + stub hatch). GUI landed as `scripts/build_iso.html`
+(form composer + live validation, sets mirror the CLI by fixture).
 
 Gate closed 2026-11-18: full `build_iso.py` run with non-default
 knobs (`--port 8080 --ctx 2048 --preset precise --temp 0.5`) built a

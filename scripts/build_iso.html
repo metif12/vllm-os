@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vllm-os ISO builder</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2em auto; padding: 0 1em; }
+  label { display: block; margin: 0.7em 0 0.2em; font-weight: 600; }
+  input, select { width: 100%; padding: 0.4em; box-sizing: border-box; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0 1em; }
+  .hint { color: #555; font-size: 0.85em; }
+  .err { color: #a00; font-size: 0.9em; min-height: 1.2em; }
+  pre { background: #f4f4f4; padding: 0.8em; overflow-x: auto; white-space: pre-wrap; }
+  button { padding: 0.5em 1em; margin-top: 0.5em; }
+</style>
+</head>
+<body>
+<h1>vllm-os ISO builder</h1>
+<p>Compose a <code>scripts/build_iso.py</code> invocation. Nothing is uploaded:
+file inputs are read <em>locally</em> for size checks only; you paste the
+WSL-visible path yourself.</p>
+
+<label>Target arch</label>
+<select id="arch">
+  <option value="x86_64" selected>x86_64 (only supported target)</option>
+  <option value="arm64">arm64 (refused — fork drivers are amd64-only)</option>
+</select>
+<div class="err" id="e-arch"></div>
+
+<label>GGUF weights file (for size check)</label>
+<input type="file" id="modelfile">
+<label>WSL-visible model path</label>
+<input type="text" id="model" value="/mnt/d/MyProjects/vllm-os/models/Qwen3-0.6B-Q4_0.gguf">
+<div class="hint" id="modelsize"></div>
+
+<label>Tokenizer path (empty = next to model)</label>
+<input type="text" id="tokenizer" value="">
+<label><input type="checkbox" id="stubtok" style="width:auto"> allow stub tokenizer (no BPE)</label>
+
+<div class="row">
+  <div><label>Port</label><input type="number" id="port" value="8000"></div>
+  <div><label>Ctx cap</label><input type="number" id="ctx" value="4096"></div>
+  <div><label>Backend</label><select id="backend">
+    <option>cpu</option><option>cpu-blocked</option><option>cpu-simd</option>
+    <option>cpu-parallel</option><option>auto</option></select></div>
+  <div><label>Sampler preset</label><select id="preset">
+    <option>balanced</option><option>deterministic</option><option>precise</option><option>creative</option></select></div>
+  <div><label>Temp (empty = default)</label><input type="number" id="temp" step="0.1" value=""></div>
+  <div><label>Guest RAM (GiB)</label><input type="number" id="mem" value="4"></div>
+</div>
+
+<label>Auth token (empty = open mode)</label>
+<input type="text" id="auth" value="">
+
+<div class="err" id="e-all"></div>
+<h2>Build command</h2>
+<pre id="cmd"></pre>
+<button id="copy">Copy</button>
+<h2>Boot it (after build)</h2>
+<pre id="boot"></pre>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const ARCHES = ['x86_64'];
+const BACKENDS = ['cpu', 'cpu-blocked', 'cpu-simd', 'cpu-parallel', 'auto'];
+const PRESETS = ['deterministic', 'precise', 'balanced', 'creative'];
+let modelBytes = 0;
+
+$('modelfile').addEventListener('change', ev => {
+  const f = ev.target.files[0];
+  modelBytes = f ? f.size : 0;
+  $('modelsize').textContent = f
+    ? 'selected: ' + f.name + ' (' + (f.size / 1048576).toFixed(1) + ' MiB, size used for the guest-RAM check)'
+    : '';
+  update();
+});
+['arch','model','tokenizer','stubtok','port','ctx','backend','preset','temp','mem','auth']
+  .forEach(id => $(id).addEventListener('input', update));
+
+function fail(el, msg) { $(el).textContent = msg; return false; }
+
+function update() {
+  $('e-arch').textContent = '';
+  $('e-all').textContent = '';
+  const arch = $('arch').value;
+  if (!ARCHES.includes(arch)) return void fail('e-arch', 'refused: only x86_64 boots (arm64 drivers not ported)');
+  const port = +$('port').value, ctx = +$('ctx').value, mem = +$('mem').value;
+  const backend = $('backend').value, preset = $('preset').value;
+  const temp = $('temp').value === '' ? null : +$('temp').value;
+  if (!(port >= 1 && port <= 65535)) return void fail('e-all', 'port out of range 1..65535');
+  if (!(ctx >= 128 && ctx <= 131072)) return void fail('e-all', 'ctx out of range 128..131072');
+  if (!BACKENDS.includes(backend)) return void fail('e-all', 'unknown backend');
+  if (!PRESETS.includes(preset)) return void fail('e-all', 'unknown preset');
+  if (temp !== null && !(temp >= 0 && temp <= 2)) return void fail('e-all', 'temp out of range 0..2');
+  if (modelBytes > 0 && modelBytes + 1073741824 > mem * 1073741824)
+    return void fail('e-all', 'weights + 1 GiB runtime exceed the ' + mem + ' GiB guest budget');
+  const model = $('model').value.trim();
+  if (!model) return void fail('e-all', 'model path required');
+  let cmd = 'python3 scripts/build_iso.py --model ' + model;
+  const tok = $('tokenizer').value.trim();
+  if (tok) cmd += ' --tokenizer ' + tok;
+  if ($('stubtok').checked) cmd += ' --allow-stub-tokenizer';
+  cmd += ' --port ' + port + ' --ctx ' + ctx + ' --backend ' + backend + ' --preset ' + preset;
+  if (temp !== null) cmd += ' --temp ' + temp;
+  const auth = $('auth').value;
+  if (auth) cmd += " --auth-token '" + auth.replace(/'/g, "'\\''") + "'";
+  $('cmd').textContent = cmd;
+  $('boot').textContent = 'qemu-system-x86_64 -cdrom vllm-os.iso -m ' + mem + 'G -display none -serial stdio '
+    + '-netdev user,id=n0,hostfwd=tcp::18000-:' + port + ' -device e1000,netdev=n0';
+}
+$('copy').addEventListener('click', () => {
+  const t = $('cmd').textContent;
+  if (navigator.clipboard) navigator.clipboard.writeText(t);
+  else { const ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+});
+update();
+</script>
+</body>
+</html>
