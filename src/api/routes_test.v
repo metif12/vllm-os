@@ -119,12 +119,18 @@ fn test_authorized_bearer() {
 }
 
 fn test_bucket_burst_and_refill() {
-	mut b := Bucket{tokens: 2.0, updated: 100}
+	mut b := Bucket{
+		tokens:  2.0
+		updated: 100
+	}
 	assert b.allow_at(100, 100, 2) == true
 	assert b.allow_at(100, 100, 2) == true
 	assert b.allow_at(100, 100, 2) == false
 	assert b.allow_at(102, 100, 2) == true
-	mut c := Bucket{tokens: 1.0, updated: 50}
+	mut c := Bucket{
+		tokens:  1.0
+		updated: 50
+	}
 	assert c.allow_at(50, 1, 0) == true
 	assert c.allow_at(50, 1, 0) == false
 	assert c.allow_at(51, 1, 0) == true

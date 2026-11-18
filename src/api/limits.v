@@ -59,7 +59,12 @@ pub fn (mut b Bucket) allow_at(now i64, per_sec int, burst int) bool {
 // (see note above) — callers pass their own map, tests use a local one.
 pub fn allow(mut buckets map[string]Bucket, key string, now i64, per_sec int, burst int) bool {
 	eff := if burst > 0 { burst } else { per_sec }
-	mut b := buckets[key] or { Bucket{ tokens: f64(eff), updated: now } }
+	mut b := buckets[key] or {
+		Bucket{
+			tokens:  f64(eff)
+			updated: now
+		}
+	}
 	ok := b.allow_at(now, per_sec, burst)
 	buckets[key] = b
 	return ok

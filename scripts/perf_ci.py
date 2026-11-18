@@ -38,6 +38,11 @@ def log(msg):
 
 
 def ensure_file(url, path, want_size=None, must_contain=None):
+    parent = os.path.dirname(path)
+    if parent:
+        # Fresh checkouts (and CI runners) lack models/: gitignored dirs
+        # do not exist until something creates them.
+        os.makedirs(parent, exist_ok=True)
     if (os.path.exists(path) and (want_size is None
                                   or os.path.getsize(path) == want_size)):
         log(f"ok: {path}")

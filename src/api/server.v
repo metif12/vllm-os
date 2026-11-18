@@ -60,7 +60,8 @@ pub fn serve(cc cfg.Config, model &infer.Model) ! {
 		}
 		if cc.server.rate_per_sec > 0 {
 			ip := conn.peer_ip() or { '' }
-			if !allow(mut buckets, ip, time.now().unix(), cc.server.rate_per_sec, cc.server.rate_burst) {
+			if !allow(mut buckets, ip, time.now().unix(), cc.server.rate_per_sec,
+				cc.server.rate_burst) {
 				send_response(mut conn, 429, 'application/json', '{"error":"rate limited"}')
 				conn.close() or {}
 				continue
