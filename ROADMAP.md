@@ -186,6 +186,29 @@ with no host files: real chat completion served, all serial asserts
 green. Outside world sees only `:8000` (OpenAI API, no SSH/shell —
 there is no shell to expose).
 
+## Phase 6 — ISO builder (CLI first, GUI stretch)
+
+A guided tool that builds a bootable ISO for custom models: pick target
+arch, model weights, and serving config, get a tested `vllm-os.iso`.
+
+* CLI: `scripts/build_iso.py` (interactive + flags). Prompts (defaults
+  in brackets): arch (`x86_64`; `arm64` listed but refused until the
+  fork's amd64-only drivers are ported — no silent wrong-arch images),
+  GGUF path (size-asserted, refuses > guest RAM budget), tokenizer
+  sidecar (required, must sit next to the weights), port / ctx cap /
+  backend / sampler preset (writes the baked `config.json`; partial
+  files OK, `cfg.load` fills the rest). Then drives `make image`
+  (MODEL / TOKENIZER / CONFIG / KERNEL passthrough) and optionally
+  boots the result under QEMU for a smoke chat.
+* GUI: thin stretch on the same backend — local single-page form
+  (arch dropdown, file pickers, config fields, build log view). No
+  Electron/Tauri runtime in the OS image; it only ever emits the same
+  `make image` invocation the CLI runs.
+* Gate: tool-built ISO for a non-default model boots fresh in QEMU and
+  serves `/v1/chat/completions` (reuse `scripts/mini_boot_gate.ps1`
+  asserts); `--dry-run` prints the exact `make` invocation without
+  building.
+
 ## Deferred (deliberately out of v1)
 
 GPU / NPU drivers, multi-tenant auth + rate limits, full 32k ctx,
