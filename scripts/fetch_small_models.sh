@@ -1,7 +1,10 @@
 #!/usr/bin/env sh
 # Host-only tooling. NOT shipped in the OS image.
 # Downloads the small GGUF fixtures used by src/infer/gguf_golden_test.v
-# and scripts/bench.py. Direct file downloads, no conversion, no login.
+# and scripts/bench.py. Direct file downloads, no conversion, no login
+# (both repos are ungated Apache-2.0; the old Llama fixture needed an HF
+# license accept and is gone). The 0.6B tokenizer.json covers the 1.7B
+# file too (same 151936 Qwen3 vocab).
 # Sizes are asserted after download (corrupt/truncated files fail fast).
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -25,5 +28,5 @@ fetch() {
 }
 fetch "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_0.gguf" \
   "$ROOT/models/Qwen3-0.6B-Q4_0.gguf" 382156480
-fetch "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Q4_0.gguf" \
-  "$ROOT/models/Llama-3.2-1B-Q4_0.gguf" 773025920
+fetch "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_0.gguf" \
+  "$ROOT/models/Qwen3-1.7B-Q4_0.gguf" 1056782912

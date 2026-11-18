@@ -70,6 +70,12 @@ def parse_args(argv):
     ap.add_argument("--top-k", type=int, default=None)
     ap.add_argument("--top-p", type=float, default=None)
     ap.add_argument("--max-tokens", type=int, default=None)
+    ap.add_argument("--auth-token", default=None,
+                    help="bake a Bearer token (empty = open mode)")
+    ap.add_argument("--rate-per-sec", type=int, default=None,
+                    help="per-IP request rate cap (0/unset = off)")
+    ap.add_argument("--rate-burst", type=int, default=None,
+                    help="per-IP burst allowance (defaults to rate)")
     ap.add_argument("--config", default=None,
                     help="bake this config file as-is (skips generation)")
     ap.add_argument("--mem", type=int, default=4,
@@ -134,6 +140,13 @@ def resolve(args):
 
 
 def gen_config(args):
+    server = {"host": "0.0.0.0", "port": args.port}
+    if args.auth_token:
+        server["auth_token"] = args.auth_token
+    if args.rate_per_sec is not None:
+        server["rate_per_sec"] = args.rate_per_sec
+    if args.rate_burst is not None:
+        server["rate_burst"] = args.rate_burst
     sampler = {"preset": args.preset}
     if args.temp is not None:
         sampler["temp"] = args.temp
@@ -145,7 +158,7 @@ def gen_config(args):
     if args.max_tokens is not None:
         api["max_tokens"] = args.max_tokens
     return {
-        "server": {"host": "0.0.0.0", "port": args.port},
+        "server": server,
         "model": {"weights": "/models/model.gguf", "format": "auto",
                   "ctx_cap": args.ctx, "backend": args.backend},
         "sampler": sampler,

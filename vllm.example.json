@@ -1,5 +1,5 @@
 {
-  "server": { "host": "0.0.0.0", "port": 8000, "max_conns": 64, "max_body": 1048576 },
+  "server": { "host": "0.0.0.0", "port": 8000, "max_conns": 64, "max_body": 1048576, "auth_token": "", "rate_per_sec": 0, "rate_burst": 0 },
   "model": {
     "weights": "models/qwen3-1.7b-q4_k_m.gguf",
     "format": "auto",

@@ -314,7 +314,7 @@ def main():
     ap.add_argument("--llama-bench", default="",
                     help="path to llama-bench binary (skipped if absent)")
     ap.add_argument("--models", nargs="*", default=[
-        "models/Qwen3-0.6B-Q4_0.gguf", "models/Llama-3.2-1B-Q4_0.gguf"],
+        "models/Qwen3-0.6B-Q4_0.gguf", "models/Qwen3-1.7B-Q4_0.gguf"],
         help="GGUF files for the llama-bench matrix")
     ap.add_argument("--pp", type=int, default=128)
     ap.add_argument("-n", type=int, default=64)

@@ -103,3 +103,56 @@ fn test_completions_roundtrip_200() {
 	assert res.status == 200
 	assert res.body.contains('text_completion')
 }
+
+fn test_authorized_open_mode() {
+	assert authorized('GET /v1/models HTTP/1.1', '') == true
+	assert authorized('', '') == true
+}
+
+fn test_authorized_bearer() {
+	head := 'GET /v1/models HTTP/1.1\r\nAuthorization: Bearer s3cret\r\n'
+	assert authorized(head, 's3cret') == true
+	assert authorized(head, 'wrong') == false
+	assert authorized('GET /v1/models HTTP/1.1', 's3cret') == false
+	assert authorized('GET /x HTTP/1.1\r\nAuthorization: Basic abc', 'abc') == false
+	assert authorized('GET /x HTTP/1.1\r\nauthorization: bearer s3cret', 's3cret') == true
+}
+
+fn test_bucket_burst_and_refill() {
+	mut b := Bucket{tokens: 2.0, updated: 100}
+	assert b.allow_at(100, 100, 2) == true
+	assert b.allow_at(100, 100, 2) == true
+	assert b.allow_at(100, 100, 2) == false
+	assert b.allow_at(102, 100, 2) == true
+	mut c := Bucket{tokens: 1.0, updated: 50}
+	assert c.allow_at(50, 1, 0) == true
+	assert c.allow_at(50, 1, 0) == false
+	assert c.allow_at(51, 1, 0) == true
+}
+
+fn test_rate_allow_independent_keys() {
+	mut buckets := map[string]Bucket{}
+	assert allow(mut buckets, 't-key-a', 1000, 1, 1) == true
+	assert allow(mut buckets, 't-key-a', 1000, 1, 1) == false
+	assert allow(mut buckets, 't-key-b', 1000, 1, 1) == true
+	assert allow(mut buckets, 't-key-a', 1001, 1, 1) == true
+}
+
+fn test_config_rejects_bad_security_knobs() {
+	mut c := cfg.defaults()
+	c.server.rate_per_sec = -1
+	if _ := c.validate() {
+		assert false, 'expected rate_per_sec rejection'
+	} else {
+		assert true
+	}
+	c.server.rate_per_sec = 10
+	c.server.rate_burst = -2
+	if _ := c.validate() {
+		assert false, 'expected rate_burst rejection'
+	} else {
+		assert true
+	}
+	c.server.rate_burst = 20
+	c.validate() or { assert false, 'valid security knobs rejected: ${err}' }
+}

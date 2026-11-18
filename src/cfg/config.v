@@ -13,10 +13,13 @@ import os
 
 pub struct ServerCfg {
 pub mut:
-	host      string = '0.0.0.0'
-	port      int    = 8000
-	max_conns int    = 64
-	max_body  int    = 1 << 20
+	host         string = '0.0.0.0'
+	port         int    = 8000
+	max_conns    int    = 64
+	max_body     int    = 1 << 20
+	auth_token   string
+	rate_per_sec int
+	rate_burst   int
 }
 
 pub struct ModelCfg {
@@ -115,6 +118,12 @@ pub fn (c Config) validate() ! {
 	}
 	if c.server.max_body < 4096 || c.server.max_body > 64 << 20 {
 		return error('config: max_body out of range: ${c.server.max_body}')
+	}
+	if c.server.rate_per_sec < 0 || c.server.rate_per_sec > 100000 {
+		return error('config: rate_per_sec out of range: ${c.server.rate_per_sec}')
+	}
+	if c.server.rate_burst < 0 || c.server.rate_burst > 100000 {
+		return error('config: rate_burst out of range: ${c.server.rate_burst}')
 	}
 	if c.model.ctx_cap < 128 || c.model.ctx_cap > 131072 {
 		return error('config: ctx_cap out of range: ${c.model.ctx_cap}')

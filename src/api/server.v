@@ -5,6 +5,7 @@ import infer
 import net
 import strconv
 import strings
+import time
 
 // Raw-socket HTTP server on purpose: `veb` pulls in OS deps we cannot
 // satisfy on vinix-mini. This stays portable to bare metal. Routing lives
@@ -29,10 +30,44 @@ pub fn serve(cc cfg.Config, model &infer.Model) ! {
 	mut ln := net.listen_tcp(.ip6, ':${cc.server.port}')!
 	eprintln('[vllm-os] openai-compat api on :${cc.server.port} model=${model.cfg.model_id} quant=${model.cfg.quant}')
 	mut sema := chan int{cap: cc.server.max_conns}
+	// The auth/rate gate runs here, in the single accept-loop thread,
+	// before any spawn: rejected junk never costs a thread, and the
+	// bucket map needs no locks. See limits.v for why ctx stays immutable.
+	mut buckets := map[string]Bucket{}
 	for {
 		mut conn := ln.accept()!
+		head, body := read_request(mut conn, cc.server.max_body) or {
+			conn.close() or {}
+			continue
+		}
+		parts := head.split_into_lines()
+		if parts.len == 0 {
+			conn.close() or {}
+			continue
+		}
+		method_path := parts[0].split(' ')
+		if method_path.len < 2 {
+			conn.close() or {}
+			continue
+		}
+		// /health stays open for load balancers; everything else needs
+		// the bearer token when one is configured (empty = open mode).
+		is_health := method_path[0] == 'GET' && method_path[1] == '/health'
+		if !is_health && !authorized(head, cc.server.auth_token) {
+			send_response(mut conn, 401, 'application/json', '{"error":"unauthorized"}')
+			conn.close() or {}
+			continue
+		}
+		if cc.server.rate_per_sec > 0 {
+			ip := conn.peer_ip() or { '' }
+			if !allow(mut buckets, ip, time.now().unix(), cc.server.rate_per_sec, cc.server.rate_burst) {
+				send_response(mut conn, 429, 'application/json', '{"error":"rate limited"}')
+				conn.close() or {}
+				continue
+			}
+		}
 		sema <- 1
-		spawn handle(mut conn, ctx, sema)
+		spawn handle(mut conn, ctx, sema, head, body)
 	}
 }
 
@@ -182,12 +217,11 @@ fn read_chunked_body(mut acc []u8, pos int, mut conn net.TcpConn, max_body int) 
 	return out.bytestr()
 }
 
-fn handle(mut conn net.TcpConn, ctx &HandlerCtx, sema chan int) {
+fn handle(mut conn net.TcpConn, ctx &HandlerCtx, sema chan int, head string, body string) {
 	defer {
 		sema_release(sema)
 		conn.close() or {}
 	}
-	head, body := read_request(mut conn, ctx.config.server.max_body) or { return }
 	lines := head.split_into_lines()
 	if lines.len == 0 {
 		return
@@ -215,6 +249,10 @@ fn send_response(mut conn net.TcpConn, code int, content_type string, payload st
 		'OK'
 	} else if code == 400 {
 		'Bad Request'
+	} else if code == 401 {
+		'Unauthorized'
+	} else if code == 429 {
+		'Too Many Requests'
 	} else {
 		'Not Found'
 	}

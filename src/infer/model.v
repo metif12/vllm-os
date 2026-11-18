@@ -92,7 +92,10 @@ pub fn config_from_kv(base Qwen3Config, kv map[string]string) Qwen3Config {
 	}
 	if v := kv['general.name'] {
 		if v.len > 0 {
-			c.model_id = v
+			// Own the id: kv strings borrow from load_gguf_table's
+			// prefix buffer, and the id must stay valid for the whole
+			// server lifetime (every /health response reads it).
+			c.model_id = v.clone()
 		}
 	}
 	if v := kv['general.file_type'] {

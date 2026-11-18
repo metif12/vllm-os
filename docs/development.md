@@ -68,7 +68,7 @@ owns them.
 | file | covers |
 |---|---|
 | `src/infer/infer_test.v` | greedy/softmax/seed-determinism/RMSNorm/Q8 scale/template/bad-magic/KV override, presets, min-p, tokenizer dispatch |
-| `src/infer/gguf_golden_test.v` | real-file tables: Qwen3-0.6B + Llama-3.2-1B tensor counts/bytes/types/key shapes; skips when `models/` absent (see `scripts/fetch_small_models.sh`) |
+| `src/infer/gguf_golden_test.v` | real-file tables: Qwen3-0.6B + Qwen3-1.7B tensor counts/bytes/types/key shapes; skips when `models/` absent (see `scripts/fetch_small_models.sh`) |
 | `src/infer/bench_test.v` | perf gates: 20k-iteration `sample_into` floor, blocked-vs-naive matvec equivalence + speed |
 | `src/infer/attention_test.v` | KV-cache append/overflow/row/reset, `attention_step` hand values + error gates |
 | `src/infer/backend_test.v` | registry contents (4 backends), explicit/auto selection, backend agreement |

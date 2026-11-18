@@ -215,16 +215,19 @@ ratios as the signal):
 | model | size | PP tok/s | TG tok/s |
 |---|---|---|---|
 | Qwen3-0.6B Q4_0 (unsloth) | 359 MB | ~389 | ~63 |
-| Llama-3.2-1B Q4_0 (bartowski) | 730 MB | ~219 | ~33 |
+| Qwen3-1.7B Q4_0 (unsloth) | ~1008 MB | — (not yet measured) | — |
 
 Both files parse with our `load_gguf_table` (310 tensors/404 MB table
-for Qwen, 147/812 MB for Llama) after two robustness fixes this round:
-KV arrays over 4096 entries are walked-not-retained (Qwen3 tokenizers
-carry 152k strings; the boot path only needs arch KV), and tensor byte
-sizes use exact block math for Q4_0/Q4_1/Q5/Q8_0. Analytic decode
-ceilings from weight traffic (~0.36 GB/token Qwen, ~0.73 GB/token
-Llama at ~20 GB/s effective) land at ~55 and ~27 tok/s — llama.cpp sits
-at or above those lines. End-to-end V tok/s is now quotable (phase 1b
+for Qwen 0.6B, 310/1124 MB for 1.7B — same 28-layer depth, wider rows)
+after two robustness fixes this round: KV arrays over 4096 entries are
+walked-not-retained (Qwen3 tokenizers carry 152k strings; the boot path
+only needs arch KV), and tensor byte sizes use exact block math for
+Q4_0/Q4_1/Q5/Q8_0. Analytic decode ceilings from weight traffic
+(~0.36 GB/token Qwen 0.6B, ~1.0 GB/token 1.7B at ~20 GB/s effective)
+land at ~55 and ~20 tok/s — llama.cpp sits at or above those lines
+(the 1.7B row is still unmeasured; the Llama fixture it replaced
+needed an HF license accept and is gone). End-to-end V tok/s is now
+quotable (phase 1b
 landed): **~13 tok/s** on Qwen3-0.6B-Q4_0 (78 ms/token threaded, same
 box) vs llama.cpp's ~63 tok/s on the same file — a ~5x gap that sizes
 the remaining kernel/threading work. Known gap found while probing:

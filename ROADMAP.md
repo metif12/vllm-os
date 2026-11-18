@@ -53,7 +53,8 @@ Gate: `/v1/models` + `/v1/chat/completions` return 200. Green.
 
 Follow-ups (not gates): server log/API still print config-default
 `Qwen/Qwen3-1.7B` / `Q4_K_M` labels instead of GGUF-derived id/quant;
-Llama-3.2-1B golden fixture not yet fetched (773 MB, optional).
+Qwen3-1.7B golden fixture not yet fetched (~1 GB, Apache-2.0 via
+unsloth, no login needed — `scripts/fetch_small_models.sh`).
 
 ## Phase 3 — vinix-mini fork
 
@@ -222,6 +223,20 @@ knobs (`--port 8080 --ctx 2048 --preset precise --temp 0.5`) built a
 387 MB ISO that fresh-boots and serves real chat on `:8080`
 (`openai-compat api on :8080` on serial, `GUEST-SERVE-OK` via hostfwd)
 — the generated config demonstrably takes effect in-guest.
+
+## Production hardening (in progress)
+
+Done 2026-11-18: bearer-token auth (opt-in, `/health` stays open),
+per-IP token-bucket rate limiting (opt-in), 401/429 framing, unit tests
+in the CI file list, `docs/security.md` (threat model, TLS-at-edge,
+serial-log hygiene, prod checklist), `--auth-token`/`--rate-*` knobs in
+`build_iso.py`. Verified on metal: guest ISO with a baked key returns
+401 without it and serves real chat with it (`GUEST-AUTH-OK`).
+Architecture note: the gate runs in the single accept-loop thread before
+`spawn` — pinned V 0.5.2 miscompiles `spawn` with a shared `mut` ctx
+(handler threads died reading garbage; bisected), so ctx stays immutable
+and the bucket map needs no locks. Open: TLS termination at the edge,
+SMP-guest validation, 1.7B boot, first perf-CI numbers.
 
 ## Deferred (deliberately out of v1)
 
