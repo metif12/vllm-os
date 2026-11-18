@@ -246,3 +246,22 @@ fn test_rope_split_half_pairing() {
 	assert q[1] == f32(0.0) // untouched by pair (1,3)
 	assert q[3] == f32(0.0) // untouched by pair (1,3)
 }
+
+// Request-sized arenas: the serve path caps KV to prompt + max_tokens
+// instead of the full ctx. Small cap allocates small caches, over-cap
+// clamps to ctx_cap, and the full constructor is cap == ctx_cap.
+fn test_forward_ctx_cap_sizing() {
+	cfg := Qwen3Config{
+		ctx_cap: 4096
+	}
+	g := GgufModel{}
+	small := new_forward_ctx_cap(cfg, g, []u8{}, 10)!
+	assert small.k_cache.len == cfg.layers * cfg.heads_kv
+	assert small.k_cache[0].cap == 10
+	assert small.v_cache[0].cap == 10
+	assert small.probs.len == 10
+	big := new_forward_ctx_cap(cfg, g, []u8{}, 999999)!
+	assert big.k_cache[0].cap == 4096
+	full := new_forward_ctx(cfg, g, []u8{})!
+	assert full.k_cache[0].cap == 4096
+}

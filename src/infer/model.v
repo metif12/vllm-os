@@ -37,6 +37,12 @@ pub:
 	gguf   GgufModel         // valid when format == .gguf
 	st     formats.ModelFile // valid when format == .safetensors (or future registry formats)
 	tok    Tokenizer
+	// blob caches the GGUF weights at boot (host + guest): generate_real
+	// borrows tensor slices from it instead of re-reading the file per
+	// request (that was a ~4s/request disk tax on the serve path).
+	// Empty for stub/safetensors Models (generate falls back to the
+	// pseudo path or a per-call load for uncached gguf Models).
+	blob []u8
 }
 
 // n_tensors is the unified tensor count across containers.
@@ -136,11 +142,15 @@ pub fn load_model(weights_path string, cfg Qwen3Config) !Model {
 		gguf := load_gguf_table(weights_path)!
 		final_cfg := config_from_kv(cfg, gguf.kv)
 		tok := load_sidecar_tokenizer(weights_path)!
+		// Cache the weights blob once: every generate_real call borrows
+		// from this instead of re-reading hundreds of MB per request.
+		blob := load_model_blob(weights_path)!
 		return Model{
 			cfg:    final_cfg
 			format: .gguf
 			gguf:   gguf
 			tok:    tok
+			blob:   blob
 		}
 	}
 	// Generic path: registry-dispatched. Unknown formats fail here;
@@ -196,6 +206,11 @@ fn weights_dir(p string) string {
 // full pipeline stays exercisable end to end.
 pub fn (m Model) generate(prompt string, max_tokens int, sp SampleParams) string {
 	ids := m.tok.encode(prompt)
+	if m.blob.len > 0 {
+		return m.generate_real_cached(ids, max_tokens, sp) or {
+			return m.generate_pseudo(prompt, ids, max_tokens, sp)
+		}
+	}
 	if m.format == .gguf && m.gguf.path != '' && os.exists(m.gguf.path) {
 		return m.generate_real(ids, max_tokens, sp) or {
 			return m.generate_pseudo(prompt, ids, max_tokens, sp)
@@ -204,12 +219,62 @@ pub fn (m Model) generate(prompt string, max_tokens int, sp SampleParams) string
 	return m.generate_pseudo(prompt, ids, max_tokens, sp)
 }
 
+// generate_real_cached runs prefill + sampling over the transformer
+// forward, borrowing tensor bytes from the boot-cached blob. Same math as
+// generate_real (per-call blob load, kept for uncached Models); the cache
+// only removes the disk re-read, never the numerics.
+fn (m Model) generate_real_cached(ids []int, max_tokens int, sp SampleParams) !string {
+	// Size arenas to the request, not the full ctx cap (see
+	// new_forward_ctx_cap): prompt + max_tokens is all pos can reach.
+	need := ids.len + max_tokens
+	mut f := new_forward_ctx_cap(m.cfg, m.gguf, m.blob, need)!
+	for id in ids {
+		embed_gather(m.blob, m.gguf, m.cfg.hidden, id, mut f.hidden)!
+		f.decode_step()!
+	}
+	eos := m.gguf.kv['tokenizer.ggml.eos_token_id'].int()
+	mut out := []int{cap: max_tokens}
+	mut work := []f32{len: f.logits.len}
+	mut idx := []int{len: f.logits.len}
+	mut seed := sp.seed
+	for id in ids {
+		seed = seed * 1315423911 + u64(id)
+	}
+	for i in 0 .. max_tokens {
+		for j in 0 .. f.logits.len {
+			work[j] = f.logits[j]
+		}
+		p := SampleParams{
+			temp:  sp.temp
+			top_k: sp.top_k
+			top_p: sp.top_p
+			min_p: sp.min_p
+			seed:  seed + u64(i)
+			fast:  sp.fast
+		}
+		next := if sp.fast {
+			sample_into_fast(mut work, mut idx, p)
+		} else {
+			sample_into(mut work, mut idx, p)
+		}
+		out << next
+		if next == eos {
+			break
+		}
+		embed_gather(m.blob, m.gguf, m.cfg.hidden, next, mut f.hidden)!
+		f.decode_step()!
+	}
+	return m.tok.decode(out)
+}
+
 // generate_real runs prefill + sampling over the transformer forward.
-// Blob load is per call (host phase-1b; the bare-metal port hands a baked
-// slice instead). KV arenas are sized from cfg.ctx_cap.
+// Blob load is per call (kept for uncached Models; generate prefers the
+// boot-cached path above). Arenas are request-sized like the cached path.
+// KV arenas are sized from cfg.ctx_cap.
 fn (m Model) generate_real(ids []int, max_tokens int, sp SampleParams) !string {
 	blob := load_model_blob(m.gguf.path)!
-	mut f := new_forward_ctx(m.cfg, m.gguf, blob)!
+	need := ids.len + max_tokens
+	mut f := new_forward_ctx_cap(m.cfg, m.gguf, blob, need)!
 	for id in ids {
 		embed_gather(blob, m.gguf, m.cfg.hidden, id, mut f.hidden)!
 		f.decode_step()!

@@ -20,9 +20,15 @@ VLLM_PORT=9000 ./server          # env override, no file edit
 | `port` | `8000` | 1–65535 | baked into the ISO service record |
 | `max_conns` | `64` | 1–4096 | backpressure: accept waits past this, no unbounded spawn |
 | `max_body` | `1048576` | 4096–67108864 | rejects absurd Content-Length before allocation |
+| `auth_token` | `""` | any string | empty = open mode; set = `Authorization: Bearer` required except `/health` (see `docs/security.md`) |
+| `rate_per_sec` | `0` | 0–100000 | 0 = off; per-IP req/s token bucket, excess gets 429 |
+| `rate_burst` | `0` | 0–100000 | 0 = one second's worth; burst allowance for the bucket |
 
-CLI: `--port` (default 8000; overrides file only when explicitly set).
-Env: `VLLM_HOST`, `VLLM_PORT`, `VLLM_MAX_CONNS`, `VLLM_MAX_BODY`.
+CLI: `--port` (default 8000; overrides file only when explicitly set),
+`--auth-token`, `--rate-per-sec`, `--rate-burst` (same explicit-set rule).
+Env: `VLLM_HOST`, `VLLM_PORT`, `VLLM_MAX_CONNS`, `VLLM_MAX_BODY`,
+`VLLM_AUTH_TOKEN` (or `VLLM_API_KEY` deploy alias), `VLLM_RATE_PER_SEC`,
+`VLLM_RATE_BURST`.
 
 ## `model`
 
@@ -98,5 +104,6 @@ Env: `VLLM_MAX_TOKENS`. Effective per-request tokens =
 ```sh
 ./server --config vllm.json
 ./server --config vllm.json --port 9000   # file for everything, flag for the port
+./server --auth-token s3cret --rate-per-sec 10   # or VLLM_AUTH_TOKEN / VLLM_API_KEY env
 VLLM_PRESET=creative VLLM_PORT=9000 ./server --config vllm.json
 ```

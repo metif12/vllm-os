@@ -44,9 +44,10 @@ in the kernel port.
 | `src/infer` → `tensor_view.v` | VTL-aligned zero-copy Tensor view (shape/strides/reshape/matvec), no dependency | data ownership |
 | `src/api` → `routes.v` | `Route` table + `match_route` (new endpoint = one row here) | sockets |
 | `src/api` → `handlers.v` | per-endpoint logic + sampler merging, SSE framing | sockets |
+| `src/api` → `limits.v` | bearer-auth check + per-IP token-bucket gate (accept-loop thread only, no locks) | sockets |
 | `src/api` → `server.v` | socket loop, request framing, response bytes | weight blobs, JSON shapes |
 | `src/api` → `types.v` | OpenAI JSON shapes | weight blobs |
-| `tools/` | host-only dev tools (`bench_kernels.v`); link VTL/VSL freely — never ship in the image | production paths |
+| `tools/` | host-only dev tools (`bench_kernels.v` kernel rows, `forward_bench.v` full-decode probe, `infer_smoke.v` greedy host-vs-guest parity); link VTL/VSL freely — never ship in the image | production paths |
 
 Dependency direction: `main → api → infer → formats`, `main → cfg`,
 `api → cfg`. `infer` never imports `api`; `formats` never imports

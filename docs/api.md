@@ -41,8 +41,7 @@ curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '
 ```
 
 Fields: `model` (informational, echoed), `messages[]` (`role` + `content`),
-`max_tokens` (clamped to 64 in the current pseudo-logit path, full range
-with the phase-1b forward; also capped by config `api.max_tokens`),
+`max_tokens` (capped by config `api.max_tokens`),
 `temperature` (0 = greedy), `top_k`, `top_p`, `seed` (0 = config seed,
 config 0 = time-based; nonzero reproduces generations exactly),
 `stream`. Request `temperature`/`top_k`/`top_p` win when they differ from
@@ -81,7 +80,19 @@ Same sampler merge rules as chat.
 | code | body | cause |
 |---|---|---|
 | 400 | `{"error":"bad chat request"}` / `bad completion request` | undecodable JSON |
+| 401 | `{"error":"unauthorized"}` | bearer token configured and missing/wrong (`Authorization: Bearer <token>`) |
+| 429 | `{"error":"rate limited"}` | per-IP token bucket exhausted (`server.rate_per_sec` / `rate_burst`) |
 | 404 | `{"error":"not found, …"}` | unknown path (try `/health` or `/v1/models`) |
 | — (close) | — | body > `max_body`, or malformed headers |
 
-No auth in v1. The box exposes only `:8000`; there is no SSH or shell.
+## Auth + rate limiting (both opt-in, off by default)
+
+Set `server.auth_token` (config file, `--auth-token` flag, or
+`VLLM_AUTH_TOKEN` / `VLLM_API_KEY` env) to require
+`Authorization: Bearer <token>` on every endpoint except `GET /health`
+(health stays open for load balancers and the boot gate). Empty = open
+mode. Set `server.rate_per_sec` (+ optional `server.rate_burst`,
+`--rate-per-sec` / `--rate-burst`, `VLLM_RATE_*` env) for a per-IP token
+bucket; excess gets 429. The gate runs in the accept-loop thread before
+any spawn, so rejected junk never costs a decode thread. Full threat
+model, TLS-at-edge rule, and prod checklist: [docs/security.md](security.md).

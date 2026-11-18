@@ -28,7 +28,9 @@ fn main() {
 	prompt := if os.args.len > 2 { os.args[2] } else { 'Hello world' }
 	n := if os.args.len > 3 { os.args[3].int() } else { 8 }
 	m := infer.load_model(weights, infer.Qwen3Config{}) or { panic(err) }
-	blob := infer.load_model_blob(weights) or { panic(err) }
+	// Reuse the boot-cached blob when present (load_model caches it);
+	// fall back to a direct load for Models built without the cache.
+	blob := if m.blob.len > 0 { m.blob } else { infer.load_model_blob(weights) or { panic(err) } }
 	mut f := infer.new_forward_ctx(m.cfg, m.gguf, blob) or { panic(err) }
 	ids := m.tok.encode(prompt)
 	for id in ids {

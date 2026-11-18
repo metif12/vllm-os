@@ -82,3 +82,20 @@ bootstrapped without sudo; honours `http_proxy`/`https_proxy` and
 `VLLM_CACHE`). Outside world sees only `:8000`. Boot it with
 `qemu-system-x86_64 -cdrom vllm-os.iso -m 4G -display none -serial
 stdio` (+ SLIRP hostfwd, see `scripts/mini_boot_gate.ps1`).
+
+## ISO builder (phase 6: custom models)
+
+```sh
+python3 scripts/build_iso.py --model path/to/foo.gguf   # interactive knobs
+python3 scripts/build_iso.py --model m.gguf --port 8080 --ctx 2048 \
+  --preset precise --temp 0.5 --auth-token s3cret --dry-run   # print, don't build
+```
+
+Validates arch (x86_64 only — arm64 refused, fork drivers are
+amd64-only), weights size vs guest RAM budget, tokenizer sidecar,
+port/ctx/backend/preset/temp ranges — then generates the baked
+`config.json` from knobs (or bakes `--config` as-is) and drives
+`make image` (`MODEL` / `TOKENIZER` / `CONFIG` / `KERNEL` passthrough).
+`gui/` is the same builder as a vlang/ui2 desktop app (pure
+`gui/compose` logic, unit-tested; thin ui2 shell; builds with a
+json2-capable V, see `docs/development.md` toolchain exception).

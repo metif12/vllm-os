@@ -50,13 +50,18 @@ src/infer/simd_c.v    # V wrappers for vllm_kernels.{h,c} (prod-only link, runti
 src/infer/tensor_view.v # VTL-aligned zero-copy Tensor view (no dependency)
 src/api/routes.v      # Route table + match_route (new endpoint = one row)
 src/api/handlers.v    # per-endpoint logic + sampler merging
+src/api/limits.v      # bearer-auth check + per-IP token-bucket gate (accept-loop only)
 src/api/server.v      # raw-socket HTTP + backpressure, no veb (bare-metal portable)
 src/api/types.v       # OpenAI JSON shapes
 src/api/context.v     # HandlerCtx: shared model + resolved config
 tools/bench_kernels.v # host-only kernel benchmark (links real C file, embeds V refs)
-docs/                 # architecture/api/configuration/formats/building/development
+tools/forward_bench.v # host-only full-decode probe (real GGUF, best-of-N ms/token)
+tools/infer_smoke.v   # host-only greedy smoke (also runs as /sbin/vllm in-guest; outputs must match)
+docs/                 # architecture/api/configuration/formats/building/development/security
 kernel/               # vinix-mini fork plan, mini.md spec, mini.ld, cmdline.txt, features.conf
-scripts/              # fetch/build profiles (ps1+sh)/qemu test (host-only tooling)
+scripts/              # fetch/build profiles (ps1+sh)/qemu test/build_iso.py (phase-6 builder)/perf CI
+gui/                  # phase-6 ISO-builder desktop app (vlang/ui2; compose/ unit-tested)
+GNUmakefile           # `make image` (WSL): static server + weights + config -> vllm-os.iso
 qemu/                 # QEMU harness docs
 vllm.example.json     # config starting point (all sections)
 ROADMAP.md            # phased plan with exit criteria
@@ -162,9 +167,9 @@ Full reference with streaming framing and error table:
 | C SIMD layer (AVX2 matvec/Q8-dot/RMSNorm/fast-softmax) | done, runtime-dispatched, removable |
 | VTL/VSL integration | parity-tested (`vtl_parity_test.v`, needs `v install vtl vsl`); VTL-aligned `tensor_view.v` in-tree |
 | QEMU network path | harness green (loopback); guest SLIRP via `$GUEST_IMG` |
-| Transformer forward (real logits, phase 1b) | done: GQA + QK-norm + split-half RoPE decode, fused Q4_0/Q4_1/Q6_K matvecs, real BPE; greedy output identical to llama.cpp, PPL close (see [docs/perf.md](docs/perf.md)) |
-| Forward speed (host, same-box measured) | C AVX2 quantized kernels + threaded vocab head + layer fork-join, runtime-dispatched: decode ~78 ms/token threaded (~100 ms serial, ~920 ms pure-V) on Qwen3-0.6B-Q4_0 (warm, Ryzen 7 5800HS), ~11x over warm pure-V; vocab head ~9.5x, Q4_1 down ~5-6x, gate matvec 4 ms to sub-ms |
-| vinix-mini fork / bare-metal port / ISO | specified (`kernel/`, `features.conf`, `scripts/build_image.sh`) |
+| Transformer forward (real logits, phase 1b) | done: GQA + QK-norm + split-half RoPE decode, fused Q4_0/Q4_1/Q6_K matvecs, q/k/v + gate/up fork-join, boot-cached blob + request-sized arenas, real BPE; greedy output identical to llama.cpp, PPL close (see [docs/perf.md](docs/perf.md)) |
+| Forward speed (host, same-box measured) | C AVX2 quantized kernels + threaded vocab head + layer fork-join, runtime-dispatched: decode ~70-85 ms/token threaded (~96-108 ms serial, ~800-1000 ms pure-V) on Qwen3-0.6B-Q4_0 (warm, Ryzen 7 5800HS), ~12x over warm pure-V; vocab head ~9.5x, Q4_1 down ~5-6x, gate matvec 4 ms to sub-ms; serve path chat8 ~2.9 s wall (was ~7.3 s pre-cache, prefill-bound) |
+| vinix-mini fork / bare-metal port / ISO | gate green: fork boots, userland V runs, full server in-guest serves real completions from the ISO (`make image`, `scripts/mini_boot_gate.ps1`) |
 
 ## Design constraints
 

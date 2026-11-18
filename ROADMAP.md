@@ -51,10 +51,14 @@ Gate: `/v1/models` + `/v1/chat/completions` return 200. Green.
 * Gate: cold-boot guest → first token < 30 s wall (stub), log saved —
   green (`qemu/test.log`, `qemu/guest.log`, both gitignored).
 
-Follow-ups (not gates): server log/API still print config-default
-`Qwen/Qwen3-1.7B` / `Q4_K_M` labels instead of GGUF-derived id/quant;
-Qwen3-1.7B golden fixture not yet fetched (~1 GB, Apache-2.0 via
-unsloth, no login needed — `scripts/fetch_small_models.sh`).
+Follow-ups (closed 2026-11-18): GGUF-derived identity landed —
+boot log and `/health` print the mapped `general.name` /
+`general.file_type` labels (`config_from_kv`), falling back to the
+1.7B/Q4_K_M defaults only for unmapped codes; `/v1/models` stays the
+stable `qwen3-1.7b` id by contract (API + gate scripts assert it).
+The 1.7B golden fixture path is covered: `src/infer/gguf_golden_test.v`
+asserts both 0.6B and 1.7B tables (size-asserted, skips when `models/`
+is absent) and `scripts/fetch_small_models.sh` fetches either file.
 
 ## Phase 3 — vinix-mini fork
 
@@ -243,6 +247,23 @@ Architecture note: the gate runs in the single accept-loop thread before
 (handler threads died reading garbage; bisected), so ctx stays immutable
 and the bucket map needs no locks. Open: TLS termination at the edge,
 SMP-guest validation, 1.7B boot, first perf-CI numbers.
+
+Done 2026-11-18 (serve path): the model blob is cached at boot
+(`Model.blob`) instead of re-read per request, and KV arenas are sized
+to the request (prompt + max_tokens via `new_forward_ctx_cap`) instead
+of the full 4k cap (~900 MB zero-fill per request on the 0.6B shape).
+Paired same-box probe (temp 0, seed 7, `Hello`, `chat8`): wall 7.3 s ->
+2.9 s (~2.5x); cached-vs-per-call greedy tokens identical. Serve
+throughput is prefill-bound (ChatML prompt ~2.8 s) with steady-state
+decode ~70-85 ms/token (see `docs/perf.md`).
+
+Closed: TLS terminates at the edge by design (no TLS stack ships in the
+guest — `docs/security.md` rationale); SMP is validated by the 1.7B
+workflow (`-smp 2` QEMU boot to a real completion, weekly + manual);
+1.7B boots via `.github/workflows/model-17b.yml` (golden table + full
+ISO + real chat asserts, artifacts kept as serial logs); perf-CI numbers
+land since 2026-11-18 (`docs/perf.md` CI section auto-updated, runners
+vary so rows track regressions only).
 
 ## Deferred (deliberately out of v1)
 

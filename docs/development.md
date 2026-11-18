@@ -87,13 +87,18 @@ owns them.
 | `src/infer/attention_test.v` | KV-cache append/overflow/row/reset, `attention_step` hand values + error gates |
 | `src/infer/backend_test.v` | registry contents (4 backends), explicit/auto selection, backend agreement |
 | `src/infer/simd_test.v` | C-vs-V agreement (matvec/Q8-dot/**Q4-fused-dot**/RMSNorm/range-block), heap top-k winners, fast-vs-exact sampler |
-| `src/infer/parallel_test.v` | threaded-vs-serial agreement (incl. wide + **remainder rows**), range-block parity |
+| `src/infer/parallel_test.v` | threaded-vs-serial agreement (incl. wide + **remainder rows** + **Q4_1 AVX2**), range-block parity, **2-way/3-way fork-join bit-exactness** |
+| `src/infer/forward_test.v` | block layout, fused matvec-vs-dequant, embed, RoPE agreement + pairing lock-in, **request-sized arena caps** |
+| `src/infer/gguf_golden_test.v` | real-file tables (Qwen3-0.6B + Qwen3-1.7B tensor counts/bytes/types/key shapes; skips when `models/` absent) + **boot blob-cache assert** |
 | `src/infer/tensor_view_test.v` | view validation, `-1` reshape, matvec parity, strided-layout rejection |
 | `src/infer/vtl_parity_test.v` | VTL `la.matmul` and VSL `matrix_matrix_mul` agree with `matvec`; view/VTL layout parity |
 | `src/formats/formats_test.v` | GGUF/SafeTensors/unknown/PyTorch detection, header parse, dtype table, registry resolve + sniff parity |
-| `src/cfg/config_test.v` | defaults, partial-file fallback, BOM strip, rejection of bad values, simd/auto backends, env overrides, preset resolve |
+| `src/cfg/config_test.v` | defaults, partial-file fallback, BOM strip, rejection of bad values, simd/auto backends, env overrides, sampler preset resolve, **auth/rate env + validation** |
+| `src/api/routes_test.v` | route match/miss, health + models payloads, sampler merge rules, max_tokens clamp, 400/200 round trips, **bearer auth + bucket/rate gates** |
 
-| `src/api/routes_test.v` | route match/miss, health + models payloads, sampler merge rules, max_tokens clamp, 400/200 round trips |
+`tools/` probes (`bench_kernels.v` kernel rows, `forward_bench.v`
+full-decode tok/s, `infer_smoke.v` greedy host-vs-guest parity) are
+measured, not gated — boxes vary.
 
 Rules (house policy): every fix ships with a failing-first test where
 practical — break the line, watch it go red, restore it. A silent green

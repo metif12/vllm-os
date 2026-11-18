@@ -95,3 +95,18 @@ fn test_gguf_golden_qwen_17b() {
 	assert q.typ == .q4_0
 	assert q.shape == [u64(2048), u64(2048)]
 }
+
+// load_model caches the weights blob at boot so the serve path never
+// re-reads the file per request (that was a seconds-scale disk tax).
+// Skips like the golden tests when models/ is absent.
+fn test_load_model_caches_blob() {
+	path := golden_path('Qwen3-0.6B-Q4_0.gguf') or {
+		eprintln('[skip] Qwen3-0.6B-Q4_0.gguf absent; run scripts/fetch_small_models.sh')
+		return
+	}
+	m := load_model(path, Qwen3Config{})!
+	assert m.blob.len == 382156480
+	// The cached blob serves real bytes: first tensor slices from it.
+	t := tensor_bytes(m.blob, m.gguf, 'blk.0.attn_q.weight')!
+	assert t.len > 0
+}

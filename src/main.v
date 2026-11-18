@@ -21,7 +21,10 @@ fn main() {
 	port := fp.int('port', `p`, 8000, 'listen port for the OpenAI-compat API')
 	ctx_cap := fp.int('ctx', `c`, 4096, 'KV context cap (v1 trims Qwen3 native 32k)')
 	backend := fp.string('backend', `b`, 'cpu',
-		'compute backend: cpu | cpu-blocked | cpu-simd | auto')
+		'compute backend: cpu | cpu-blocked | cpu-simd | cpu-parallel | auto')
+	auth_token := fp.string('auth-token', 0, '', 'bearer token (empty = open mode)')
+	rate_per_sec := fp.int('rate-per-sec', 0, 0, 'per-IP req/s cap (0 = off)')
+	rate_burst := fp.int('rate-burst', 0, 0, 'per-IP burst (0 = one second worth)')
 	list_backends := fp.bool('list-backends', 0, false, 'print backend registry and exit')
 	list_formats := fp.bool('list-formats', 0, false, 'print weight-format handlers and exit')
 	print_config := fp.bool('print-config', 0, false, 'print effective config as JSON and exit')
@@ -67,6 +70,18 @@ fn main() {
 	}
 	if backend != 'cpu' {
 		cc.model.backend = backend
+	}
+	// Security knobs: CLI wins when explicitly set (non-default), same
+	// rule as --port/--model above; env (VLLM_AUTH_TOKEN/VLLM_API_KEY,
+	// VLLM_RATE_*) already applied in apply_env.
+	if auth_token != '' {
+		cc.server.auth_token = auth_token
+	}
+	if rate_per_sec != 0 {
+		cc.server.rate_per_sec = rate_per_sec
+	}
+	if rate_burst != 0 {
+		cc.server.rate_burst = rate_burst
 	}
 	cc.validate() or {
 		eprintln('[vllm-os] bad config: ${err}')

@@ -167,3 +167,25 @@ fn test_accepts_simd_and_auto_backends() {
 	c.model.backend = 'cpu-blocked'
 	c.validate()!
 }
+
+fn test_env_auth_and_rate_overrides() {
+	os.setenv('VLLM_AUTH_TOKEN', 's3cret', true)
+	os.setenv('VLLM_RATE_PER_SEC', '10', true)
+	os.setenv('VLLM_RATE_BURST', '20', true)
+	defer {
+		os.unsetenv('VLLM_AUTH_TOKEN')
+		os.unsetenv('VLLM_API_KEY')
+		os.unsetenv('VLLM_RATE_PER_SEC')
+		os.unsetenv('VLLM_RATE_BURST')
+	}
+	mut c := defaults()
+	c.apply_env()!
+	assert c.server.auth_token == 's3cret'
+	assert c.server.rate_per_sec == 10
+	assert c.server.rate_burst == 20
+	// VLLM_API_KEY is the deploy-time alias and wins when both are set
+	// (applied after the canonical var so deploys override files).
+	os.setenv('VLLM_API_KEY', 'alias-key', true)
+	c.apply_env()!
+	assert c.server.auth_token == 'alias-key'
+}

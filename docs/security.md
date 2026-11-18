@@ -10,9 +10,11 @@ regardless; that is out of scope until confidential-computing hardware).
 ## What is enforced today
 
 * **Bearer auth (opt-in).** `server.auth_token` (config file,
-  `vllm.example.json` shows the shape). Empty = open mode (default: keeps
-  local dev, QEMU gates, and first-boot flows working). When set, every
-  endpoint except `GET /health` requires
+  `--auth-token` flag, `VLLM_AUTH_TOKEN` or `VLLM_API_KEY` env — full
+  list in `docs/configuration.md`, `vllm.example.json` shows the shape).
+  Empty = open mode (default: keeps local dev, QEMU gates, and
+  first-boot flows working). When set, every endpoint except
+  `GET /health` requires
   `Authorization: Bearer <token>` and answers 401 otherwise. Health stays
   open on purpose: load balancers and the boot gate need an unauthenticated
   liveness signal. Pure function `api.authorized`, unit-tested.

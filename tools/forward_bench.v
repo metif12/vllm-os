@@ -18,7 +18,9 @@ fn main() {
 	weights := os.args[1]
 	n := if os.args.len > 2 { os.args[2].int() } else { 5 }
 	m := infer.load_model(weights, infer.Qwen3Config{}) or { panic(err) }
-	blob := infer.load_model_blob(weights) or { panic(err) }
+	// Reuse the boot-cached blob when present; fall back to a direct
+	// load for Models built without the cache.
+	blob := if m.blob.len > 0 { m.blob } else { infer.load_model_blob(weights) or { panic(err) } }
 	mut f := infer.new_forward_ctx(m.cfg, m.gguf, blob) or { panic(err) }
 	print('model_hidden=')
 	println(m.cfg.hidden)

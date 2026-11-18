@@ -121,6 +121,22 @@ pub mut:
 
 // new_forward_ctx allocates arenas for ctx_cap tokens of KV per head.
 pub fn new_forward_ctx(cfg Qwen3Config, gguf GgufModel, blob []u8) !ForwardCtx {
+	return new_forward_ctx_cap(cfg, gguf, blob, cfg.ctx_cap)
+}
+
+// new_forward_ctx_cap allocates KV arenas for cap tokens per head,
+// clamped to 1..cfg.ctx_cap. The serve path sizes cap to the actual
+// request (prompt + max_tokens) instead of the full 4k: full arenas are
+// ~900 MB zero-fill per request on the 0.6B shape, which dwarfs decode.
+// Short requests stay correct -- pos can never exceed prompt + max_tokens.
+pub fn new_forward_ctx_cap(cfg Qwen3Config, gguf GgufModel, blob []u8, cap_ int) !ForwardCtx {
+	cap := if cap_ < 1 {
+		1
+	} else if cap_ > cfg.ctx_cap {
+		cfg.ctx_cap
+	} else {
+		cap_
+	}
 	h := cfg.hidden
 	nh := cfg.heads_q
 	nkv := cfg.heads_kv
@@ -129,8 +145,8 @@ pub fn new_forward_ctx(cfg Qwen3Config, gguf GgufModel, blob []u8) !ForwardCtx {
 	mut k_cache := []KVCache{cap: cfg.layers * nkv}
 	mut v_cache := []KVCache{cap: cfg.layers * nkv}
 	for _ in 0 .. cfg.layers * nkv {
-		k_cache << new_kv_cache(hd, cfg.ctx_cap)!
-		v_cache << new_kv_cache(vd, cfg.ctx_cap)!
+		k_cache << new_kv_cache(hd, cap)!
+		v_cache << new_kv_cache(vd, cap)!
 	}
 	inter := cfg.intermediate
 	vocab := vocab_size(gguf)
@@ -150,7 +166,7 @@ pub fn new_forward_ctx(cfg Qwen3Config, gguf GgufModel, blob []u8) !ForwardCtx {
 		gate:     []f32{len: inter}
 		up:       []f32{len: inter}
 		down:     []f32{len: h}
-		probs:    []f32{len: cfg.ctx_cap}
+		probs:    []f32{len: cap}
 		cos_sin:  []f32{len: hd}
 		logits:   []f32{len: vocab}
 	}

@@ -234,6 +234,21 @@ pub fn (mut c Config) apply_env() ! {
 	if v := os.getenv_opt('VLLM_MAX_TOKENS') {
 		c.api.max_tokens = v.int()
 	}
+	// Auth/rate overrides: VLLM_AUTH_TOKEN is canonical, VLLM_API_KEY is
+	// the deploy-time alias (never baked into a shared ISO — see
+	// docs/security.md). Empty = open mode.
+	if v := os.getenv_opt('VLLM_AUTH_TOKEN') {
+		c.server.auth_token = v
+	}
+	if v := os.getenv_opt('VLLM_API_KEY') {
+		c.server.auth_token = v
+	}
+	if v := os.getenv_opt('VLLM_RATE_PER_SEC') {
+		c.server.rate_per_sec = v.int()
+	}
+	if v := os.getenv_opt('VLLM_RATE_BURST') {
+		c.server.rate_burst = v.int()
+	}
 	c.normalize()
 	c.validate()!
 }
