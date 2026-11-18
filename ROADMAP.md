@@ -209,6 +209,15 @@ arch, model weights, and serving config, get a tested `vllm-os.iso`.
   asserts); `--dry-run` prints the exact `make` invocation without
   building.
 
+Status 2026-11-18: CLI landed (`scripts/build_iso.py`, WSL).
+Refuses arm64 / missing weights / missing sidecar (unless
+`--allow-stub-tokenizer`) / bad backend-preset-port-temp / over-budget
+weights, generates `config.json` from knobs (verified through the real
+server `--print-config`: `cfg.load` + `validate` green), drives
+`make image`, prints the QEMU boot line. Fixture-tested (10 refusal
+cases + happy path + stub hatch). GUI stretch + non-default-model
+boot gate still open.
+
 ## Deferred (deliberately out of v1)
 
 GPU / NPU drivers, multi-tenant auth + rate limits, full 32k ctx,
