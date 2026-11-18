@@ -215,8 +215,13 @@ Refuses arm64 / missing weights / missing sidecar (unless
 weights, generates `config.json` from knobs (verified through the real
 server `--print-config`: `cfg.load` + `validate` green), drives
 `make image`, prints the QEMU boot line. Fixture-tested (10 refusal
-cases + happy path + stub hatch). GUI stretch + non-default-model
-boot gate still open.
+cases + happy path + stub hatch). GUI stretch still open.
+
+Gate closed 2026-11-18: full `build_iso.py` run with non-default
+knobs (`--port 8080 --ctx 2048 --preset precise --temp 0.5`) built a
+387 MB ISO that fresh-boots and serves real chat on `:8080`
+(`openai-compat api on :8080` on serial, `GUEST-SERVE-OK` via hostfwd)
+— the generated config demonstrably takes effect in-guest.
 
 ## Deferred (deliberately out of v1)
 

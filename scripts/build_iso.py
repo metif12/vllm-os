@@ -201,7 +201,7 @@ def main(argv=None):
     print(f"image ready: {out}")
     print("boot it: qemu-system-x86_64 -cdrom "
           f"{out} -m {args.mem}G -display none -serial stdio "
-          "-netdev user,id=n0,hostfwd=tcp::18000-:8000 "
+          f"-netdev user,id=n0,hostfwd=tcp::18000-:{args.port} "
           "-device e1000,netdev=n0")
     return 0
 
