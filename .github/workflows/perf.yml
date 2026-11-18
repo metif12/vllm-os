@@ -28,7 +28,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      # Full history: the commit-back rebases onto fresh main (a push
+      # landing mid-run must not fail the workflow).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install V
         run: |
           curl -sL -o /tmp/v_linux.zip \
@@ -57,5 +61,7 @@ jobs:
             echo "perf.md unchanged"
           else
             git commit -m "perf: CI-tracked numbers $(date -u +%F) [skip ci]"
+            git fetch origin main
+            git rebase origin/main
             git push
           fi
