@@ -29,7 +29,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_URL = ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/"
              "Qwen3-0.6B-Q4_0.gguf")
 MODEL_SIZE = 382156480
-TOKENIZER_URL = ("https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/"
+# Tokenizer lives in the canonical Qwen repo, not the GGUF mirror:
+# unsloth removed tokenizer.json from Qwen3-0.6B-GGUF after our first
+# fetch (their URL now 404s). Same 151936-entry Qwen3 vocab either way
+# (byte-identical size 11422654); the Qwen org repos stay ungated.
+TOKENIZER_URL = ("https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/"
                  "tokenizer.json")
 
 
