@@ -29,13 +29,14 @@
 set -eu
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KERNEL="$ROOT/kernel/mini/bin/vinix"
-OUT="$ROOT/vllm-mini.iso"
+OUT="$ROOT/vllm-os.iso"
 WORK="$ROOT/kernel/init/.work"
 IMAGE_ID="mini-smoke-00000001"
 LIMINE_VER="12.9.3"
 LIMINE_URL="https://github.com/limine-bootloader/limine/releases/download/v${LIMINE_VER}/limine-binary.tar.gz"
 CACHE="${VLLM_CACHE:-$HOME/.cache/vllm-os}"
 EXTRA=""
+CONFIG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --kernel) KERNEL="$2"; shift 2;;
@@ -43,7 +44,8 @@ while [ $# -gt 0 ]; do
     --work) WORK="$2"; shift 2;;
     --image-id) IMAGE_ID="$2"; shift 2;;
     --initramfs-extra) EXTRA="$2"; shift 2;;
-    *) echo "usage: $0 [--kernel PATH] [--out ISO] [--work DIR] [--image-id ID] [--initramfs-extra DIR]" >&2; exit 2;;
+    --config) CONFIG="$2"; shift 2;;
+    *) echo "usage: $0 [--kernel PATH] [--out ISO] [--work DIR] [--image-id ID] [--initramfs-extra DIR] [--config FILE]" >&2; exit 2;;
   esac
 done
 if [ ! -f "$KERNEL" ]; then
@@ -54,6 +56,9 @@ for t in cc tar gzip dd; do
   command -v "$t" >/dev/null || { echo "need $t on PATH" >&2; exit 1; }
 done
 mkdir -p "$WORK" "$CACHE"
+# The script cds into $IMG mid-run: anchor WORK absolute now so every
+# later reference resolves the same regardless of caller cwd.
+WORK="$(cd "$WORK" && pwd)"
 
 echo "== init =="
 INIT="$WORK/init"
@@ -64,11 +69,19 @@ chmod 755 "$INIT"
 echo "== initramfs =="
 IMG="$WORK/img"
 rm -rf "$IMG"
-mkdir -p "$IMG/sbin"
+mkdir -p "$IMG/sbin" "$IMG/models"
 cp "$INIT" "$IMG/sbin/init"
 chmod 755 "$IMG/sbin/init"
 printf '%s\n' "$IMAGE_ID" > "$IMG/.vinix-image-id"
 dd if=/dev/urandom of="$IMG/.pad.bin" bs=4096 count=1 status=none
+# config.json always exists in the image (init passes --config): explicit
+# file wins, else a minimal one pointing at the baked weights (cfg.load
+# fills every other knob from built-in defaults, partial files are OK).
+if [ -n "$CONFIG" ]; then
+  cp "$CONFIG" "$IMG/models/config.json"
+else
+  printf '%s\n' '{"model": {"weights": "/models/model.gguf"}, "server": {"port": 8000}}' > "$IMG/models/config.json"
+fi
 if [ -n "$EXTRA" ]; then
   cp -a "$EXTRA/." "$IMG/"
 fi

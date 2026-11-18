@@ -174,10 +174,17 @@ dual-stack socket with no changes.
 
 ## Phase 5 — OS+weights image
 
-* `make image MODEL=models/qwen3-1.7b-q4_k_m.gguf` → `vllm-os.iso`.
-* Contents: kernel + `models/*.gguf` + `tokenizer.json` + `config.json`.
-* Outside world sees only `:8000` OpenAI API. No SSH, no shell.
-* Gate: fresh QEMU boot from ISO, no host files, chat completion works.
+Done 2026-11-18, gate GREEN. `make image` (root `GNUmakefile`, WSL)
+builds the static server, stages `sbin/vllm` + `models/model.gguf` +
+`models/tokenizer.json` + `models/config.json`, and emits Limine
+BIOS+UEFI `vllm-os.iso` via `kernel/init/build-image.sh`
+(`scripts/build_image.sh` is a thin compat wrapper). `config.json` is
+always baked (explicit `--config` file, else a minimal default pointing
+at `/models/model.gguf` — `cfg.load` fills the rest); init passes
+`--model` + `--config`. Fresh QEMU `-m 4G` boot from `vllm-os.iso`
+with no host files: real chat completion served, all serial asserts
+green. Outside world sees only `:8000` (OpenAI API, no SSH/shell —
+there is no shell to expose).
 
 ## Deferred (deliberately out of v1)
 

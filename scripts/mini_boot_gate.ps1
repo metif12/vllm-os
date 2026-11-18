@@ -1,5 +1,5 @@
 param(
-  [string]$ISO = "$PSScriptRoot\..\vllm-os\vllm-mini.iso",
+  [string]$ISO = "$PSScriptRoot\..\vllm-os\vllm-os.iso",
   [int]$HostPort = 18000,
   [string]$LogDir = "$env:TEMP\opencode"
 )

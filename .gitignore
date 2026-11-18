@@ -15,6 +15,9 @@ bench/results_*/
 # kernel/init/build-image.sh work dir (init binary, staging, iso-root, xorriso root)
 kernel/init/.work/
 /vllm-mini.iso
+# `make image` outputs (Phase 5)
+/vllm-os.iso
+build/
 qemu/*.iso
 qemu/*.img
 qemu/*.log

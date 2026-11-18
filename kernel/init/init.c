@@ -109,8 +109,10 @@ void _start(void) {
 		static char path[] = "/sbin/vllm";
 		static char arg1[] = "--model";
 		static char arg2[] = "/models/model.gguf";
+		static char arg3[] = "--config";
+		static char arg4[] = "/models/config.json";
 		static char env0[] = "VLLM_THREADS=1";
-		static char *argv[] = { path, arg1, arg2, 0 };
+		static char *argv[] = { path, arg1, arg2, arg3, arg4, 0 };
 		static char *envp[] = { env0, 0 };
 		sc3(59 /* execve */, (long)path, (long)argv, (long)envp);
 		puts1("[vllm-os] no /sbin/vllm, stub mode\n");

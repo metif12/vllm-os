@@ -64,16 +64,21 @@ with SLIRP `hostfwd` so the guest reaches the host at `10.0.2.2:<port>`
 
 ## OS image (phases 3-5)
 
+One-time: `sh kernel/fetch_vinix.sh` pins upstream Vinix into
+`third_party/` (the `kernel/mini` fork derives from it).
+
 ```sh
-sh kernel/fetch_vinix.sh        # pin upstream Vinix into third_party/
-sh scripts/build_image.sh [weights.gguf]
+make image                        # WSL: static server + 0.6B weights + config -> vllm-os.iso
+make image MODEL=models/foo.gguf CONFIG=custom.json   # other weights / explicit config
 ```
 
-`build_image.sh` validates the weights + `kernel/vinix-mini.elf`, stages
-kernel (stripped) + `models/model.gguf` + `tokenizer.json` + `limine.cfg`
-(`TIMEOUT=0`, serial console, `model=/models/model.gguf …`), and emits
-`vllm-os.iso` via xorriso. Feature selection lives in
-`kernel/features.conf` (every extra OFF by default). Link constraints
-in `kernel/mini.ld` (higher-half, 2 MB-aligned, debug sections
-discarded); boot order, IP defaults, and the memory budget in
-`kernel/mini.md`.
+`make image` (WSL2 Ubuntu, no sudo) builds the static `/sbin/vllm`
+userland server, stages `sbin/vllm` + `models/model.gguf` +
+`models/tokenizer.json` + `models/config.json` (explicit `--config`
+file, else a minimal baked default pointing at `/models/model.gguf`),
+and emits Limine BIOS+UEFI `vllm-os.iso` via
+`kernel/init/build-image.sh` (pinned limine-binary 12.9.3, xorriso
+bootstrapped without sudo; honours `http_proxy`/`https_proxy` and
+`VLLM_CACHE`). Outside world sees only `:8000`. Boot it with
+`qemu-system-x86_64 -cdrom vllm-os.iso -m 4G -display none -serial
+stdio` (+ SLIRP hostfwd, see `scripts/mini_boot_gate.ps1`).
