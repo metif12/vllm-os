@@ -334,7 +334,35 @@ record; the forward row is the one to quote for model speed:
 ## CI-tracked numbers (auto-updated, do not edit by hand)
 
 <!-- PERF-CI-START -->
-_Not yet run: the weekly perf workflow fills this section._
+_Updated 2026-11-18T11:40:24+0000 from `f36db1b` on Linux (`AMD EPYC 7763 64-Core Processor`, 4 cores, 15.6 GB RAM, V V 0.5.2 7647ce1, gcc gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0) ([workflow run](https://github.com/metif12/vllm-os/actions/runs/44296772503))._
+
+_Runner hardware varies between runs: these rows track regressions on CI, they do NOT replace the curated tables above and must not be quoted as machine numbers._
+
+| suite | bench | best | unit | detail |
+|---|---|---|---|---|
+| forward | decode pure-v | 696 | ms/token | range 696-706 over 5 tokens |
+| forward | decode serial | 122 | ms/token | range 122-124 over 5 tokens |
+| forward | decode threaded | 81 | ms/token | range 81-82 over 5 tokens |
+| forward | prefill 2tok pure-v | 1393 | ms |  |
+| forward | prefill 2tok serial | 244 | ms |  |
+| forward | prefill 2tok threaded | 163 | ms |  |
+| v | q4 fused C x20x2048blocks | 184 | us | acc=831.0002 [best of 2] |
+| v | q4 materialize x20x2048blocks | 6320 | us | acc=830.99646 [best of 2] |
+| v | v matvec 2048x6144 x3 c-kernel | 6 | ms | (avx2=1) [best of 2] |
+| v | v matvec 2048x6144 x3 naive | 23 | ms | [best of 2] |
+| v | v matvec 2048x6144 x3 parallel-2 | 3 | ms | (avx2=1) [best of 2] |
+| v | v matvec 2048x6144 x3 parallel-4 | 3 | ms | (avx2=1) [best of 2] |
+| v | v matvec 2048x6144 x3 parallel-8 | 3 | ms | (avx2=1) [best of 2] |
+| v | v matvec 256x512 x20 blocked | 1251 | us | [best of 2] |
+| v | v matvec 256x512 x20 c-kernel | 192 | us | (avx2=1) [best of 2] |
+| v | v matvec 256x512 x20 naive | 1665 | us | [best of 2] |
+| v | v sample 151936-logit x20 exact | 16 | ms | [best of 2] |
+| v | v sample 151936-logit x20 fast | 6 | ms | [best of 2] |
+| v | v sample 64-logit x20k exact | 36 | ms | [best of 2] |
+| numpy | matvec 2048x6144 x3 | 3 | ms | [best of 2] |
+| numpy | matvec 256x512 x20 | 235 | us | [best of 2] |
+| numpy | sample 151936-logit x20 | 40 | ms | [best of 2] |
+| numpy | sample 64-logit x20k | 836 | ms | [best of 2] |
 <!-- PERF-CI-END -->
 
 ## Per-token resource budget, Qwen3-1.7B (analytic, exact math)
