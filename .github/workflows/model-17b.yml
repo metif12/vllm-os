@@ -114,9 +114,10 @@ jobs:
         timeout-minutes: 150
         run: |
           # KVM when the runner offers it, TCG otherwise (much slower).
-          ACCEL=kvm:tcg
+          # Two -accel flags = fallback chain (kvm first, then tcg).
+          ACCEL="-accel kvm -accel tcg"
           qemu-system-x86_64 -cdrom vllm-os-1.7b.iso -m 4G -smp 2 \
-            -display none -serial file:boot-17b.log -accel $ACCEL \
+            -display none -serial file:boot-17b.log $ACCEL \
             -netdev user,id=n0,hostfwd=tcp::18000-:8000 \
             -device e1000,netdev=n0 &
           QEMU=$!
