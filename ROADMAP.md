@@ -321,6 +321,52 @@ Non-goals (stay deferred): whole patched `llama.cpp`, `GLIBC<=2.30`
 portable binary, GPU backends, `*-ablit` weights, `sse_gateway.py` in
 the guest (host-side proxy only), 30B/284B weights.
 
+## Phase 8 — similar-engine takeaways (planned, 2026-11-19)
+
+Sources: `ikawrakow/ik_llama.cpp` (IQK + repack + MLA/GDN, late-2026
+diverged), `ggml-org/llama.cpp docs/speculative.md` (draft/EAGLE/DFlash/
+ngram taxonomy), `Tiiny-AI/PowerInfer(-2)` (hot/cold sparse activation),
+`kvcache-ai/KTransformers` (CPU+GPU heterogeneous MoE, AMX),
+`microsoft/BitNet.cpp` (ternary 1.58-bit kernels). Same rule as Phase 7:
+ideas only, nothing vendored; `-gc none` + freestanding-safe + `tools/`-only
+VTL/VSL stay. License/provenance check before copying any C.
+
+* F — IQK + row-interleaved repack (from `ik_llama`). Prefer standard
+  `IQ4_NL` (+ `Q2_0_R8` repack variant) over custom types 44/45: add
+  `IQ4_NL` dequant + fused AVX2 matvec in `src/infer/quant.v` +
+  `vllm_kernels.{h,c}` + `simd_c.v` (runtime-dispatched,
+  `VLLM_NO_SIMD=1` fallback), repack as a load-time layout behind
+  `Backend` (`src/infer/backend.v`), never a second math path. Note
+  the `ik` `-rtr` warning: repack only tensors the CPU really runs.
+  Gate: real-weight maxdiff in 1e-3 band, `quant`/`simd`/`bench` tests
+  green, `docs/perf.md` same-box rows (pp/tg) move, not just microbench.
+* G — Upstream speculative taxonomy (from `llama.cpp`). Ship only
+  `ngram-simple/cache` (no draft weights, pure V in `src/infer/sampler.v`,
+  arena-allocated, opt-in flag + `VLLM_*` env in `src/cfg/config.v`);
+  `EAGLE3/DFlash/DSpark` stay out (need per-target draft GGUFs that do
+  not fit the 4 GB guest). Gate: accept-rate + wall-time in
+  `tools/forward_bench.v`, greedy `temp: 0.0` bit-identical on/off,
+  host-vs-guest parity like `infer_smoke.v`.
+* H — Sparse-activation note (from `PowerInfer`). No port: hot/cold
+  predictors need ReLU-sparse models, `Qwen3 SwiGLU` is dense. Recorded
+  only as model-selection bias: prefer MoE over dense-sparse for future
+  models (same conclusion as the Nemotron note in Phase 7-E). Gate:
+  docs-only (`docs/architecture.md` one paragraph), no code.
+* I — Heterogeneous boundary (from `KTransformers`). Stays deferred:
+  CPU+GPU offload with AMX async scheduling beats pure CPU for
+  100B+ MoE, but `vinix-mini` has no GPU drivers by design
+  (`docs/architecture.md` constraints). Record the boundary so a future
+  `cpu-gpu` `Backend` has a seam (`list_backends()` + `select_backend()`).
+  Gate: docs-only, no guest code.
+* J — Ternary research note (from `BitNet.cpp`). No port in v1: 1.58-bit
+  needs trained ternary weights, no `Qwen3` GGUF exists. Keep as the
+  sub-2bpw reference point for Phase 7-C quality gates (PPL/KLD/Same-top-p).
+  Gate: docs-only.
+
+Non-goals (stay deferred): vendoring `ik_llama`/upstream diffs, CUDA/AMX
+kernels in-guest, draft-model GGUFs in the ISO, ReLU-sparse-only models,
+ternary weights, distributed/RPC inference (`exo`/`llama.cpp RPC` class).
+
 ## Deferred (deliberately out of v1)
 
 GPU / NPU drivers, multi-tenant auth + rate limits, full 32k ctx,
