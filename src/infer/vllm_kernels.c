@@ -851,23 +851,50 @@ static void vllm_q4_0_unpack(const unsigned char *qs, float *vals) {
 	}
 }
 
-void vllm_q4_0_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
+VLLM_AVX2_FN void vllm_q4_0_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
 	int rows, int cols) {
 	int bpr = cols / 32;
 #if VLLM_HAVE_SIMD
 	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
 		vllm_f16_lut_init();
-		for (int r = 0; r < rows; r++) {
-			const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
-			for (int t = 0; t < k; t++) outs[(size_t)t * rows + r] = 0.0f;
-			for (int b = 0; b < bpr; b++) {
-				const unsigned char *blk = row + (size_t)b * 18;
-				float scale = vllm_f16_le_to_f32(blk);
-				for (int t = 0; t < k; t++) {
-					const float *x = xs + (size_t)t * cols + (size_t)b * 32;
-					// Same block dot as the single-token kernel -> bit-identical
-					// logits; weights stay cached across the k tokens.
-					outs[(size_t)t * rows + r] += q4_0_block_dot_avx2(blk + 2, x) * scale;
+		__m128i m15 = _mm_set1_epi8(0x0f);
+		__m256 eight = _mm256_set1_ps(8.0f);
+		// One accumulator per token, chunked at 8 to stay in YMM registers.
+		// Weights are dequantized once per block and shared across the chunk;
+		// one horizontal sum per row per token (not per block).
+		for (int t0 = 0; t0 < k; t0 += 8) {
+			int kk = k - t0 < 8 ? k - t0 : 8;
+			for (int r = 0; r < rows; r++) {
+				__m256 acc[8];
+				for (int i = 0; i < kk; i++) acc[i] = _mm256_setzero_ps();
+				const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
+				for (int b = 0; b < bpr; b++) {
+					const unsigned char *blk = row + (size_t)b * 18;
+					__m256 sc = _mm256_set1_ps(vllm_f16_lut_get(blk));
+					__m128i q = _mm_loadu_si128((const __m128i *)(blk + 2));
+					__m128i lo = _mm_and_si128(q, m15);
+					__m128i hi = _mm_and_si128(_mm_srli_epi64(q, 4), m15);
+					__m256 f0 = _mm256_mul_ps(
+						_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), eight), sc);
+					__m256 f1 = _mm256_mul_ps(
+						_mm256_sub_ps(_mm256_cvtepi32_ps(
+							_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))), eight), sc);
+					__m256 f2 = _mm256_mul_ps(
+						_mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), eight), sc);
+					__m256 f3 = _mm256_mul_ps(
+						_mm256_sub_ps(_mm256_cvtepi32_ps(
+							_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))), eight), sc);
+					for (int i = 0; i < kk; i++) {
+						const float *x = xs + (size_t)(t0 + i) * cols + (size_t)b * 32;
+						__m256 p = _mm256_fmadd_ps(f0, _mm256_loadu_ps(x), _mm256_setzero_ps());
+						p = _mm256_fmadd_ps(f1, _mm256_loadu_ps(x + 8), p);
+						p = _mm256_fmadd_ps(f2, _mm256_loadu_ps(x + 16), p);
+						p = _mm256_fmadd_ps(f3, _mm256_loadu_ps(x + 24), p);
+						acc[i] = _mm256_add_ps(acc[i], p);
+					}
+				}
+				for (int i = 0; i < kk; i++) {
+					outs[(size_t)(t0 + i) * rows + r] = vllm_hsum_avx2(acc[i]);
 				}
 			}
 		}
@@ -890,22 +917,54 @@ void vllm_q4_0_matmul_f32(const unsigned char *data, const float *xs, float *out
 	}
 }
 
-void vllm_q4_1_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
+VLLM_AVX2_FN void vllm_q4_1_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
 	int rows, int cols) {
 	int bpr = cols / 32;
 #if VLLM_HAVE_SIMD
 	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
 		vllm_f16_lut_init();
-		for (int r = 0; r < rows; r++) {
-			const unsigned char *row = data + (size_t)r * (size_t)bpr * 20;
-			for (int t = 0; t < k; t++) outs[(size_t)t * rows + r] = 0.0f;
-			for (int b = 0; b < bpr; b++) {
-				const unsigned char *blk = row + (size_t)b * 20;
-				float scale = vllm_f16_le_to_f32(blk);
-				float min = vllm_f16_le_to_f32(blk + 2);
-				for (int t = 0; t < k; t++) {
-					const float *x = xs + (size_t)t * cols + (size_t)b * 32;
-					outs[(size_t)t * rows + r] += q4_1_block_dot_avx2(blk + 4, x, scale, min);
+		__m128i m15 = _mm_set1_epi8(0x0f);
+		for (int t0 = 0; t0 < k; t0 += 8) {
+			int kk = k - t0 < 8 ? k - t0 : 8;
+			for (int r = 0; r < rows; r++) {
+				__m256 acc[8];
+				__m256 xacc[8];
+				for (int i = 0; i < kk; i++) {
+					acc[i] = _mm256_setzero_ps();
+					xacc[i] = _mm256_setzero_ps();
+				}
+				const unsigned char *row = data + (size_t)r * (size_t)bpr * 20;
+				for (int b = 0; b < bpr; b++) {
+					const unsigned char *blk = row + (size_t)b * 20;
+					__m256 sc = _mm256_set1_ps(vllm_f16_lut_get(blk));
+					__m256 mn = _mm256_set1_ps(vllm_f16_lut_get(blk + 2));
+					__m128i q = _mm_loadu_si128((const __m128i *)(blk + 4));
+					__m128i lo = _mm_and_si128(q, m15);
+					__m128i hi = _mm_and_si128(_mm_srli_epi64(q, 4), m15);
+					__m256 f0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), sc);
+					__m256 f1 = _mm256_mul_ps(
+						_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))), sc);
+					__m256 f2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), sc);
+					__m256 f3 = _mm256_mul_ps(
+						_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))), sc);
+					for (int i = 0; i < kk; i++) {
+						const float *x = xs + (size_t)(t0 + i) * cols + (size_t)b * 32;
+						__m256 x0 = _mm256_loadu_ps(x);
+						__m256 x1 = _mm256_loadu_ps(x + 8);
+						__m256 x2 = _mm256_loadu_ps(x + 16);
+						__m256 x3 = _mm256_loadu_ps(x + 24);
+						__m256 p = _mm256_fmadd_ps(f0, x0, _mm256_setzero_ps());
+						p = _mm256_fmadd_ps(f1, x1, p);
+						p = _mm256_fmadd_ps(f2, x2, p);
+						p = _mm256_fmadd_ps(f3, x3, p);
+						acc[i] = _mm256_add_ps(acc[i], p);
+						__m256 xs4 = _mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3));
+						xacc[i] = _mm256_fmadd_ps(xs4, mn, xacc[i]);
+					}
+				}
+				for (int i = 0; i < kk; i++) {
+					outs[(size_t)(t0 + i) * rows + r] =
+						vllm_hsum_avx2(acc[i]) + vllm_hsum_avx2(xacc[i]);
 				}
 			}
 		}
@@ -936,7 +995,7 @@ void vllm_q4_1_matmul_f32(const unsigned char *data, const float *xs, float *out
 	}
 }
 
-void vllm_q6_k_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
+VLLM_AVX2_FN void vllm_q6_k_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
 	int rows, int cols) {
 	int bpr = cols / 256;
 #if VLLM_HAVE_SIMD
@@ -1015,3 +1074,4 @@ void vllm_softmax_scaled_fast_f32(float *xs, int n, float scale) {
 		xs[i] *= inv;
 	}
 }
+

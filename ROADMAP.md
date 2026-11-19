@@ -368,9 +368,13 @@ rollback on rejection, `tools/pld_bench.v`) but is **EXPERIMENTAL / opt-in**
 via `VLLM_PLD_BATCH=1`: its kernels do a horizontal sum per block per token,
 so on the probe they were ~2x slower than the row-vector single-token path,
 and their accumulation order can flip a near-tie argmax on accepted drafts.
-The default stays bit-exact serial verification. A real win needs a
-SIMD-across-k matmul (k register accumulators, one hsum per row) plus a
-batched Q6_K head — follow-up work. EAGLE3/DFlash/DSpark/MTP stay out.
+The default stays bit-exact serial verification. A SIMD-across-k matmul
+(k register accumulators, one hsum per row) was then added; it improves the
+kernels but end-to-end batching remains slower on every tested prompt (see
+`docs/perf.md`) because the draft accept rate is low — a 10-token batch is
+usually discarded at the first rejection — and the Q6_K head is still
+per-block. A win needs a higher accept rate plus a fully batched head; both
+are follow-up work. EAGLE3/DFlash/DSpark/MTP stay out.
 
 * Ship only PLD/ngram in `src/infer/sampler.v` (pure V,
   arena-allocated, opt-in flag + `VLLM_*` env in `src/cfg/config.v`).

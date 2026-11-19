@@ -176,11 +176,17 @@ the same forwards as plain decoding. `tools/pld_bench.v` on the code-edit
 probe (Qwen3-0.6B-Q4_0, `VLLM_THREADS=1`, loaded host): plain 6496 ms vs PLD
 6591 ms with **identical text** — correctness gate green, no speedup.
 
-The shared-weight batched verifier (`VLLM_PLD_BATCH=1`) is experimental: its
-per-block horizontal sums made the same probe ~14166 ms (~2x slower) and a
-near-tie argmax flipped on accepted drafts (text diverged). It is opt-in and
-never the default. A real win needs a SIMD-across-k matmul (k register
-accumulators, one hsum per row) plus a batched Q6_K head; that work remains.
+The shared-weight batched verifier (`VLLM_PLD_BATCH=1`) is experimental and
+never the default. A first version used a per-block horizontal sum per token
+(~14166 ms); replacing it with SIMD-across-k accumulation (k register
+accumulators, one hsum per row, chunked at 8) improved the kernels but the
+end-to-end path is still slower on every tested prompt: ~15815 ms on the
+code-edit probe and ~5792 ms on a deliberately repetitive "hello world"
+prompt (vs ~9458 / ~3396 ms plain). Two causes: draft accept rate is low, so
+a 10-token batch is usually thrown away after the first rejection, and the
+Q6_K head still uses per-block dots. Text can also diverge on accepted drafts
+from f32 reassociation. A win needs both a higher accept rate and a fully
+batched head; neither is claimed here.
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
