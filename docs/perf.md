@@ -118,6 +118,13 @@ How the wins happened, in order:
     vocab microbench 91-94 ms vs 85-94 pre-change (overlapping, no win),
     so the tree keeps the original structure. No V changes — same ABI,
     scalar mirrors untouched.
+    Gate-out (2026-11-19): caching resolved layer tensor views at ctx
+    creation was profiled and rejected — 112 `find` calls (4 names x 28
+    layers) cost ~86 us/token against ~48-150 ms decode (<1%; full
+    `layer_tensors` overhead with `f32_row` decodes stays sub-ms). The
+    per-token `find` + slice path stays; the remaining decode gap is
+    dequant compute (kernels run ~7-8x over the ~37 GB/s memory wall),
+    which is what layout-level packing targets — not lookup overhead.
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
