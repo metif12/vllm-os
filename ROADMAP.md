@@ -265,6 +265,62 @@ ISO + real chat asserts, artifacts kept as serial logs); perf-CI numbers
 land since 2026-11-18 (`docs/perf.md` CI section auto-updated, runners
 vary so rows track regressions only).
 
+## Phase 7 — llama-modchip takeaways (planned, 2026-11-19)
+
+Source: `synchopate/llama-modchip v3.0` (`llama.cpp @ de32b268c` +
+`patches/llama-modchip-v3.0.patch`, CLI `modchip` / `install.sh` /
+`scripts/`, `ARCHITECTURE.md`). Rule: ideas only, nothing vendored —
+no C++/OpenMP, no Metal/CUDA/Vulkan shaders, no 13–58 GiB weights in
+the image. Every item keeps `-gc none`, freestanding-safe kernels, and
+`tools/`-only VTL/VSL. License check before copying any C from
+`patches/` (vllm-os is Apache-2.0; record provenance per file).
+
+* A — Non-convoy threading. Adopt `threads = phys_cores - 1`,
+  one core reserved for the accept loop (`src/api/server.v`), no
+  oversubscription, `--poll`-style busy-poll off; then a persistent
+  pool to replace spawn-per-call (`src/infer/parallel.v`,
+  `cpu-parallel` backend in `src/infer/backend.v`). modchip reports
+  +25.9% pp / +31.3% tg from this fix alone. Gate: `tools/forward_bench.v`
+  threaded vs serial improves on the same box, `parallel_test.v` +
+  `bench_test.v` green, guest stays pinned serial under
+  `VLLM_THREADS=1`.
+* B — Draftless speculation. Port the idea of `Stockfish-PVS v2` /
+  `RouteCrack ngram-simple 3x3` (modchip: 1.67–1.87x cold, 11–14 tok/s)
+  as an opt-in ngram drafter in `src/infer/sampler.v` (pure V, no
+  extra weights, arena-allocated); built-in MTP stays out (needs
+  `blk.48`-style weights we do not ship). Gate: accept-rate metric in
+  `forward_bench`, greedy `temp: 0.0` output bit-identical with
+  speculation on/off (`in-hw vs host` parity like `infer_smoke.v`).
+* C — Low-bit quants + quality gates. Add `Q2_0` signed-scale dequant
+  + fused AVX2 matvec next (`src/infer/quant.v` + `vllm_kernels.{h,c}` +
+  `simd_c.v`, runtime-dispatched, `VLLM_NO_SIMD=1` fallback); `Fractal-64`
+  (type 44, 3.75 bpw) / `VQ3-64` (type 45, 3.0 bpw) only via the
+  `ContainerHandler` registry (`src/formats/`, `docs/formats.md`)
+  if a model needs them — never as a second native path. Adopt the
+  modchip gate trio: blind `wiki-alt` PPL + KLD + Same-top-p plus
+  cgroup `VmHWM` enforcement for the guest RAM budget. Gate: real-weight
+  maxdiff inside the 1e-3 band, `vtl_parity_test` style parity,
+  `docs/perf.md` rows updated (same box only).
+* D — Memory/VM. `madvise(MADV_HUGEPAGE)` inward-aligned to 2 MiB for
+  the boot-cached blob (`Model.blob`), `_MM_HINT_NTA`-style streaming
+  for weight sweeps vs L3-resident KV, keep 3D/MoE tensors zero-copy
+  mmap-backed; host-side `/dev/shm` Slot-0 KV snapshot/restore as a
+  `tools/` experiment (modchip: ~38 ms vs ~6 s prefill). Gate: same
+  greedy tokens, measured wall-time win on `chat8`, no `mmap`/THP
+  dependency in the freestanding path.
+* E — Long context. Opt-in sliding-window attention + sinks
+  (`LLAMA_ATTN_WINDOW`-style knob in `src/cfg/config.v` +
+  `src/infer/attention.v`, default exact full attention); hybrid
+  SSM/Mamba-style models stay a research note (modchip/Nemotron:
+  6 GQA layers = 1.7 KB/token vs 27 KB/token dense — the reason for
+  our 4k cap in `docs/architecture.md`). Gate: attention-scaling probe
+  (`n=512/4096` head-step) recorded in `docs/perf.md`, 4k default
+  unchanged until a ≥16 GB guest exists.
+
+Non-goals (stay deferred): whole patched `llama.cpp`, `GLIBC<=2.30`
+portable binary, GPU backends, `*-ablit` weights, `sse_gateway.py` in
+the guest (host-side proxy only), 30B/284B weights.
+
 ## Deferred (deliberately out of v1)
 
 GPU / NPU drivers, multi-tenant auth + rate limits, full 32k ctx,
