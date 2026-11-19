@@ -1,5 +1,9 @@
-# vllm-os roadmap — Qwen3-1.7B on trimmed Vinix
+# vllm-os roadmap — portable V CPU inference core + thin appliance builder
 
+Goal (redefined 2026-11-19): a portable CPU inference core in V
+(`src/infer`, freestanding-safe, `-gc none`) plus a thin appliance
+builder that bakes it into a bootable OpenAI-compat image. The v1
+reference appliance serves Qwen3-1.7B; the core is model-agnostic.
 Each phase has an exit gate. Do not start the next phase until the gate is green.
 
 ## Phase 0 — Host skeleton (done ✅)
@@ -265,167 +269,117 @@ ISO + real chat asserts, artifacts kept as serial logs); perf-CI numbers
 land since 2026-11-18 (`docs/perf.md` CI section auto-updated, runners
 vary so rows track regressions only).
 
-## Phase 7 — llama-modchip takeaways (planned, 2026-11-19)
+## Phase 7 — fast core (planned, 2026-11-19)
 
-Source: `synchopate/llama-modchip v3.0` (`llama.cpp @ de32b268c` +
-`patches/llama-modchip-v3.0.patch`, CLI `modchip` / `install.sh` /
-`scripts/`, `ARCHITECTURE.md`). Rule: ideas only, nothing vendored —
-no C++/OpenMP, no Metal/CUDA/Vulkan shaders, no 13–58 GiB weights in
-the image. Every item keeps `-gc none`, freestanding-safe kernels, and
-`tools/`-only VTL/VSL. License check before copying any C from
-`patches/` (vllm-os is Apache-2.0; record provenance per file).
+Goal: close the ~3x gap to `llama.cpp` on the same file/box (ours
+~48-50 ms/token threaded vs ~16 ms, `docs/perf.md`). Engine work first,
+everything else after.
 
-* A — Non-convoy threading. Adopt `threads = phys_cores - 1`,
-  one core reserved for the accept loop (`src/api/server.v`), no
-  oversubscription, `--poll`-style busy-poll off; then a persistent
-  pool to replace spawn-per-call (`src/infer/parallel.v`,
-  `cpu-parallel` backend in `src/infer/backend.v`). modchip reports
-  +25.9% pp / +31.3% tg from this fix alone. Gate: `tools/forward_bench.v`
-  threaded vs serial improves on the same box, `parallel_test.v` +
-  `bench_test.v` green, guest stays pinned serial under
-  `VLLM_THREADS=1`.
-* B — Draftless speculation. Port the idea of `Stockfish-PVS v2` /
-  `RouteCrack ngram-simple 3x3` (modchip: 1.67–1.87x cold, 11–14 tok/s)
-  as an opt-in ngram drafter in `src/infer/sampler.v` (pure V, no
-  extra weights, arena-allocated); built-in MTP stays out (needs
-  `blk.48`-style weights we do not ship). Gate: accept-rate metric in
-  `forward_bench`, greedy `temp: 0.0` output bit-identical with
-  speculation on/off (`in-hw vs host` parity like `infer_smoke.v`).
-* C — Low-bit quants + quality gates. Add `Q2_0` signed-scale dequant
-  + fused AVX2 matvec next (`src/infer/quant.v` + `vllm_kernels.{h,c}` +
-  `simd_c.v`, runtime-dispatched, `VLLM_NO_SIMD=1` fallback); `Fractal-64`
-  (type 44, 3.75 bpw) / `VQ3-64` (type 45, 3.0 bpw) only via the
-  `ContainerHandler` registry (`src/formats/`, `docs/formats.md`)
-  if a model needs them — never as a second native path. Adopt the
-  modchip gate trio: blind `wiki-alt` PPL + KLD + Same-top-p plus
-  cgroup `VmHWM` enforcement for the guest RAM budget. Gate: real-weight
-  maxdiff inside the 1e-3 band, `vtl_parity_test` style parity,
-  `docs/perf.md` rows updated (same box only).
-* D — Memory/VM. `madvise(MADV_HUGEPAGE)` inward-aligned to 2 MiB for
-  the boot-cached blob (`Model.blob`), `_MM_HINT_NTA`-style streaming
-  for weight sweeps vs L3-resident KV, keep 3D/MoE tensors zero-copy
-  mmap-backed; host-side `/dev/shm` Slot-0 KV snapshot/restore as a
-  `tools/` experiment (modchip: ~38 ms vs ~6 s prefill). Gate: same
-  greedy tokens, measured wall-time win on `chat8`, no `mmap`/THP
-  dependency in the freestanding path.
-* E — Long context. Opt-in sliding-window attention + sinks
+Sources: `synchopate/llama-modchip v3.0` (non-convoy threading),
+`ikawrakow/ik_llama.cpp` (IQK + row-interleaved repack), `karpathy/llm.c`
+(single-file dependency-free C as the style bar). Rule: ideas only,
+nothing vendored; `-gc none` + freestanding-safe + `tools/`-only VTL/VSL;
+license/provenance check before copying any C (Apache-2.0).
+
+* Threads + pool. `threads = phys_cores - 1`, one core reserved for the
+  accept loop (`src/api/server.v`), no oversubscription, no busy-poll;
+  then a persistent pool replacing spawn-per-call (`src/infer/parallel.v`,
+  `cpu-parallel` in `src/infer/backend.v`). Reference: modchip +25.9% pp
+  / +31.3% tg from this fix alone; `llm.c` uses `OMP_NUM_THREADS`.
+* Quants. `IQ4_NL` first, then `Q2_0` signed-scale (+ `Q2_0_R8` repack
+  variant) — standard types over modchip custom 44/45. Dequant + fused
+  AVX2 matvec in `src/infer/quant.v` + `vllm_kernels.{h,c}` + `simd_c.v`
+  (runtime-dispatched, `VLLM_NO_SIMD=1` fallback); repack as a load-time
+  layout behind `Backend`, never a second math path. Heed the `ik`
+  `-rtr` warning: repack only tensors the CPU really runs. Style bar:
+  `llm.c` — one file, explicit loops, software f16 (we already do), no
+  hidden allocator, no new dependency in any kernel PR.
+* Quality gates. Blind `wiki-alt` PPL + KLD + Same-top-p plus cgroup
+  `VmHWM` enforcement for the guest RAM budget (from modchip).
+* Gate: real-weight maxdiff in 1e-3 band, `quant`/`simd`/`parallel`/
+  `bench` tests green, `tools/forward_bench.v` threaded vs serial
+  improves on the same box, `docs/perf.md` rows move (same box only),
+  guest stays pinned serial under `VLLM_THREADS=1`.
+
+## Phase 8 — cheap speculation (planned, 2026-11-19)
+
+Goal: draftless decode speedup with zero extra weights.
+
+Sources: modchip `Stockfish-PVS v2` / `RouteCrack ngram-simple`
+(1.67–1.87x cold), `llama.cpp docs/speculative.md` taxonomy,
+`apoorvumang/prompt-lookup-decoding` (validated ~2.4x on
+input-grounded tasks; now in HF transformers as
+`prompt_lookup_num_tokens` and vLLM as `speculative_model="[ngram]"`).
+
+* Ship only PLD/ngram in `src/infer/sampler.v` (pure V,
+  arena-allocated, opt-in flag + `VLLM_*` env in `src/cfg/config.v`).
+  Start from validated hyperparams: `max_ngram_size = 3`, continuation
+  10, match over prompt + own output (turn-2 code editing is our best
+  case). `EAGLE3/DFlash/DSpark`/built-in MTP stay out (need per-target
+  draft weights or `blk.48`-style weights that do not fit the 4 GB guest).
+* Gate: accept-rate + wall-time in `tools/forward_bench.v` on a code-edit
+  prompt, greedy `temp: 0.0` bit-identical on/off, host-vs-guest parity
+  like `infer_smoke.v`.
+
+## Phase 9 — serve path (planned, 2026-11-19)
+
+Goal: attack the measured prefill-bound serve wall (`chat8` ~1.5 s,
+ChatML prompt ~1.2 s of it).
+
+Sources: `EricLBuehler/mistral.rs` (prefix caching, chunked prefill,
+ISQ, hardware-aware `tune`), modchip (THP/NTA/`/dev/shm` snapshot),
+`intel/ipex-llm` mmap side-channel warning (ARCHIVED project — never a
+dependency).
+
+* Prefix caching (reuse prompt KV across turns) + chunked prefill
+  (bound per-request prefill work) in the serve path; ISQ (in-situ
+  quantization on load) host-side only, e.g. in the
+  `scripts/fetch_model.sh` flow, never in the guest. Paged attention
+  stays a research note (our flat arena in `src/infer/attention.v` is
+  simpler and already request-sized).
+* Hardware-aware `--tune` host flag (print recommended
+  backend/threads/quant from detected CPU, like `mistralrs tune`).
+* Memory/VM experiment (`tools/` only): `madvise(MADV_HUGEPAGE)`
+  inward-aligned to 2 MiB for `Model.blob`, `_MM_HINT_NTA`-style
+  streaming for weight sweeps vs L3-resident KV, host-side `/dev/shm`
+  Slot-0 snapshot/restore (modchip: ~38 ms vs ~6 s prefill). No
+  `mmap`/THP dependency in the freestanding path.
+* Record in `docs/security.md`: our mmap'd `Model.blob` is safe only
+  because the appliance is single-tenant by design.
+* Gate per item: same greedy tokens, measured wall-time win on `chat8`,
+  `vllm.example.json` + `docs/configuration.md` row for any new knob.
+
+## Phase 10 — long memory (planned, 2026-11-19)
+
+Goal: raise the 4k context ceiling without breaking the 4 GB guest.
+
+Sources: modchip/Nemotron (6 GQA layers = 1.7 KB/token vs 27 KB/token
+dense — the reason for our 4k cap), `LLAMA_ATTN_WINDOW`-style SWA;
+docs-only boundaries: `Tiiny-AI/PowerInfer(-2)` (hot/cold needs
+ReLU-sparse models; `Qwen3 SwiGLU` is dense — model-selection bias
+toward MoE only), `kvcache-ai/KTransformers` (CPU+GPU offload needs
+GPU drivers `vinix-mini` does not have — seam stays
+`list_backends()`/`select_backend()`), `mlc-ai/mlc-llm` (TVM needs a
+compiler runtime no freestanding guest can host — rejected with reason),
+`microsoft/BitNet.cpp` (1.58-bit needs trained ternary weights; keep as
+the sub-2bpw reference for the Phase 7 quality gates).
+
+* Code: opt-in sliding-window attention + sinks
   (`LLAMA_ATTN_WINDOW`-style knob in `src/cfg/config.v` +
-  `src/infer/attention.v`, default exact full attention); hybrid
-  SSM/Mamba-style models stay a research note (modchip/Nemotron:
-  6 GQA layers = 1.7 KB/token vs 27 KB/token dense — the reason for
-  our 4k cap in `docs/architecture.md`). Gate: attention-scaling probe
-  (`n=512/4096` head-step) recorded in `docs/perf.md`, 4k default
-  unchanged until a ≥16 GB guest exists.
+  `src/infer/attention.v`, default exact full attention).
+* Gate: attention-scaling probe (`n=512/4096` head-step) recorded in
+  `docs/perf.md`; 4k default unchanged until a ≥16 GB guest exists.
+  Everything else in this phase is docs-only (`docs/architecture.md`
+  paragraph each), no guest code.
 
-Non-goals (stay deferred): whole patched `llama.cpp`, `GLIBC<=2.30`
-portable binary, GPU backends, `*-ablit` weights, `sse_gateway.py` in
-the guest (host-side proxy only), 30B/284B weights.
-
-## Phase 8 — similar-engine takeaways (planned, 2026-11-19)
-
-Sources: `ikawrakow/ik_llama.cpp` (IQK + repack + MLA/GDN, late-2026
-diverged), `ggml-org/llama.cpp docs/speculative.md` (draft/EAGLE/DFlash/
-ngram taxonomy), `Tiiny-AI/PowerInfer(-2)` (hot/cold sparse activation),
-`kvcache-ai/KTransformers` (CPU+GPU heterogeneous MoE, AMX),
-`microsoft/BitNet.cpp` (ternary 1.58-bit kernels). Same rule as Phase 7:
-ideas only, nothing vendored; `-gc none` + freestanding-safe + `tools/`-only
-VTL/VSL stay. License/provenance check before copying any C.
-
-* F — IQK + row-interleaved repack (from `ik_llama`). Prefer standard
-  `IQ4_NL` (+ `Q2_0_R8` repack variant) over custom types 44/45: add
-  `IQ4_NL` dequant + fused AVX2 matvec in `src/infer/quant.v` +
-  `vllm_kernels.{h,c}` + `simd_c.v` (runtime-dispatched,
-  `VLLM_NO_SIMD=1` fallback), repack as a load-time layout behind
-  `Backend` (`src/infer/backend.v`), never a second math path. Note
-  the `ik` `-rtr` warning: repack only tensors the CPU really runs.
-  Gate: real-weight maxdiff in 1e-3 band, `quant`/`simd`/`bench` tests
-  green, `docs/perf.md` same-box rows (pp/tg) move, not just microbench.
-* G — Upstream speculative taxonomy (from `llama.cpp`). Ship only
-  `ngram-simple/cache` (no draft weights, pure V in `src/infer/sampler.v`,
-  arena-allocated, opt-in flag + `VLLM_*` env in `src/cfg/config.v`);
-  `EAGLE3/DFlash/DSpark` stay out (need per-target draft GGUFs that do
-  not fit the 4 GB guest). Gate: accept-rate + wall-time in
-  `tools/forward_bench.v`, greedy `temp: 0.0` bit-identical on/off,
-  host-vs-guest parity like `infer_smoke.v`.
-* H — Sparse-activation note (from `PowerInfer`). No port: hot/cold
-  predictors need ReLU-sparse models, `Qwen3 SwiGLU` is dense. Recorded
-  only as model-selection bias: prefer MoE over dense-sparse for future
-  models (same conclusion as the Nemotron note in Phase 7-E). Gate:
-  docs-only (`docs/architecture.md` one paragraph), no code.
-* I — Heterogeneous boundary (from `KTransformers`). Stays deferred:
-  CPU+GPU offload with AMX async scheduling beats pure CPU for
-  100B+ MoE, but `vinix-mini` has no GPU drivers by design
-  (`docs/architecture.md` constraints). Record the boundary so a future
-  `cpu-gpu` `Backend` has a seam (`list_backends()` + `select_backend()`).
-  Gate: docs-only, no guest code.
-* J — Ternary research note (from `BitNet.cpp`). No port in v1: 1.58-bit
-  needs trained ternary weights, no `Qwen3` GGUF exists. Keep as the
-  sub-2bpw reference point for Phase 7-C quality gates (PPL/KLD/Same-top-p).
-  Gate: docs-only.
-
-Non-goals (stay deferred): vendoring `ik_llama`/upstream diffs, CUDA/AMX
-kernels in-guest, draft-model GGUFs in the ISO, ReLU-sparse-only models,
-ternary weights, distributed/RPC inference (`exo`/`llama.cpp RPC` class).
-
-## Phase 9 — second-wave takeaways (planned, 2026-11-19)
-
-Sources: `apoorvumang/prompt-lookup-decoding` (PLD, now in HF
-transformers as `prompt_lookup_num_tokens` + in vLLM as
-`speculative_model="[ngram]"`), `EricLBuehler/mistral.rs` (Rust engine:
-ISQ, paged attention, prefix caching, chunked prefill, auto-detect),
-`intel/ipex-llm` (ARCHIVED by Intel — known security issues, no fixes;
-ideas only, never a dependency), `mlc-ai/mlc-llm` (TVM compiler engine),
-`karpathy/llm.c` (pure C/CUDA reference, ~1000-line CPU fp32 in one
-file). Same rule as Phase 7/8: ideas only, `-gc none` + freestanding-safe
-+ `tools/`-only VTL/VSL stay.
-
-* K — PLD parameters for Phase 7-B/8-G (from `prompt-lookup-decoding`).
-  Validated numbers: ~2.4x on input-grounded tasks (summarization,
-  context-QA), smaller on first-turn chat; never slower than greedy in
-  their runs. Start from their hyperparams: `max_ngram_size = 3`,
-  continuation length 10, match over prompt + own output (turn-2 code
-  editing is our best case). Implement in `src/infer/sampler.v` (pure V,
-  arena-allocated, opt-in). Gate: accept-rate + wall-time in
-  `tools/forward_bench.v` on a code-edit prompt, greedy `temp: 0.0`
-  bit-identical on/off.
-* L — Serve-path trio (from `mistral.rs`). Three ideas that attack our
-  measured prefill-bound serve wall (`chat8` ~1.5 s, ChatML prompt ~1.2 s):
-  prefix caching (reuse prompt KV across turns), chunked prefill (bound
-  per-request prefill work), ISQ — in-situ quantization on load
-  (host-side only, e.g. in `scripts/fetch_model.sh` flow, never in the
-  guest). Paged attention stays a research note (our flat arena in
-  `src/infer/attention.v` is simpler and already request-sized). Also
-  adoptable: hardware-aware `tune` (print recommended
-  backend/threads/quant from detected CPU, like `mistralrs tune`) as a
-  `--tune` host flag. Gate per item: same greedy tokens, wall-time win
-  on `chat8`, `vllm.example.json` + `docs/configuration.md` row for any
-  new knob.
-* M — IPEX-LLM boundary (ARCHIVED — never depend). Takeaways only:
-  low-bit CPU path (INT4/FP8/FP6/FP4), self-speculative decoding (~30%
-  reported on CPU), FlashMoE for 671B-class on small GPUs; plus their
-  mmap side-channel warning (`--no-mmap` for multi-tenant) — record in
-  `docs/security.md` that our mmap'd `Model.blob` is safe only because
-  the appliance is single-tenant by design. Gate: docs-only.
-* N — Compiler-vs-handkernels (from `mlc-ai/mlc-llm`). TVM compiles one
-  source to CPU/CUDA/Metal/Vulkan/WebGPU with an OpenAI-compat server on
-  every target — the portability ideal — but it needs a compiler runtime
-  no freestanding guest can host. Rejected for the token loop with
-  reason; keep hand-written `vllm_kernels.c` (style precedent: `llm.c`
-  below). Host-side autotuning stays an open question for `tools/`.
-  Gate: docs-only.
-* O — Single-file C precedent (from `karpathy/llm.c`). `train_gpt2.c`
-  proves a whole fp32 transformer fits in ~1000 clean dependency-free C
-  lines with `OMP_NUM_THREADS` threading — the same shape as our
-  `vllm_kernels.{h,c}` (no libm/libc in the loop, OMP optional). Use as
-  the style bar for every new kernel in Phase 7/8: one file, explicit
-  loops, software f16 (we already do), no hidden allocator. Gate:
-  review checklist, no new dependency in any kernel PR.
-
-Non-goals (stay deferred): draft-model weights (EAGLE/DFlash class),
-GPU/NPU runtimes, TVM/compiler toolchain in the image, training code,
-multi-tenant mmap exposure.
+Non-goals (stay deferred): vendored `llama.cpp`/`ik_llama` diffs,
+modchip custom types 44/45, draft-model GGUFs, GPU/NPU runtimes,
+TVM/compiler toolchain in the image, training code, ternary weights,
+ReLU-sparse-only models, distributed/RPC inference, multi-tenant mmap
+exposure. Supersedes the Phase 7 A–E / Phase 8 F–J / Phase 9 K–O
+itemization (same content, execution order).
 
 ## Deferred (deliberately out of v1)
 
 GPU / NPU drivers, multi-tenant auth + rate limits, full 32k ctx,
-quant servers beyond Q4_K_M/Q8_0, ARM64 bare metal, OTA updates.
+quant servers beyond IQ4_NL/Q2_0 (Phase 7), ARM64 bare metal, OTA updates.
