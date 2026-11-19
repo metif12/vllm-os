@@ -61,6 +61,9 @@ pub enum GgmlType as u32 {
 	f64     = 28
 	iq1_m   = 29
 	bf16    = 30
+	// 31-33 were Q4_0_4_4/4_8/8_8 (removed from GGUF); 34 TQ1_0, 35 TQ2_0,
+	// 36-38 IQ4_NL repacks (removed), 39 MXFP4, 40 NVFP4, 41 Q1_0.
+	q2_0 = 42
 }
 
 pub struct GgufMeta {
@@ -390,6 +393,7 @@ fn ggml_type_size(t GgmlType) u64 {
 		.q8_0, .q8_1 { return 1 }
 		.q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k { return 1 }
 		.iq4_nl { return 1 } // 18 bytes / 32 elems; exact math below
+		.q2_0 { return 1 } // 18 bytes / 64 elems; exact math below
 		.i8 { return 1 }
 		.i16 { return 2 }
 		.i32 { return 4 }
@@ -421,6 +425,10 @@ fn ggml_tensor_bytes(t GgmlType, n u64) u64 {
 	if t == .q6_k {
 		blocks := (n + 255) / 256
 		return blocks * 210
+	}
+	if t == .q2_0 {
+		blocks := (n + 63) / 64
+		return blocks * 18
 	}
 	return ggml_type_size(t) * n
 }

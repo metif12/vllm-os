@@ -72,6 +72,8 @@ pub fn embed_gather(blob []u8, gguf GgufModel, dim int, id int, mut out []f32) !
 		embed_gather_q6_k(data, dim, id, mut out)
 	} else if info.typ == .iq4_nl {
 		embed_gather_iq4_nl(data, dim, id, mut out)
+	} else if info.typ == .q2_0 {
+		embed_gather_q2_0(data, dim, id, mut out)
 	} else {
 		embed_gather_i8(data, dim, id, mut out)
 	}
@@ -334,6 +336,8 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 		q6_k_matvec_parallel_pool(f.pool, emb, f.logits.len, h, f.normed, mut f.logits)
 	} else if emb_info.typ == .iq4_nl {
 		iq4_nl_matvec_parallel_pool(f.pool, emb, f.logits.len, h, f.normed, mut f.logits)
+	} else if emb_info.typ == .q2_0 {
+		q2_0_matvec_parallel_pool(f.pool, emb, f.logits.len, h, f.normed, mut f.logits)
 	} else {
 		i8_matvec(emb, f.logits.len, h, f.normed, mut f.logits)
 	}

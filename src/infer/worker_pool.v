@@ -27,6 +27,7 @@ enum PoolJobKind {
 	matvec_range // f32 row-block: matvec_c_range
 	q6k_range    // Q6_K row-block: q6_k_matvec_c_range
 	iq4_nl_range // IQ4_NL row-block: iq4_nl_matvec_c_range
+	q2_0_range   // Q2_0 row-block: q2_0_matvec_c_range
 	q4_0_full    // whole Q4_0 matrix: q4_0_matvec_c
 }
 
@@ -89,6 +90,9 @@ fn pool_worker(p &WorkerPool, id int) {
 			.iq4_nl_range {
 				iq4_nl_matvec_c_range(job.data, job.rows, job.cols, job.x, job.r0, job.n, mut
 					job.out)
+			}
+			.q2_0_range {
+				q2_0_matvec_c_range(job.data, job.rows, job.cols, job.x, job.r0, job.n, mut job.out)
 			}
 			.q4_0_full {
 				q4_0_matvec_c(job.data, job.rows, job.cols, job.x, mut job.out)

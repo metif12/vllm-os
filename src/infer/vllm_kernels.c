@@ -540,6 +540,72 @@ void vllm_iq4_nl_matvec_f32(const unsigned char *data, const float *x, float *ou
 	}
 }
 
+// --- Q2_0 (signed-scale 2-bit) -------------------------------------------
+// One 64-elem block dot. The 2-bit codes are expanded into a small local
+// stack buffer (one f32 per element, no caller-visible materialization),
+// then the dot runs as eight AVX2 FMAs. The scalar mirror stays bit-close
+// to infer.q2_0_dot_row.
+#if VLLM_HAVE_SIMD
+static VLLM_AVX2_FN float q2_0_block_dot_avx2(const unsigned char *qs, const float *x) {
+	float vals[64];
+	for (int b = 0; b < 16; b++) {
+		unsigned char q = qs[b];
+		vals[4*b + 0] = (float)((int)((q >> 0) & 3) - 1);
+		vals[4*b + 1] = (float)((int)((q >> 2) & 3) - 1);
+		vals[4*b + 2] = (float)((int)((q >> 4) & 3) - 1);
+		vals[4*b + 3] = (float)((int)((q >> 6) & 3) - 1);
+	}
+	__m256 acc = _mm256_setzero_ps();
+	for (int i = 0; i < 64; i += 8) {
+		acc = _mm256_fmadd_ps(_mm256_loadu_ps(vals + i), _mm256_loadu_ps(x + i), acc);
+	}
+	return vllm_hsum_avx2(acc);
+}
+#endif
+
+float vllm_q2_0_dot_f32(const unsigned char *qs, const float *x, float scale, int n) {
+#if VLLM_HAVE_SIMD
+	if (n == 64 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		return q2_0_block_dot_avx2(qs, x) * scale;
+	}
+#endif
+	float s = 0.0f;
+	for (int j = 0; j < n; j++) {
+		int code = (int)((qs[j / 4] >> ((j % 4) * 2)) & 3);
+		s += (float)(code - 1) * x[j];
+	}
+	return s * scale;
+}
+
+void vllm_q2_0_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
+	int cols) {
+	int bpr = cols / 64;
+#if VLLM_HAVE_SIMD
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		vllm_f16_lut_init();
+		for (int r = 0; r < rows; r++) {
+			float s = 0.0f;
+			const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
+			for (int b = 0; b < bpr; b++) {
+				const unsigned char *blk = row + (size_t)b * 18;
+				s += q2_0_block_dot_avx2(blk + 2, x + (size_t)b * 64) * vllm_f16_le_to_f32(blk);
+			}
+			out[r] = s;
+		}
+		return;
+	}
+#endif
+	for (int r = 0; r < rows; r++) {
+		float s = 0.0f;
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 18;
+			s += vllm_q2_0_dot_f32(blk + 2, x + (size_t)b * 64, vllm_f16_le_to_f32(blk), 64);
+		}
+		out[r] = s;
+	}
+}
+
 #if VLLM_HAVE_SIMD
 // One 32-elem split-half Q4_1 block dot (no scale/min applied by caller
 // confusion -- applied here): byte i holds q[i] (low nibble, 0..15) and

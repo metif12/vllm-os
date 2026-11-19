@@ -429,3 +429,146 @@ pub fn embed_gather_iq4_nl(data []u8, dim int, id int, mut out []f32) {
 		dequant_iq4_nl_row(block_iq4_nl_at(data, base + b), mut seg)
 	}
 }
+
+// --- Q2_0: signed-scale 2-bit (phase 7) ----------------------------------
+//
+// GGML `block_q2_0` (ggml-common.h): f16 `d` + 16 bytes holding 64 2-bit
+// codes = 18 bytes / 64 values. Element j uses bits (j%4)*2 of byte j/4.
+// Dequant is `(code - 1) * d` with code in {0,1,2,3} -> {-1,0,+1,+2}
+// (ggml-quants.c `dequantize_row_q2_0`). GGML type id 42.
+
+pub const qk2_0 = 64
+pub const q2_0_block_bytes = 18
+
+pub struct BlockQ20 {
+pub:
+	d  u16    // f16 scale bits
+	qs [16]u8 // 64 two-bit codes (4 per byte)
+}
+
+@[direct_array_access]
+pub fn block_q2_0_at(data []u8, blk int) BlockQ20 {
+	off := blk * q2_0_block_bytes
+	mut qs := [16]u8{}
+	for i in 0 .. 16 {
+		qs[i] = data[off + 2 + i]
+	}
+	return BlockQ20{
+		d:  u16(data[off]) | (u16(data[off + 1]) << 8)
+		qs: qs
+	}
+}
+
+// q2_0_code returns element j's 2-bit code from a block.
+@[direct_array_access]
+pub fn q2_0_code(block BlockQ20, j int) int {
+	return int((block.qs[j / 4] >> u8((j % 4) * 2)) & 0x03)
+}
+
+// dequant_q2_0_row decodes one 64-elem block into out[0..64].
+@[direct_array_access]
+pub fn dequant_q2_0_row(block BlockQ20, mut out []f32) {
+	d := f16bits_to_f32(block.d)
+	for j in 0 .. qk2_0 {
+		out[j] = f32(q2_0_code(block, j) - 1) * d
+	}
+}
+
+// q2_0_dot_row fuses dot(dequant(q_row), x) without materializing the row.
+@[direct_array_access]
+pub fn q2_0_dot_row(block BlockQ20, x []f32, x_off int) f32 {
+	d := f16bits_to_f32(block.d)
+	mut s := f32(0)
+	for j in 0 .. qk2_0 {
+		s += f32(q2_0_code(block, j) - 1) * x[x_off + j]
+	}
+	return s * d
+}
+
+// q2_0_matvec computes out = W*x for a Q2_0 row-major [rows x cols] matrix
+// (cols must divide 64). Scalar reference for the dispatched kernel.
+@[direct_array_access]
+pub fn q2_0_matvec(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	bpr := cols / qk2_0
+	for r in 0 .. rows {
+		mut s := f32(0)
+		base := r * bpr
+		for b in 0 .. bpr {
+			s += q2_0_dot_row(block_q2_0_at(data, base + b), x, b * qk2_0)
+		}
+		out[r] = s
+	}
+}
+
+// embed_gather_q2_0 decodes row id of a Q2_0 [vocab x dim] matrix into f32.
+@[direct_array_access]
+pub fn embed_gather_q2_0(data []u8, dim int, id int, mut out []f32) {
+	bpr := dim / qk2_0
+	base := id * bpr
+	for b in 0 .. bpr {
+		mut seg := unsafe { out[b * qk2_0..(b + 1) * qk2_0] }
+		dequant_q2_0_row(block_q2_0_at(data, base + b), mut seg)
+	}
+}
+
+// --- Q2_0_R8: load-time repack (phase 7) ---------------------------------
+//
+// "R8" expands each 2-bit code into one signed int8 in {-1,0,+1,+2}, so the
+// dot becomes a plain int8 dot — the SAME math as the existing Q8_0 path,
+// not a second kernel family. The repack is a host-side, load-time layout
+// decision (never in the token loop); the guest keeps native Q2_0. Repack
+// only tensors the CPU actually runs (the ik `-rtr` warning): callers choose
+// which blobs to expand, this function just converts blocks they hand it.
+//
+// Repacked block: f16 d (2 bytes) + 64 signed bytes = 66 bytes.
+
+pub const q2_0_r8_block_bytes = 66
+
+// repack_q2_0_r8 converts `blocks` native Q2_0 blocks into the R8 layout.
+// Allocates once at load time; the returned blob is owned by the caller.
+@[direct_array_access]
+pub fn repack_q2_0_r8(src []u8, blocks int) []u8 {
+	mut out := []u8{len: blocks * q2_0_r8_block_bytes}
+	for b in 0 .. blocks {
+		src_off := b * q2_0_block_bytes
+		dst_off := b * q2_0_r8_block_bytes
+		out[dst_off] = src[src_off]
+		out[dst_off + 1] = src[src_off + 1]
+		for j in 0 .. qk2_0 {
+			code := int((src[src_off + 2 + j / 4] >> u8((j % 4) * 2)) & 0x03) - 1
+			out[dst_off + 2 + j] = u8(i8(code))
+		}
+	}
+	return out
+}
+
+fn q2_0_r8_scale(data []u8, blk int) f32 {
+	off := blk * q2_0_r8_block_bytes
+	return f16bits_to_f32(u16(data[off]) | (u16(data[off + 1]) << 8))
+}
+
+// q2_0_r8_dot_block is the shared int8-dot math: dot(codes, x) * d, where
+// codes were expanded to signed bytes by repack_q2_0_r8.
+@[direct_array_access]
+pub fn q2_0_r8_dot_block(data []u8, blk int, x []f32, x_off int) f32 {
+	off := blk * q2_0_r8_block_bytes + 2
+	mut s := f32(0)
+	for j in 0 .. qk2_0 {
+		s += f32(i8(data[off + j])) * x[x_off + j]
+	}
+	return s * q2_0_r8_scale(data, blk)
+}
+
+// q2_0_r8_matvec computes out = W*x over an R8-repacked Q2_0 matrix.
+@[direct_array_access]
+pub fn q2_0_r8_matvec(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	bpr := cols / qk2_0
+	for r in 0 .. rows {
+		mut s := f32(0)
+		base := r * bpr
+		for b in 0 .. bpr {
+			s += q2_0_r8_dot_block(data, base + b, x, b * qk2_0)
+		}
+		out[r] = s
+	}
+}

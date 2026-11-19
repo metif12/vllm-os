@@ -67,6 +67,16 @@ float vllm_iq4_nl_dot_f32(const unsigned char *qs, const float *x, float scale, 
 void vllm_iq4_nl_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
 	int cols);
 
+// Q2_0 (signed-scale 2-bit): dot(dequant(q_row), x_f32) * scale over n elems.
+// n=64, qs holds 16 bytes (4 codes/byte, element j = (qs[j/4] >> 2*(j%4))&3,
+// value = (code-1)*scale) — mirrors infer.q2_0_dot_row.
+float vllm_q2_0_dot_f32(const unsigned char *qs, const float *x, float scale, int n);
+
+// out = W * x, W row-major Q2_0 [rows x cols] (cols must divide 64).
+// data holds rows*cols/64 packed 18-byte blocks (f16 d + 16 two-bit bytes).
+void vllm_q2_0_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
+	int cols);
+
 // x[i] = x[i] * w[i] / sqrt(mean(x^2) + eps), in place.
 void vllm_rmsnorm_f32(float *x, const float *w, int n, float eps);
 

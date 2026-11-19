@@ -441,3 +441,82 @@ pub fn iq4_nl_matvec_parallel_pool(pool &WorkerPool, data []u8, rows int, cols i
 		wg.wait()
 	}
 }
+
+// q2_0_matvec_parallel computes the Q2_0 vocab head row-block split across
+// workers (spawn-per-call form). Gating mirrors the other quantized heads.
+pub fn q2_0_matvec_parallel(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if freestanding {
+		q2_0_matvec_c(data, rows, cols, x, mut out)
+		return
+	} $else {
+		nt := parallel_threads()
+		if nt <= 1 || rows < 2 {
+			q2_0_matvec_c(data, rows, cols, x, mut out)
+			return
+		}
+		mut n := nt
+		for n > 1 && rows / n < 512 {
+			n--
+		}
+		if n <= 1 {
+			q2_0_matvec_c(data, rows, cols, x, mut out)
+			return
+		}
+		mut wg := sync.new_waitgroup()
+		base := rows / n
+		rem := rows % n
+		for t in 0 .. n {
+			r0 := t * base + (if t < rem { t } else { rem })
+			r1 := r0 + base + (if t < rem { 1 } else { 0 })
+			wg.add(1)
+			spawn q2_0_chunk(data, rows, cols, x, r0, r1 - r0, mut out, mut wg)
+		}
+		wg.wait()
+	}
+}
+
+fn q2_0_chunk(data []u8, rows int, cols int, x []f32, r0 int, n int, mut out []f32, mut wg sync.WaitGroup) {
+	defer {
+		wg.done()
+	}
+	q2_0_matvec_c_range(data, rows, cols, x, r0, n, mut out)
+}
+
+// q2_0_matvec_parallel_pool is the persistent-pool form of the Q2_0 head.
+// A nil pool (guest / no pool wired) delegates to the spawn or serial entry.
+pub fn q2_0_matvec_parallel_pool(pool &WorkerPool, data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if freestanding {
+		q2_0_matvec_c(data, rows, cols, x, mut out)
+		return
+	} $else {
+		nt := parallel_threads()
+		if nt <= 1 || rows < 2 || pool == unsafe { nil } {
+			q2_0_matvec_parallel(data, rows, cols, x, mut out)
+			return
+		}
+		mut n := nt
+		for n > 1 && rows / n < 512 {
+			n--
+		}
+		if n <= 1 {
+			q2_0_matvec_c(data, rows, cols, x, mut out)
+			return
+		}
+		wg := pool_batch(n)
+		for t in 0 .. n {
+			r0, r1 := pool_bounds(rows, n, t)
+			pool.jobs <- PoolJob{
+				kind: PoolJobKind.q2_0_range
+				data: data
+				x:    x
+				out:  out
+				rows: rows
+				cols: cols
+				r0:   r0
+				n:    r1 - r0
+				wg:   wg
+			}
+		}
+		wg.wait()
+	}
+}

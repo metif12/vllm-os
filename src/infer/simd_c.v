@@ -39,6 +39,8 @@ $if prod {
 	fn C.vllm_q6_k_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_iq4_nl_dot_f32(qs &u8, x &f32, scale f32, n int) f32
 	fn C.vllm_iq4_nl_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
+	fn C.vllm_q2_0_dot_f32(qs &u8, x &f32, scale f32, n int) f32
+	fn C.vllm_q2_0_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_rmsnorm_f32(x &f32, w &f32, n int, eps f64)
 	fn C.vllm_dot_f32(a &f32, b &f32, n int) f32
 	fn C.vllm_softmax_scaled_fast_f32(xs &f32, n int, scale f32)
@@ -250,6 +252,81 @@ pub fn iq4_nl_matvec_c_range(data []u8, rows int, cols int, x []f32, r0 int, n i
 	ds := data[r0 * bpr * iq4_nl_block_bytes..(r0 + n) * bpr * iq4_nl_block_bytes]
 	mut outs := unsafe { out[r0..r0 + n] }
 	iq4_nl_matvec(ds, n, cols, x, mut outs)
+}
+
+// q2_0_dot_row_c is the C/AVX2 version of q2_0_dot_row (signed-scale 2-bit,
+// 64 codes per block). Falls back to pure V outside -prod / without AVX2.
+@[direct_array_access]
+pub fn q2_0_dot_row_c(block BlockQ20, x []f32, x_off int) f32 {
+	$if prod {
+		if has_avx2() {
+			return C.vllm_q2_0_dot_f32(&block.qs[0], &x[x_off], f16bits_to_f32(block.d), qk2_0)
+		}
+	}
+	return q2_0_dot_row(block, x, x_off)
+}
+
+// q2_0_matvec_c computes out = W*x for a Q2_0 row-major matrix via the C
+// kernel (AVX2 FMA over a local dequant scratch), or pure V otherwise.
+@[direct_array_access]
+pub fn q2_0_matvec_c(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q2_0_matvec_f32(data.data, x.data, out.data, rows, cols)
+			}
+			return
+		}
+	}
+	q2_0_matvec(data, rows, cols, x, mut out)
+}
+
+// q2_0_matvec_c_range computes out[r0..r0+n] on a row block (offsets resolve
+// inside so workers share the caller's buffers). Used by the threaded head.
+@[direct_array_access]
+pub fn q2_0_matvec_c_range(data []u8, rows int, cols int, x []f32, r0 int, n int, mut out []f32) {
+	bpr := cols / qk2_0
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q2_0_matvec_f32(&data[r0 * bpr * q2_0_block_bytes], x.data, &out[r0], n,
+					cols)
+			}
+			return
+		}
+	}
+	ds := data[r0 * bpr * q2_0_block_bytes..(r0 + n) * bpr * q2_0_block_bytes]
+	mut outs := unsafe { out[r0..r0 + n] }
+	q2_0_matvec(ds, n, cols, x, mut outs)
+}
+
+// q2_0_r8_dot_c runs the R8 block dot through the EXISTING int8 C kernel —
+// the repack exists precisely so no second math path is needed. Outside
+// -prod / without AVX2 it uses the same int8 formula in pure V.
+@[direct_array_access]
+pub fn q2_0_r8_dot_c(data []u8, blk int, x []f32, x_off int) f32 {
+	scale := q2_0_r8_scale(data, blk)
+	$if prod {
+		if has_avx2() {
+			off := blk * q2_0_r8_block_bytes + 2
+			return C.vllm_q8_dot_f32(&data[off], &x[x_off], scale, qk2_0)
+		}
+	}
+	return q2_0_r8_dot_block(data, blk, x, x_off)
+}
+
+// q2_0_r8_matvec_c computes out = W*x over an R8-repacked Q2_0 matrix.
+@[direct_array_access]
+pub fn q2_0_r8_matvec_c(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	bpr := cols / qk2_0
+	for r in 0 .. rows {
+		mut s := f32(0)
+		for b in 0 .. bpr {
+			blk := r * bpr + b
+			s += q2_0_r8_dot_c(data, blk, x, b * qk2_0)
+		}
+		out[r] = s
+	}
 }
 
 // rmsnorm_c normalizes x with weight w and eps via the C kernel.
