@@ -367,6 +367,64 @@ Non-goals (stay deferred): vendoring `ik_llama`/upstream diffs, CUDA/AMX
 kernels in-guest, draft-model GGUFs in the ISO, ReLU-sparse-only models,
 ternary weights, distributed/RPC inference (`exo`/`llama.cpp RPC` class).
 
+## Phase 9 — second-wave takeaways (planned, 2026-11-19)
+
+Sources: `apoorvumang/prompt-lookup-decoding` (PLD, now in HF
+transformers as `prompt_lookup_num_tokens` + in vLLM as
+`speculative_model="[ngram]"`), `EricLBuehler/mistral.rs` (Rust engine:
+ISQ, paged attention, prefix caching, chunked prefill, auto-detect),
+`intel/ipex-llm` (ARCHIVED by Intel — known security issues, no fixes;
+ideas only, never a dependency), `mlc-ai/mlc-llm` (TVM compiler engine),
+`karpathy/llm.c` (pure C/CUDA reference, ~1000-line CPU fp32 in one
+file). Same rule as Phase 7/8: ideas only, `-gc none` + freestanding-safe
++ `tools/`-only VTL/VSL stay.
+
+* K — PLD parameters for Phase 7-B/8-G (from `prompt-lookup-decoding`).
+  Validated numbers: ~2.4x on input-grounded tasks (summarization,
+  context-QA), smaller on first-turn chat; never slower than greedy in
+  their runs. Start from their hyperparams: `max_ngram_size = 3`,
+  continuation length 10, match over prompt + own output (turn-2 code
+  editing is our best case). Implement in `src/infer/sampler.v` (pure V,
+  arena-allocated, opt-in). Gate: accept-rate + wall-time in
+  `tools/forward_bench.v` on a code-edit prompt, greedy `temp: 0.0`
+  bit-identical on/off.
+* L — Serve-path trio (from `mistral.rs`). Three ideas that attack our
+  measured prefill-bound serve wall (`chat8` ~1.5 s, ChatML prompt ~1.2 s):
+  prefix caching (reuse prompt KV across turns), chunked prefill (bound
+  per-request prefill work), ISQ — in-situ quantization on load
+  (host-side only, e.g. in `scripts/fetch_model.sh` flow, never in the
+  guest). Paged attention stays a research note (our flat arena in
+  `src/infer/attention.v` is simpler and already request-sized). Also
+  adoptable: hardware-aware `tune` (print recommended
+  backend/threads/quant from detected CPU, like `mistralrs tune`) as a
+  `--tune` host flag. Gate per item: same greedy tokens, wall-time win
+  on `chat8`, `vllm.example.json` + `docs/configuration.md` row for any
+  new knob.
+* M — IPEX-LLM boundary (ARCHIVED — never depend). Takeaways only:
+  low-bit CPU path (INT4/FP8/FP6/FP4), self-speculative decoding (~30%
+  reported on CPU), FlashMoE for 671B-class on small GPUs; plus their
+  mmap side-channel warning (`--no-mmap` for multi-tenant) — record in
+  `docs/security.md` that our mmap'd `Model.blob` is safe only because
+  the appliance is single-tenant by design. Gate: docs-only.
+* N — Compiler-vs-handkernels (from `mlc-ai/mlc-llm`). TVM compiles one
+  source to CPU/CUDA/Metal/Vulkan/WebGPU with an OpenAI-compat server on
+  every target — the portability ideal — but it needs a compiler runtime
+  no freestanding guest can host. Rejected for the token loop with
+  reason; keep hand-written `vllm_kernels.c` (style precedent: `llm.c`
+  below). Host-side autotuning stays an open question for `tools/`.
+  Gate: docs-only.
+* O — Single-file C precedent (from `karpathy/llm.c`). `train_gpt2.c`
+  proves a whole fp32 transformer fits in ~1000 clean dependency-free C
+  lines with `OMP_NUM_THREADS` threading — the same shape as our
+  `vllm_kernels.{h,c}` (no libm/libc in the loop, OMP optional). Use as
+  the style bar for every new kernel in Phase 7/8: one file, explicit
+  loops, software f16 (we already do), no hidden allocator. Gate:
+  review checklist, no new dependency in any kernel PR.
+
+Non-goals (stay deferred): draft-model weights (EAGLE/DFlash class),
+GPU/NPU runtimes, TVM/compiler toolchain in the image, training code,
+multi-tenant mmap exposure.
+
 ## Deferred (deliberately out of v1)
 
 GPU / NPU drivers, multi-tenant auth + rate limits, full 32k ctx,
