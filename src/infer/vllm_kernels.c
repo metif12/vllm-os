@@ -1,9 +1,9 @@
-// vllm_kernels.c — host-optimized C kernels for vllm-os.
+// vllm_kernels.c -- host-optimized C kernels for vllm-os.
 //
 // Scalar C paths always compile (gcc, clang, tcc, MSVC, freestanding:
 // no libc, no libm, no OS calls). On gcc/clang x86 the hot functions
 // carry __attribute__((target("avx2,fma"))) so they get AVX2+FMA codegen
-// with PLAIN portable build flags — no -march=native needed, the binary
+// with PLAIN portable build flags -- no -march=native needed, the binary
 // still runs anywhere (runtime dispatch via vllm_has_avx2()).
 // The bare-metal port links this file as-is.
 
@@ -266,11 +266,128 @@ static float vllm_f16_le_to_f32(const unsigned char *p) {
 }
 
 #if VLLM_HAVE_SIMD
+// f16 (LE) -> f32 lookup: exact for all 65536 inputs (built from the bit
+// trick above on first use), so per-block scale conversion is branch-free
+// with zero numeric change. 256 KB of BSS; init is idempotent (every
+// entry always gets the same value), so concurrent first calls from
+// worker threads are benign. No libc/libm, freestanding-safe.
+static float vllm_f16_lut[65536];
+static int vllm_f16_lut_ready = 0;
+
+static void vllm_f16_lut_init(void) {
+	if (vllm_f16_lut_ready) {
+		return;
+	}
+	for (unsigned i = 0; i < 65536; i++) {
+		unsigned char p[2];
+		p[0] = (unsigned char)(i & 0xff);
+		p[1] = (unsigned char)(i >> 8);
+		vllm_f16_lut[i] = vllm_f16_le_to_f32(p);
+	}
+	vllm_f16_lut_ready = 1;
+}
+
+// vllm_f16_lut_get converts two LE bytes via the table (init first).
+static float vllm_f16_lut_get(const unsigned char *p) {
+	unsigned i = (unsigned)p[0] | ((unsigned)p[1] << 8);
+	return vllm_f16_lut[i];
+}
+
+// Horizontal sum of one 8-lane vector (same tree as the per-block dots).
+static VLLM_AVX2_FN float vllm_hsum_avx2(__m256 s) {
+	__m128 hi = _mm256_extractf128_ps(s, 1);
+	__m128 lo = _mm256_castps256_ps128(s);
+	__m128 v = _mm_add_ps(lo, hi);
+	v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+	v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
+	return _mm_cvtss_f32(v);
+}
+
+// Row-vector Q4_0 accumulation: the four dequant lanes stream across
+// blocks into accumulators with ONE horizontal sum per row (not per
+// block), and no scalar dependency chain through s. Summation order
+// changes vs the scalar mirror (lane-wise across blocks, then reduce)
+// -- last-ulp drift, gated by simd_test's 1e-3 agreement band.
+static VLLM_AVX2_FN void q4_0_matvec_rows_avx2(const unsigned char *data, const float *x,
+	float *out, int rows, int bpr) {
+	__m128i m15 = _mm_set1_epi8(0x0f);
+	__m256 eight = _mm256_set1_ps(8.0f);
+	for (int r = 0; r < rows; r++) {
+		__m256 acc0 = _mm256_setzero_ps();
+		__m256 acc1 = _mm256_setzero_ps();
+		__m256 acc2 = _mm256_setzero_ps();
+		__m256 acc3 = _mm256_setzero_ps();
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 18;
+			__m256 sc = _mm256_set1_ps(vllm_f16_lut_get(blk));
+			__m128i q = _mm_loadu_si128((const __m128i *)(blk + 2));
+			__m128i lo = _mm_and_si128(q, m15);
+			__m128i hi = _mm_and_si128(_mm_srli_epi64(q, 4), m15);
+			__m256 f0 = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), eight);
+			__m256 f1 = _mm256_sub_ps(
+				_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))), eight);
+			__m256 f2 = _mm256_sub_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), eight);
+			__m256 f3 = _mm256_sub_ps(
+				_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))), eight);
+			const float *xb = x + (size_t)b * 32;
+			acc0 = _mm256_fmadd_ps(_mm256_mul_ps(f0, sc), _mm256_loadu_ps(xb), acc0);
+			acc1 = _mm256_fmadd_ps(_mm256_mul_ps(f1, sc), _mm256_loadu_ps(xb + 8), acc1);
+			acc2 = _mm256_fmadd_ps(_mm256_mul_ps(f2, sc), _mm256_loadu_ps(xb + 16), acc2);
+			acc3 = _mm256_fmadd_ps(_mm256_mul_ps(f3, sc), _mm256_loadu_ps(xb + 24), acc3);
+		}
+		__m256 s = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+		out[r] = vllm_hsum_avx2(s);
+	}
+}
+
+// Row-vector Q4_1 accumulation: same discipline as the Q4_0 loop, with a
+// fifth accumulator for the sum(x)*min offset lane.
+static VLLM_AVX2_FN void q4_1_matvec_rows_avx2(const unsigned char *data, const float *x,
+	float *out, int rows, int bpr) {
+	__m128i m15 = _mm_set1_epi8(0x0f);
+	for (int r = 0; r < rows; r++) {
+		__m256 acc0 = _mm256_setzero_ps();
+		__m256 acc1 = _mm256_setzero_ps();
+		__m256 acc2 = _mm256_setzero_ps();
+		__m256 acc3 = _mm256_setzero_ps();
+		__m256 xacc = _mm256_setzero_ps();
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 20;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 20;
+			__m256 sc = _mm256_set1_ps(vllm_f16_lut_get(blk));
+			__m256 mn = _mm256_set1_ps(vllm_f16_lut_get(blk + 2));
+			__m128i q = _mm_loadu_si128((const __m128i *)(blk + 4));
+			__m128i lo = _mm_and_si128(q, m15);
+			__m128i hi = _mm_and_si128(_mm_srli_epi64(q, 4), m15);
+			__m256 f0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
+			__m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8)));
+			__m256 f2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
+			__m256 f3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8)));
+			const float *xb = x + (size_t)b * 32;
+			__m256 x0 = _mm256_loadu_ps(xb);
+			__m256 x1 = _mm256_loadu_ps(xb + 8);
+			__m256 x2 = _mm256_loadu_ps(xb + 16);
+			__m256 x3 = _mm256_loadu_ps(xb + 24);
+			acc0 = _mm256_fmadd_ps(_mm256_mul_ps(f0, sc), x0, acc0);
+			acc1 = _mm256_fmadd_ps(_mm256_mul_ps(f1, sc), x1, acc1);
+			acc2 = _mm256_fmadd_ps(_mm256_mul_ps(f2, sc), x2, acc2);
+			acc3 = _mm256_fmadd_ps(_mm256_mul_ps(f3, sc), x3, acc3);
+			__m256 xs = _mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3));
+			xacc = _mm256_fmadd_ps(xs, mn, xacc);
+		}
+		__m256 s = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+		out[r] = vllm_hsum_avx2(s) + vllm_hsum_avx2(xacc);
+	}
+}
+#endif
+
+#if VLLM_HAVE_SIMD
 // One 32-elem split-half Q4_0 block dot (no scale applied): byte i holds
 // q[i] (low nibble) and q[i+16] (high nibble), values are nibble - 8.
 // Unpack trick: epi64 >> 4 moves every byte's HIGH nibble into its own
 // low nibble (epi16 would cross-contaminate odd bytes from the neighbor's
-// low nibble — verify with byte pattern 0xAB at odd offsets).
+// low nibble -- verify with byte pattern 0xAB at odd offsets).
 static VLLM_AVX2_FN float q4_0_block_dot_avx2(const unsigned char *qs, const float *x) {
 	__m128i q = _mm_loadu_si128((const __m128i *)qs);
 	__m128i m15 = _mm_set1_epi8(0x0f);
@@ -319,16 +436,8 @@ void vllm_q4_0_matvec_f32(const unsigned char *data, const float *x, float *out,
 	int bpr = cols / 32;
 #if VLLM_HAVE_SIMD
 	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-		for (int r = 0; r < rows; r++) {
-			float s = 0.0f;
-			const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
-			for (int b = 0; b < bpr; b++) {
-				const unsigned char *blk = row + (size_t)b * 18;
-				s += q4_0_block_dot_avx2(blk + 2, x + (size_t)b * 32) *
-					vllm_f16_le_to_f32(blk);
-			}
-			out[r] = s;
-		}
+		vllm_f16_lut_init();
+		q4_0_matvec_rows_avx2(data, x, out, rows, bpr);
 		return;
 	}
 #endif
@@ -355,7 +464,7 @@ void vllm_q4_0_matvec_f32(const unsigned char *data, const float *x, float *out,
 
 #if VLLM_HAVE_SIMD
 // One 32-elem split-half Q4_1 block dot (no scale/min applied by caller
-// confusion — applied here): byte i holds q[i] (low nibble, 0..15) and
+// confusion -- applied here): byte i holds q[i] (low nibble, 0..15) and
 // q[i+16] (high nibble). Same epi64 unpack trick as the Q4_0 path.
 // Returns dot(q,x)*scale + sum(x)*min, mirroring infer.q4_1_dot_row.
 static VLLM_AVX2_FN float q4_1_block_dot_avx2(const unsigned char *qs, const float *x,
@@ -421,16 +530,8 @@ void vllm_q4_1_matvec_f32(const unsigned char *data, const float *x, float *out,
 	int bpr = cols / 32;
 #if VLLM_HAVE_SIMD
 	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-		for (int r = 0; r < rows; r++) {
-			float s = 0.0f;
-			const unsigned char *row = data + (size_t)r * (size_t)bpr * 20;
-			for (int b = 0; b < bpr; b++) {
-				const unsigned char *blk = row + (size_t)b * 20;
-				s += q4_1_block_dot_avx2(blk + 4, x + (size_t)b * 32,
-					vllm_f16_le_to_f32(blk), vllm_f16_le_to_f32(blk + 2));
-			}
-			out[r] = s;
-		}
+		vllm_f16_lut_init();
+		q4_1_matvec_rows_avx2(data, x, out, rows, bpr);
 		return;
 	}
 #endif
@@ -464,6 +565,7 @@ void vllm_q6_k_matvec_f32(const unsigned char *data, const float *x, float *out,
 	int bpr = cols / 256;
 #if VLLM_HAVE_SIMD
 	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		vllm_f16_lut_init();
 		for (int r = 0; r < rows; r++) {
 			float s = 0.0f;
 			const unsigned char *row = data + (size_t)r * (size_t)bpr * 210;
@@ -472,7 +574,7 @@ void vllm_q6_k_matvec_f32(const unsigned char *data, const float *x, float *out,
 				const unsigned char *ql = blk;
 				const unsigned char *qh = blk + 128;
 				const signed char *scales = (const signed char *)(blk + 192);
-				float d = vllm_f16_le_to_f32(blk + 208);
+				float d = vllm_f16_lut_get(blk + 208);
 				const float *xb = x + (size_t)b * 256;
 				float t = q6_k_half_dot_avx2(ql, qh, scales, xb) +
 					q6_k_half_dot_avx2(ql + 64, qh + 32, scales + 8, xb + 128);
@@ -573,7 +675,7 @@ float vllm_dot_f32(const float *a, const float *b, int n) {
 }
 
 // Branchless Schraudolph exp, no libm: reinterpret float bits.
-// u.i = x * 2^23/log(2) + 127*2^23. Worst-case rel err ~0.5% — sampling
+// u.i = x * 2^23/log(2) + 127*2^23. Worst-case rel err ~0.5% -- sampling
 // only, never scoring. Clamped to avoid inf/nan on wild logits.
 static float vllm_expf_fast(float x) {
 	union {

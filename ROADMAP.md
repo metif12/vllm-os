@@ -253,9 +253,10 @@ Done 2026-11-18 (serve path): the model blob is cached at boot
 to the request (prompt + max_tokens via `new_forward_ctx_cap`) instead
 of the full 4k cap (~900 MB zero-fill per request on the 0.6B shape).
 Paired same-box probe (temp 0, seed 7, `Hello`, `chat8`): wall 7.3 s ->
-2.9 s (~2.5x); cached-vs-per-call greedy tokens identical. Serve
-throughput is prefill-bound (ChatML prompt ~2.8 s) with steady-state
-decode ~70-85 ms/token (see `docs/perf.md`).
+2.9 s (~2.5x), and 1.5 s after the win-12 kernel rewrite
+(~4.7x cumulative); greedy tokens identical across all paths. Serve
+throughput is prefill-bound (ChatML prompt ~1.2 s) with steady-state
+decode ~48-50 ms/token (see `docs/perf.md`).
 
 Closed: TLS terminates at the edge by design (no TLS stack ships in the
 guest — `docs/security.md` rationale); SMP is validated by the 1.7B

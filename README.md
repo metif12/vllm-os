@@ -168,7 +168,7 @@ Full reference with streaming framing and error table:
 | VTL/VSL integration | parity-tested (`vtl_parity_test.v`, needs `v install vtl vsl`); VTL-aligned `tensor_view.v` in-tree |
 | QEMU network path | harness green (loopback); guest SLIRP via `$GUEST_IMG` |
 | Transformer forward (real logits, phase 1b) | done: GQA + QK-norm + split-half RoPE decode, fused Q4_0/Q4_1/Q6_K matvecs, q/k/v + gate/up fork-join, boot-cached blob + request-sized arenas, real BPE; greedy output identical to llama.cpp, PPL close (see [docs/perf.md](docs/perf.md)) |
-| Forward speed (host, same-box measured) | C AVX2 quantized kernels + threaded vocab head + layer fork-join, runtime-dispatched: decode ~70-85 ms/token threaded (~96-108 ms serial, ~800-1000 ms pure-V) on Qwen3-0.6B-Q4_0 (warm, Ryzen 7 5800HS), ~12x over warm pure-V; vocab head ~9.5x, Q4_1 down ~5-6x, gate matvec 4 ms to sub-ms; serve path chat8 ~2.9 s wall (was ~7.3 s pre-cache, prefill-bound) |
+| Forward speed (host, same-box measured) | C AVX2 quantized kernels (row-vector Q4) + threaded vocab head + layer fork-join, runtime-dispatched: decode ~48-50 ms/token threaded (~65-67 ms serial, ~800-1000 ms pure-V) on Qwen3-0.6B-Q4_0 (warm, Ryzen 7 5800HS), ~18x over warm pure-V; Q4_0/Q4_1 matvecs ~2x via accumulation + f16 LUT, vocab head ~9.5x, gate matvec 4 ms to sub-ms; serve path chat8 ~1.5 s wall (prefill-bound) |
 | vinix-mini fork / bare-metal port / ISO | gate green: fork boots, userland V runs, full server in-guest serves real completions from the ISO (`make image`, `scripts/mini_boot_gate.ps1`) |
 
 ## Design constraints
