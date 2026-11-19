@@ -117,6 +117,10 @@ pub mut:
 	probs    []f32
 	cos_sin  []f32
 	logits   []f32
+	// pool is the boot-wide persistent worker pool (nil under freestanding /
+	// VLLM_THREADS=1, where decode falls back to serial kernels). Copied from
+	// Model at request time so decode_step uses no global state.
+	pool &WorkerPool = unsafe { nil }
 }
 
 // new_forward_ctx allocates arenas for ctx_cap tokens of KV per head.
@@ -255,8 +259,8 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 		rmsnorm_in_place(mut f.normed, lt.an, f.cfg.rms_norm_eps)
 		// q/k/v fork-join: three independent projections over the same
 		// normed hidden (serial under freestanding / VLLM_THREADS=1).
-		q4_0_matvec_3way(lt.q, lt.k, lt.v, nh * hd, nkv * hd, nkv * vd, h, f.normed, mut f.q, mut
-			f.k, mut f.v)
+		q4_0_matvec_3way_pool(f.pool, lt.q, lt.k, lt.v, nh * hd, nkv * hd, nkv * vd, h, f.normed, mut
+			f.q, mut f.k, mut f.v)
 		// QK-norm per head (slices passed directly as mut args borrow;
 		// never `mut qs := ...` — that implicitly clones and drops the write).
 		for qh in 0 .. nh {
@@ -296,7 +300,8 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 		rmsnorm_in_place(mut f.normed, lt.fn_, f.cfg.rms_norm_eps)
 		// gate/up fork-join: two independent projections over the same
 		// normed hidden (same serial fallback as the q/k/v join above).
-		q4_0_matvec_2way(lt.gate, lt.up, inter, inter, h, f.normed, mut f.gate, mut f.up)
+		q4_0_matvec_2way_pool(f.pool, lt.gate, lt.up, inter, inter, h, f.normed, mut f.gate, mut
+			f.up)
 		silu_in_place(mut f.gate)
 		for i in 0 .. inter {
 			f.up[i] *= f.gate[i]
@@ -324,7 +329,7 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 	if emb_info.typ == .q6_k {
 		// Threaded row-block vocab head (serial fallback under
 		// freestanding / VLLM_THREADS=1 / small rows; the guest pins 1).
-		q6_k_matvec_parallel(emb, f.logits.len, h, f.normed, mut f.logits)
+		q6_k_matvec_parallel_pool(f.pool, emb, f.logits.len, h, f.normed, mut f.logits)
 	} else {
 		i8_matvec(emb, f.logits.len, h, f.normed, mut f.logits)
 	}

@@ -43,6 +43,12 @@ pub:
 	// Empty for stub/safetensors Models (generate falls back to the
 	// pseudo path or a per-call load for uncached gguf Models).
 	blob []u8
+pub mut:
+	// pool is the boot-wide persistent worker pool, wired once in main() after
+	// config resolution. nil under freestanding / VLLM_THREADS=1, where the
+	// forward path stays single-threaded (guest parity). generate_* copies it
+	// into each ForwardCtx so decode_step needs no global state.
+	pool &WorkerPool = unsafe { nil }
 }
 
 // n_tensors is the unified tensor count across containers.
@@ -228,6 +234,7 @@ fn (m Model) generate_real_cached(ids []int, max_tokens int, sp SampleParams) !s
 	// new_forward_ctx_cap): prompt + max_tokens is all pos can reach.
 	need := ids.len + max_tokens
 	mut f := new_forward_ctx_cap(m.cfg, m.gguf, m.blob, need)!
+	f.pool = m.pool
 	for id in ids {
 		embed_gather(m.blob, m.gguf, m.cfg.hidden, id, mut f.hidden)!
 		f.decode_step()!
@@ -275,6 +282,7 @@ fn (m Model) generate_real(ids []int, max_tokens int, sp SampleParams) !string {
 	blob := load_model_blob(m.gguf.path)!
 	need := ids.len + max_tokens
 	mut f := new_forward_ctx_cap(m.cfg, m.gguf, blob, need)!
+	f.pool = m.pool
 	for id in ids {
 		embed_gather(blob, m.gguf, m.cfg.hidden, id, mut f.hidden)!
 		f.decode_step()!

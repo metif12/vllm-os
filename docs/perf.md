@@ -125,6 +125,21 @@ How the wins happened, in order:
     per-token `find` + slice path stays; the remaining decode gap is
     dequant compute (kernels run ~7-8x over the ~37 GB/s memory wall),
     which is what layout-level packing targets — not lookup overhead.
+13. **Persistent worker pool** (`src/infer/worker_pool.v`, 2026-11-19):
+    a fixed set of long-lived threads drains a shared job channel; the
+    decode fork-joins submit 2/3 whole-matrix jobs (q/k/v, gate/up) and
+    n row-block jobs (vocab head) per token instead of spawning 2-4 OS
+    threads per call. Each batch owns a WaitGroup, so concurrent request
+    handlers can interleave jobs safely. Same kernels and disjoint outs,
+    so numerics are unchanged: serial-agreement + bit-exact 2-way/3-way
+    tests pass in dev and `-prod`, plus a concurrent-batch test where four
+    submitters share one pool. Timing A/B was **BLOCKED** by a loaded host
+    (CPU 100%, ~1.8 GB free, many unrelated background processes during
+    the measurement window), so no wall-time delta is claimed here; the
+    win is structural (no spawn storm / thread-commit exhaustion, and a
+    bounded thread count regardless of concurrent requests). Re-measure
+    `tools/forward_bench.v` with `VLLM_NO_POOL=1` (legacy spawn) vs pool on
+    a quiet box before quoting a number.
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
@@ -132,9 +147,15 @@ multiplied available bandwidth up to the socket wall (~8 ms -> ~4 ms at
 ~37 GB/s effective). NumPy's multithreaded BLAS sits at ~7 ms on the
 same wall. Remaining traffic wins come from quantization (less traffic
 per token via the fused `q8_0_dot_row` path), not from kernel tuning.
-Threading is spawn-per-call today (no pool): fine at 2048+ rows where
-tens of microseconds vanish next to milliseconds; a persistent pool is
-documented follow-up for the phase-1b forward, not needed for the win.
+Threading now runs on a boot-wide persistent pool (`src/infer/worker_pool.v`)
+instead of spawn-per-call: the decode fork-joins (q/k/v, gate/up, vocab
+head) submit their chunks to a fixed worker set, each batch with its own
+WaitGroup so concurrent requests interleave without cross-batch barriers.
+Besides removing ~140 OS-thread spawns/token, this avoids a real failure
+mode of the old path on a loaded host: `go q4_0_chunk_full(): The paging
+file is too small for this operation to complete` (thread/commit
+exhaustion). The guest stays single-threaded (`VLLM_THREADS=1` /
+`-freestanding` → nil pool → serial kernels).
 
 ## Full-decode throughput (Qwen3-0.6B-Q4_0, same box)
 

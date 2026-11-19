@@ -117,10 +117,14 @@ fn main() {
 		}
 		return
 	}
-	model := infer.load_model(cc.model.weights, qcfg) or {
+	mut model := infer.load_model(cc.model.weights, qcfg) or {
 		eprintln('[vllm-os] bad weights: ${err}')
 		exit(1)
 	}
+	// One boot-wide pool for the decode fork-joins; nil when pinned to one
+	// thread (VLLM_THREADS=1) or under -freestanding, so the guest stays
+	// single-threaded. generate_real_cached copies it into each ForwardCtx.
+	model.pool = infer.new_worker_pool(infer.parallel_threads())
 	eprintln('[vllm-os] boot ok: ${model.cfg.model_id} format=${model.format} tensors=${model.n_tensors()}')
 	api.serve(cc, &model) or {
 		eprintln('[vllm-os] serve failed: ${err}')

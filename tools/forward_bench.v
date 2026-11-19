@@ -7,6 +7,8 @@ module main
 //   /tmp/fwdbench /path/to/model.gguf [n]
 // Prints prefill ms + per-decode ms + best. Threading follows
 // VLLM_THREADS (default 4); VLLM_NO_SIMD=1 forces the pure-V path.
+// VLLM_NO_POOL=1 forces the legacy spawn-per-call path (A/B vs the
+// boot-wide persistent pool the server uses by default).
 // NOTE: print/println only, no interpolation — the release-V -prod
 // cgen quirk drops the str_intp runtime for interpolation in tiny
 // module-main binaries (see forward parity notes).
@@ -22,6 +24,13 @@ fn main() {
 	// load for Models built without the cache.
 	blob := if m.blob.len > 0 { m.blob } else { infer.load_model_blob(weights) or { panic(err) } }
 	mut f := infer.new_forward_ctx(m.cfg, m.gguf, blob) or { panic(err) }
+	if os.getenv('VLLM_NO_POOL') == '' {
+		f.pool = infer.new_worker_pool(infer.parallel_threads())
+		print('pool=on')
+	} else {
+		print('pool=off')
+	}
+	println('')
 	print('model_hidden=')
 	println(m.cfg.hidden)
 	print('model_layers=')

@@ -200,3 +200,163 @@ fn matvec_chunk(w []f32, x []f32, rows int, cols int, r0 int, n int, mut out []f
 	}
 	matvec_c_range(w, x, rows, cols, r0, n, mut out)
 }
+
+// --- Persistent-pool variants (phase 7) ---------------------------------
+//
+// The originals above stay spawn-based so tools/tests keep their existing
+// fallback. These variants run the same partition on a pre-spawned pool,
+// removing ~140 OS-thread spawns per decode token on the Q4 path. A nil
+// pool (freestanding / VLLM_THREADS=1 / no pool wired) delegates straight
+// to the original spawn-or-serial entry, so numerics are bit-identical.
+
+// matvec_parallel_pool computes out = W*x using the persistent pool.
+pub fn matvec_parallel_pool(pool &WorkerPool, w []f32, x []f32, rows int, cols int, mut out []f32) {
+	$if freestanding {
+		matvec_c(w, x, rows, cols, mut out)
+		return
+	} $else {
+		nt := parallel_threads()
+		if nt <= 1 || rows < 2 || pool == unsafe { nil } {
+			matvec_parallel(w, x, rows, cols, mut out)
+			return
+		}
+		mut n := nt
+		for n > 1 && rows / n < 512 {
+			n--
+		}
+		if n <= 1 {
+			matvec_c(w, x, rows, cols, mut out)
+			return
+		}
+		wg := pool_batch(n)
+		for t in 0 .. n {
+			r0, r1 := pool_bounds(rows, n, t)
+			pool.jobs <- PoolJob{
+				kind:  PoolJobKind.matvec_range
+				words: w
+				x:     x
+				out:   out
+				rows:  rows
+				cols:  cols
+				r0:    r0
+				n:     r1 - r0
+				wg:    wg
+			}
+		}
+		wg.wait()
+	}
+}
+
+// q6_k_matvec_parallel_pool computes the Q6_K vocab head on the pool.
+pub fn q6_k_matvec_parallel_pool(pool &WorkerPool, data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if freestanding {
+		q6_k_matvec_c(data, rows, cols, x, mut out)
+		return
+	} $else {
+		nt := parallel_threads()
+		if nt <= 1 || rows < 2 || pool == unsafe { nil } {
+			q6_k_matvec_parallel(data, rows, cols, x, mut out)
+			return
+		}
+		mut n := nt
+		for n > 1 && rows / n < 512 {
+			n--
+		}
+		if n <= 1 {
+			q6_k_matvec_c(data, rows, cols, x, mut out)
+			return
+		}
+		wg := pool_batch(n)
+		for t in 0 .. n {
+			r0, r1 := pool_bounds(rows, n, t)
+			pool.jobs <- PoolJob{
+				kind: PoolJobKind.q6k_range
+				data: data
+				x:    x
+				out:  out
+				rows: rows
+				cols: cols
+				r0:   r0
+				n:    r1 - r0
+				wg:   wg
+			}
+		}
+		wg.wait()
+	}
+}
+
+// q4_0_matvec_2way_pool runs the gate/up pair on the pool (one job each).
+pub fn q4_0_matvec_2way_pool(pool &WorkerPool, a []u8, b []u8, rows_a int, rows_b int, cols int, x []f32, mut out_a []f32, mut out_b []f32) {
+	$if freestanding {
+		q4_0_matvec_2way(a, b, rows_a, rows_b, cols, x, mut out_a, mut out_b)
+		return
+	} $else {
+		if parallel_threads() <= 1 || pool == unsafe { nil } {
+			q4_0_matvec_2way(a, b, rows_a, rows_b, cols, x, mut out_a, mut out_b)
+			return
+		}
+		wg := pool_batch(2)
+		pool.jobs <- PoolJob{
+			kind: PoolJobKind.q4_0_full
+			data: a
+			x:    x
+			out:  out_a
+			rows: rows_a
+			cols: cols
+			wg:   wg
+		}
+		pool.jobs <- PoolJob{
+			kind: PoolJobKind.q4_0_full
+			data: b
+			x:    x
+			out:  out_b
+			rows: rows_b
+			cols: cols
+			wg:   wg
+		}
+		wg.wait()
+	}
+}
+
+// q4_0_matvec_3way_pool runs the q/k/v triple on the pool (one job each).
+pub fn q4_0_matvec_3way_pool(pool &WorkerPool, a []u8, b []u8, c []u8, rows_a int, rows_b int, rows_c int, cols int, x []f32, mut out_a []f32, mut out_b []f32, mut out_c []f32) {
+	$if freestanding {
+		q4_0_matvec_3way(a, b, c, rows_a, rows_b, rows_c, cols, x, mut out_a, mut out_b, mut out_c)
+		return
+	} $else {
+		if parallel_threads() <= 1 || pool == unsafe { nil } {
+			q4_0_matvec_3way(a, b, c, rows_a, rows_b, rows_c, cols, x, mut out_a, mut out_b, mut
+				out_c)
+			return
+		}
+		wg := pool_batch(3)
+		pool.jobs <- PoolJob{
+			kind: PoolJobKind.q4_0_full
+			data: a
+			x:    x
+			out:  out_a
+			rows: rows_a
+			cols: cols
+			wg:   wg
+		}
+		pool.jobs <- PoolJob{
+			kind: PoolJobKind.q4_0_full
+			data: b
+			x:    x
+			out:  out_b
+			rows: rows_b
+			cols: cols
+			wg:   wg
+		}
+		pool.jobs <- PoolJob{
+			kind: PoolJobKind.q4_0_full
+			data: c
+			x:    x
+			out:  out_c
+			rows: rows_c
+			cols: cols
+			wg:   wg
+		}
+		wg.wait()
+	}
+}

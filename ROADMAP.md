@@ -281,6 +281,18 @@ Sources: `synchopate/llama-modchip v3.0` (non-convoy threading),
 nothing vendored; `-gc none` + freestanding-safe + `tools/`-only VTL/VSL;
 license/provenance check before copying any C (Apache-2.0).
 
+Status 2026-11-19: the **pool** half landed — `src/infer/worker_pool.v`
+gives the decode fork-joins a boot-wide fixed worker set (per-batch
+WaitGroups, no cross-request barrier), replacing ~140 spawn-per-call
+threads/token. Wired through `Model.pool` → `ForwardCtx.pool` (no global
+state); nil under `-freestanding` / `VLLM_THREADS=1`, so the guest stays
+serial. Correctness gates green in dev + `-prod` (serial agreement,
+bit-exact 2-way/3-way, four-submitter concurrency). The `phys_cores - 1`
+default is **deferred**: V 0.5.2 exposes only logical CPUs, and a clean
+A/B needs a quiet box (the measurement host was loaded — see
+`docs/perf.md` win 13). `parallel_threads()` keeps the measured default of
+4 with a `VLLM_THREADS` override until that A/B exists.
+
 * Threads + pool. `threads = phys_cores - 1`, one core reserved for the
   accept loop (`src/api/server.v`), no oversubscription, no busy-poll;
   then a persistent pool replacing spawn-per-call (`src/infer/parallel.v`,
