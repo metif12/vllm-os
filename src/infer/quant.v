@@ -335,3 +335,97 @@ pub fn dequant_f16_row(src []u16, mut out []f32) {
 		out[i] = f16bits_to_f32(src[i])
 	}
 }
+
+// --- IQ4_NL: non-linear 4-bit (phase 7) ---------------------------------
+//
+// GGML `block_iq4_nl` (ggml-common.h): f16 `d` + 16 split-half nibble bytes
+// = 18 bytes per 32 values, the same byte layout as Q4_0. The difference is
+// the codebook: a 4-bit index selects one of 16 fixed int8 grid values
+// (`kvalues_iq4nl` in ggml/src/ggml-common.h) instead of nibble-8. Dequant is
+// exactly `d * grid[code]` (ggml-quants.c `dequantize_row_iq4_nl` — no extra
+// 1/64 factor; the quantizer folds magnitude into `d`). Provenance recorded,
+// no C copied: the values below are the 16 published constants.
+
+pub const qk4_nl = 32
+pub const iq4_nl_block_bytes = 18
+
+const iq4_nl_grid_i8 = [i8(-127), -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89,
+	113]
+
+// iq4_nl_grid returns the GGML non-linear codebook value for a 4-bit code.
+pub fn iq4_nl_grid(code int) f32 {
+	return f32(iq4_nl_grid_i8[code])
+}
+
+pub struct BlockIQ4NL {
+pub:
+	d  u16    // f16 scale bits
+	qs [16]u8 // 32 split-half nibble codes
+}
+
+// block_iq4_nl_at parses one 18-byte IQ4_NL block (caller bounds-checks).
+@[direct_array_access]
+pub fn block_iq4_nl_at(data []u8, blk int) BlockIQ4NL {
+	off := blk * iq4_nl_block_bytes
+	mut qs := [16]u8{}
+	for i in 0 .. 16 {
+		qs[i] = data[off + 2 + i]
+	}
+	return BlockIQ4NL{
+		d:  u16(data[off]) | (u16(data[off + 1]) << 8)
+		qs: qs
+	}
+}
+
+// dequant_iq4_nl_row decodes one 32-elem block (split-half like Q4_0).
+@[direct_array_access]
+pub fn dequant_iq4_nl_row(block BlockIQ4NL, mut out []f32) {
+	d := f16bits_to_f32(block.d)
+	for i in 0 .. 16 {
+		b := block.qs[i]
+		out[i] = d * iq4_nl_grid(int(b & 0x0f))
+		out[i + 16] = d * iq4_nl_grid(int((b >> 4) & 0x0f))
+	}
+}
+
+// iq4_nl_dot_row fuses dot(dequant(q_row), x) without materializing the row.
+// Same codebook + split-half layout as dequant_iq4_nl_row; the forward pass
+// never needs the intermediate f32 vector.
+@[direct_array_access]
+pub fn iq4_nl_dot_row(block BlockIQ4NL, x []f32, x_off int) f32 {
+	d := f16bits_to_f32(block.d)
+	mut s := f32(0)
+	for i in 0 .. 16 {
+		b := block.qs[i]
+		s += iq4_nl_grid(int(b & 0x0f)) * x[x_off + i]
+		s += iq4_nl_grid(int((b >> 4) & 0x0f)) * x[x_off + i + 16]
+	}
+	return s * d
+}
+
+// iq4_nl_matvec computes out = W*x for an IQ4_NL row-major [rows x cols]
+// matrix (cols must divide 32). Scalar reference for the dispatched kernel.
+@[direct_array_access]
+pub fn iq4_nl_matvec(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	bpr := cols / qk4_nl
+	for r in 0 .. rows {
+		mut s := f32(0)
+		base := r * bpr
+		for b in 0 .. bpr {
+			s += iq4_nl_dot_row(block_iq4_nl_at(data, base + b), x, b * qk4_nl)
+		}
+		out[r] = s
+	}
+}
+
+// embed_gather_iq4_nl decodes row id of an IQ4_NL [vocab x dim] matrix
+// (dim divides 32) into f32 — the tied output head on IQ4_NL files.
+@[direct_array_access]
+pub fn embed_gather_iq4_nl(data []u8, dim int, id int, mut out []f32) {
+	bpr := dim / qk4_nl
+	base := id * bpr
+	for b in 0 .. bpr {
+		mut seg := unsafe { out[b * qk4_nl..(b + 1) * qk4_nl] }
+		dequant_iq4_nl_row(block_iq4_nl_at(data, base + b), mut seg)
+	}
+}

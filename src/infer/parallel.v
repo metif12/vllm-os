@@ -360,3 +360,84 @@ pub fn q4_0_matvec_3way_pool(pool &WorkerPool, a []u8, b []u8, c []u8, rows_a in
 		wg.wait()
 	}
 }
+
+// iq4_nl_matvec_parallel computes the IQ4_NL vocab head row-block split
+// across workers (spawn-per-call form; the _pool variant below is what the
+// server uses). Gating mirrors q6_k_matvec_parallel.
+pub fn iq4_nl_matvec_parallel(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if freestanding {
+		iq4_nl_matvec_c(data, rows, cols, x, mut out)
+		return
+	} $else {
+		nt := parallel_threads()
+		if nt <= 1 || rows < 2 {
+			iq4_nl_matvec_c(data, rows, cols, x, mut out)
+			return
+		}
+		mut n := nt
+		for n > 1 && rows / n < 512 {
+			n--
+		}
+		if n <= 1 {
+			iq4_nl_matvec_c(data, rows, cols, x, mut out)
+			return
+		}
+		mut wg := sync.new_waitgroup()
+		base := rows / n
+		rem := rows % n
+		for t in 0 .. n {
+			r0 := t * base + (if t < rem { t } else { rem })
+			r1 := r0 + base + (if t < rem { 1 } else { 0 })
+			wg.add(1)
+			spawn iq4_nl_chunk(data, rows, cols, x, r0, r1 - r0, mut out, mut wg)
+		}
+		wg.wait()
+	}
+}
+
+fn iq4_nl_chunk(data []u8, rows int, cols int, x []f32, r0 int, n int, mut out []f32, mut wg sync.WaitGroup) {
+	defer {
+		wg.done()
+	}
+	iq4_nl_matvec_c_range(data, rows, cols, x, r0, n, mut out)
+}
+
+// iq4_nl_matvec_parallel_pool is the persistent-pool form of the IQ4_NL
+// vocab head. A nil pool (guest / no pool wired) delegates to the spawn or
+// serial entry, so numerics are identical.
+pub fn iq4_nl_matvec_parallel_pool(pool &WorkerPool, data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if freestanding {
+		iq4_nl_matvec_c(data, rows, cols, x, mut out)
+		return
+	} $else {
+		nt := parallel_threads()
+		if nt <= 1 || rows < 2 || pool == unsafe { nil } {
+			iq4_nl_matvec_parallel(data, rows, cols, x, mut out)
+			return
+		}
+		mut n := nt
+		for n > 1 && rows / n < 512 {
+			n--
+		}
+		if n <= 1 {
+			iq4_nl_matvec_c(data, rows, cols, x, mut out)
+			return
+		}
+		wg := pool_batch(n)
+		for t in 0 .. n {
+			r0, r1 := pool_bounds(rows, n, t)
+			pool.jobs <- PoolJob{
+				kind: PoolJobKind.iq4_nl_range
+				data: data
+				x:    x
+				out:  out
+				rows: rows
+				cols: cols
+				r0:   r0
+				n:    r1 - r0
+				wg:   wg
+			}
+		}
+		wg.wait()
+	}
+}

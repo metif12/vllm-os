@@ -462,6 +462,84 @@ void vllm_q4_0_matvec_f32(const unsigned char *data, const float *x, float *out,
 	}
 }
 
+// --- IQ4_NL (non-linear 4-bit) -------------------------------------------
+// The 16-entry int8 codebook from ggml-common.h `kvalues_iq4nl`. Published
+// constants only (no code copied); V mirror is infer.iq4_nl_grid.
+static const signed char vllm_iq4nl_lut[16] = {
+	-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+#if VLLM_HAVE_SIMD
+// One 32-elem IQ4_NL block dot (no scale). Split-half nibbles like Q4_0,
+// but each nibble indexes the non-linear int8 grid: use pshufb to map the
+// 16 codes to their grid bytes in one instruction, then widen + FMA.
+static VLLM_AVX2_FN float iq4_nl_block_dot_avx2(const unsigned char *qs, const float *x) {
+	__m128i q = _mm_loadu_si128((const __m128i *)qs);
+	__m128i lut = _mm_loadu_si128((const __m128i *)vllm_iq4nl_lut);
+	__m128i m15 = _mm_set1_epi8(0x0f);
+	__m128i lo = _mm_and_si128(q, m15);
+	__m128i hi = _mm_and_si128(_mm_srli_epi64(q, 4), m15);
+	__m128i lo_v = _mm_shuffle_epi8(lut, lo);
+	__m128i hi_v = _mm_shuffle_epi8(lut, hi);
+	__m256i lo0 = _mm256_cvtepi8_epi32(lo_v);
+	__m256i lo1 = _mm256_cvtepi8_epi32(_mm_srli_si128(lo_v, 8));
+	__m256i hi0 = _mm256_cvtepi8_epi32(hi_v);
+	__m256i hi1 = _mm256_cvtepi8_epi32(_mm_srli_si128(hi_v, 8));
+	__m256 f0 = _mm256_cvtepi32_ps(lo0);
+	__m256 f1 = _mm256_cvtepi32_ps(lo1);
+	__m256 f2 = _mm256_cvtepi32_ps(hi0);
+	__m256 f3 = _mm256_cvtepi32_ps(hi1);
+	__m256 a0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(x), _mm256_mul_ps(f1, _mm256_loadu_ps(x + 8)));
+	__m256 a1 = _mm256_fmadd_ps(f2, _mm256_loadu_ps(x + 16), _mm256_mul_ps(f3, _mm256_loadu_ps(x + 24)));
+	return vllm_hsum_avx2(_mm256_add_ps(a0, a1));
+}
+#endif
+
+float vllm_iq4_nl_dot_f32(const unsigned char *qs, const float *x, float scale, int n) {
+#if VLLM_HAVE_SIMD
+	if (n == 32 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		return iq4_nl_block_dot_avx2(qs, x) * scale;
+	}
+#endif
+	float s = 0.0f;
+	for (int i = 0; i < n / 2; i++) {
+		unsigned char b = qs[i];
+		s += (float)vllm_iq4nl_lut[b & 0x0f] * x[i];
+		s += (float)vllm_iq4nl_lut[b >> 4] * x[i + n / 2];
+	}
+	return s * scale;
+}
+
+void vllm_iq4_nl_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
+	int cols) {
+	int bpr = cols / 32;
+#if VLLM_HAVE_SIMD
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		vllm_f16_lut_init();
+		for (int r = 0; r < rows; r++) {
+			float s = 0.0f;
+			const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
+			for (int b = 0; b < bpr; b++) {
+				const unsigned char *blk = row + (size_t)b * 18;
+				float scale = vllm_f16_le_to_f32(blk);
+				s += iq4_nl_block_dot_avx2(blk + 2, x + (size_t)b * 32) * scale;
+			}
+			out[r] = s;
+		}
+		return;
+	}
+#endif
+	for (int r = 0; r < rows; r++) {
+		float s = 0.0f;
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 18;
+			s += vllm_iq4_nl_dot_f32(blk + 2, x + (size_t)b * 32, vllm_f16_le_to_f32(blk), 32);
+		}
+		out[r] = s;
+	}
+}
+
 #if VLLM_HAVE_SIMD
 // One 32-elem split-half Q4_1 block dot (no scale/min applied by caller
 // confusion -- applied here): byte i holds q[i] (low nibble, 0..15) and

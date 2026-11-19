@@ -293,6 +293,16 @@ A/B needs a quiet box (the measurement host was loaded — see
 `docs/perf.md` win 13). `parallel_threads()` keeps the measured default of
 4 with a `VLLM_THREADS` override until that A/B exists.
 
+Status 2026-11-19 (quants): **IQ4_NL landed** — pure-V dequant/fused dot
+(`quant.v`) + AVX2 `pshufb` codebook matvec (`vllm_kernels.{h,c}`), the
+`simd_c.v` bridge, threaded + pooled row-block head, and GGUF 18-byte
+block sizing. The 16 int8 codebook values and split-half layout are pinned
+to the GGML primary source (`ggml-common.h` / `ggml-quants.c`); tests cover
+codebook identity, fused-vs-dequant, C-vs-V agreement, threaded agreement,
+and tail rows. No IQ4_NL weights ship with the v1 assets, so validation is
+synthetic — real-weight maxdiff / PPL awaits an IQ4_NL GGUF. `Q2_0` and the
+quality-gate harness stay next.
+
 * Threads + pool. `threads = phys_cores - 1`, one core reserved for the
   accept loop (`src/api/server.v`), no oversubscription, no busy-poll;
   then a persistent pool replacing spawn-per-call (`src/infer/parallel.v`,

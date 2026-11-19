@@ -389,6 +389,7 @@ fn ggml_type_size(t GgmlType) u64 {
 		.q5_0, .q5_1 { return 1 }
 		.q8_0, .q8_1 { return 1 }
 		.q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q8_k { return 1 }
+		.iq4_nl { return 1 } // 18 bytes / 32 elems; exact math below
 		.i8 { return 1 }
 		.i16 { return 2 }
 		.i32 { return 4 }
@@ -404,10 +405,11 @@ fn ggml_type_size(t GgmlType) u64 {
 // ggml_type_size * n. K-quants other than Q6_K stay on the estimate path
 // (follow-up when a K-quant weight ships in v1).
 fn ggml_tensor_bytes(t GgmlType, n u64) u64 {
-	if t == .q4_0 || t == .q4_1 || t == .q5_0 || t == .q5_1 || t == .q8_0 || t == .q8_1 {
+	if t == .q4_0 || t == .q4_1 || t == .q5_0 || t == .q5_1 || t == .q8_0 || t == .q8_1
+		|| t == .iq4_nl {
 		blocks := (n + 31) / 32
 		per := match t {
-			.q4_0 { u64(18) }
+			.q4_0, .iq4_nl { u64(18) } // same 18-byte block, different codebook
 			.q4_1 { u64(20) }
 			.q5_0 { u64(22) }
 			.q5_1 { u64(24) }

@@ -70,6 +70,8 @@ pub fn embed_gather(blob []u8, gguf GgufModel, dim int, id int, mut out []f32) !
 	data := tensor_bytes(blob, gguf, 'token_embd.weight')!
 	if info.typ == .q6_k {
 		embed_gather_q6_k(data, dim, id, mut out)
+	} else if info.typ == .iq4_nl {
+		embed_gather_iq4_nl(data, dim, id, mut out)
 	} else {
 		embed_gather_i8(data, dim, id, mut out)
 	}
@@ -330,6 +332,8 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 		// Threaded row-block vocab head (serial fallback under
 		// freestanding / VLLM_THREADS=1 / small rows; the guest pins 1).
 		q6_k_matvec_parallel_pool(f.pool, emb, f.logits.len, h, f.normed, mut f.logits)
+	} else if emb_info.typ == .iq4_nl {
+		iq4_nl_matvec_parallel_pool(f.pool, emb, f.logits.len, h, f.normed, mut f.logits)
 	} else {
 		i8_matvec(emb, f.logits.len, h, f.normed, mut f.logits)
 	}

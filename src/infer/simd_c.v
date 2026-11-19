@@ -37,6 +37,8 @@ $if prod {
 	fn C.vllm_q4_0_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_q4_1_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_q6_k_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
+	fn C.vllm_iq4_nl_dot_f32(qs &u8, x &f32, scale f32, n int) f32
+	fn C.vllm_iq4_nl_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_rmsnorm_f32(x &f32, w &f32, n int, eps f64)
 	fn C.vllm_dot_f32(a &f32, b &f32, n int) f32
 	fn C.vllm_softmax_scaled_fast_f32(xs &f32, n int, scale f32)
@@ -200,6 +202,54 @@ pub fn q6_k_matvec_c_range(data []u8, rows int, cols int, x []f32, r0 int, n int
 	ds := data[r0 * bpr * 210..(r0 + n) * bpr * 210]
 	mut outs := unsafe { out[r0..r0 + n] }
 	q6_k_matvec(ds, n, cols, x, mut outs)
+}
+
+// iq4_nl_dot_row_c is the C/AVX2 version of iq4_nl_dot_row (non-linear
+// 4-bit codebook, split-half, fused dot). Falls back to pure V outside -prod
+// / without AVX2 / with VLLM_NO_SIMD=1.
+@[direct_array_access]
+pub fn iq4_nl_dot_row_c(block BlockIQ4NL, x []f32, x_off int) f32 {
+	$if prod {
+		if has_avx2() {
+			return C.vllm_iq4_nl_dot_f32(&block.qs[0], &x[x_off], f16bits_to_f32(block.d), qk4_nl)
+		}
+	}
+	return iq4_nl_dot_row(block, x, x_off)
+}
+
+// iq4_nl_matvec_c computes out = W*x for an IQ4_NL row-major matrix via the
+// C kernel (AVX2 pshufb codebook lookup), or pure V otherwise.
+@[direct_array_access]
+pub fn iq4_nl_matvec_c(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_iq4_nl_matvec_f32(data.data, x.data, out.data, rows, cols)
+			}
+			return
+		}
+	}
+	iq4_nl_matvec(data, rows, cols, x, mut out)
+}
+
+// iq4_nl_matvec_c_range computes out[r0..r0+n] on a row block (offsets
+// resolve inside so workers can share the caller's buffers). Same dispatch
+// as iq4_nl_matvec_c; used by the threaded vocab-head path.
+@[direct_array_access]
+pub fn iq4_nl_matvec_c_range(data []u8, rows int, cols int, x []f32, r0 int, n int, mut out []f32) {
+	bpr := cols / qk4_nl
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_iq4_nl_matvec_f32(&data[r0 * bpr * iq4_nl_block_bytes], x.data, &out[r0], n,
+					cols)
+			}
+			return
+		}
+	}
+	ds := data[r0 * bpr * iq4_nl_block_bytes..(r0 + n) * bpr * iq4_nl_block_bytes]
+	mut outs := unsafe { out[r0..r0 + n] }
+	iq4_nl_matvec(ds, n, cols, x, mut outs)
 }
 
 // rmsnorm_c normalizes x with weight w and eps via the C kernel.

@@ -56,6 +56,17 @@ void vllm_q4_1_matvec_f32(const unsigned char *data, const float *x, float *out,
 void vllm_q6_k_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
 	int cols);
 
+// IQ4_NL (non-linear 4-bit): dot(dequant(q_row), x_f32) * scale over n elems.
+// n=32, qs holds 16 split-half nibble codes, result = dot(grid[code],x)*d
+// with the GGML kvalues_iq4nl codebook — mirrors infer.iq4_nl_dot_row.
+float vllm_iq4_nl_dot_f32(const unsigned char *qs, const float *x, float scale, int n);
+
+// out = W * x, W row-major IQ4_NL [rows x cols] (cols must divide 32).
+// data holds rows*cols/32 packed 18-byte blocks (f16 d + 16 split-half
+// nibble bytes), matching infer.iq4_nl_matvec.
+void vllm_iq4_nl_matvec_f32(const unsigned char *data, const float *x, float *out, int rows,
+	int cols);
+
 // x[i] = x[i] * w[i] / sqrt(mean(x^2) + eps), in place.
 void vllm_rmsnorm_f32(float *x, const float *w, int n, float eps);
 

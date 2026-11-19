@@ -42,10 +42,11 @@ src/infer/model.v     # Qwen3 arch config + KV override + generate path
 src/infer/attention.v # phase-1b primitives: KVCache arena + attention_step
 src/infer/sampler.v   # presets, fused softmax-scale, min-p, heap top-k, zero-alloc top-k/top-p + xorshift RNG
 src/infer/tokenizer.v # Tokenizer iface (BPE loader + stub) + Qwen ChatML template
-src/infer/quant.v     # Q4_0/Q8_0/F16 dequant + fused Q8 dot (no materialize)
+src/infer/quant.v     # Q4_0/Q4_1/Q6_K/IQ4_NL/F16 dequant + fused dots (no materialize)
 src/infer/nn.v        # rmsnorm/rope-tables/swiglu/unrolled+blocked matvec
 src/infer/backend.v   # Backend interface + registry (cpu/cpu-blocked/cpu-simd/cpu-parallel/auto)
 src/infer/parallel.v    # threaded row-block matvec (VLLM_THREADS, freestanding-safe fallback)
+src/infer/worker_pool.v # persistent decode worker pool (per-batch WaitGroups, no global state)
 src/infer/simd_c.v    # V wrappers for vllm_kernels.{h,c} (prod-only link, runtime-dispatched)
 src/infer/tensor_view.v # VTL-aligned zero-copy Tensor view (no dependency)
 src/api/routes.v      # Route table + match_route (new endpoint = one row)

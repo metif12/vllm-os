@@ -140,6 +140,15 @@ How the wins happened, in order:
     bounded thread count regardless of concurrent requests). Re-measure
     `tools/forward_bench.v` with `VLLM_NO_POOL=1` (legacy spawn) vs pool on
     a quiet box before quoting a number.
+14. **IQ4_NL kernel** (`quant.v` + `vllm_kernels.{h,c}`, 2026-11-19):
+    non-linear 4-bit support — 18-byte split-half block (f16 `d` + 16
+    nibble codes), GGML's 16-entry int8 codebook, fused scalar dot, and an
+    AVX2 `pshufb` codebook-lookup matvec with a scalar C fallback. The
+    vocab head and token embedding dispatch on `.iq4_nl` and reuse the
+    threaded/pooled row-block path. **No timing row**: no IQ4_NL GGUF is
+    among the v1 assets, so only correctness is gated (codebook identity,
+    fused-vs-dequant, C-vs-V, threaded agreement incl. tail rows), dev +
+    `-prod`. Real-weight maxdiff/PPL and a tok/s row need an IQ4_NL file.
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
