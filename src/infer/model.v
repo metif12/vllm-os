@@ -289,7 +289,10 @@ fn (m Model) generate_real_cached(ids []int, max_tokens int, sp SampleParams) !s
 // wall-time win (see ROADMAP phase 8 / docs/perf.md).
 fn (m Model) generate_pld(ids []int, max_tokens int, sp SampleParams) !string {
 	_ = sp // PLD is greedy-only; sampling params are resolved by the caller
-	need := ids.len + max_tokens
+	// A draft batch appends up to `continuation` KV rows before rejection
+	// rolls them back, so the arena must hold emitted tokens plus one full
+	// draft window. new_forward_ctx_cap clamps to cfg.ctx_cap.
+	need := ids.len + max_tokens + m.pld.continuation + 1
 	mut f := new_forward_ctx_cap(m.cfg, m.gguf, m.blob, need)!
 	// Prefill: feed the prompt, leaving f.logits at the first answer position.
 	for id in ids {
@@ -299,6 +302,14 @@ fn (m Model) generate_pld(ids []int, max_tokens int, sp SampleParams) !string {
 	eos := m.gguf.kv['tokenizer.ggml.eos_token_id'].int()
 	mut out := []int{cap: max_tokens}
 	mut controller := new_pld_controller(m.pld, ids)
+	// Shared-weight batch verification is EXPERIMENTAL: the current kernels
+	// do a horizontal sum per block per token, which is slower than the
+	// row-vector single-token path, and their accumulation order can drift a
+	// near-tie argmax on accepted drafts. Keep bit-exact serial verification
+	// as the default; opt in with VLLM_PLD_BATCH=1 to exercise the path.
+	if os.getenv('VLLM_PLD_BATCH') == '1' {
+		controller.enable_batch(m.cfg, m.gguf)
+	}
 	mut emitted := []int{len: m.pld.continuation + 1}
 	for out.len < max_tokens {
 		n := controller.next_tokens(mut f, m.blob, m.gguf, mut emitted)!

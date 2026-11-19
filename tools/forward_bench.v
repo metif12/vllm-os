@@ -37,7 +37,11 @@ fn main() {
 	println(m.cfg.hidden)
 	print('model_layers=')
 	println(m.cfg.layers)
-	ids := m.tok.encode('Hello world')
+	probe := os.getenv('VLLM_PROBE')
+	if probe == '' {
+		probe = 'Hello world'
+	}
+	ids := m.tok.encode(probe)
 	pld_on := os.getenv('VLLM_PLD') == '1'
 	mut ngram := 3
 	if v := os.getenv_opt('VLLM_PLD_NGRAM') {

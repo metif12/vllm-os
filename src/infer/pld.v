@@ -36,6 +36,17 @@ mut:
 	history []int
 	drafts  []int
 	stats   PldStats
+	// batch is the shared-weight verifier scratch (nil = serial verify).
+	batch &BatchCtx = unsafe { nil }
+}
+
+// enable_batch prepares the shared-weight batched verifier for this model.
+// Returns false (leaving the serial path active) for quant mixes the batched
+// kernels do not cover.
+pub fn (mut c PldController) enable_batch(cfg Qwen3Config, gguf GgufModel) bool {
+	mut bc := new_batch_ctx(cfg, gguf, c.drafts.len) or { return false }
+	c.batch = &bc
+	return true
 }
 
 pub fn new_pld_controller(cfg PldCfg, prompt []int) PldController {
@@ -112,6 +123,9 @@ pub fn (mut c PldController) next_tokens(mut f ForwardCtx, blob []u8, gguf GgufM
 	}
 
 	c.stats.drafts += nd
+	if c.batch != unsafe { nil } {
+		return c.verify_batched(mut f, blob, gguf, nd, mut out)
+	}
 	mut written := 0
 	for i := 0; i < nd; i++ {
 		pred := sample_greedy(f.logits)
@@ -130,6 +144,62 @@ pub fn (mut c PldController) next_tokens(mut f ForwardCtx, blob []u8, gguf GgufM
 	}
 	// All drafts accepted: the model's argmax after feeding the last draft is
 	// the bonus token (standard speculative decoding).
+	bonus := sample_greedy(f.logits)
+	out[written] = bonus
+	written++
+	c.history << bonus
+	pld_advance(mut f, blob, gguf, bonus)!
+	return written
+}
+
+// verify_batched runs the whole draft block in one shared-weight batch,
+// then compares the per-position argmaxes in order. On rejection it rolls
+// the KV cache back to the accepted prefix and feeds the model's token.
+fn (mut c PldController) verify_batched(mut f ForwardCtx, blob []u8, gguf GgufModel, nd int, mut out []int) !int {
+	start_pos := f.pos
+	vocab := f.logits.len
+	// decode_batch overwrites f.logits with the last draft row, so snapshot
+	// the authoritative distribution for the first position before it runs.
+	mut first_logits := []f32{len: vocab}
+	for j, v in f.logits {
+		first_logits[j] = v
+	}
+	mut toks := []int{len: nd}
+	for i := 0; i < nd; i++ {
+		toks[i] = c.drafts[i]
+	}
+	f.decode_batch(mut c.batch, toks)!
+	mut written := 0
+	for i := 0; i < nd; i++ {
+		// The first draft position is verified against the distribution we
+		// already have (f.logits from the previous step) — not a recomputed
+		// batch row — so the emitted token matches the serial path exactly.
+		mut row := unsafe { first_logits[0..vocab] }
+		if i > 0 {
+			row = c.batch.logits[i * vocab..(i + 1) * vocab]
+		}
+		pred := sample_greedy(row)
+		if pred != c.drafts[i] {
+			// The batch appended all nd draft rows already. Truncate to the
+			// accepted prefix, then feed the model's token from that prefix.
+			for l in 0 .. f.cfg.layers {
+				for kh in 0 .. f.cfg.heads_kv {
+					f.k_cache[l * f.cfg.heads_kv + kh].truncate_to(start_pos + i)!
+					f.v_cache[l * f.cfg.heads_kv + kh].truncate_to(start_pos + i)!
+				}
+			}
+			f.pos = start_pos + i
+			out[written] = pred
+			written++
+			c.history << pred
+			pld_advance(mut f, blob, gguf, pred)!
+			return written
+		}
+		c.stats.accepted++
+		out[written] = c.drafts[i]
+		written++
+		c.history << c.drafts[i]
+	}
 	bonus := sample_greedy(f.logits)
 	out[written] = bonus
 	written++

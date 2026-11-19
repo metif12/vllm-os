@@ -59,6 +59,7 @@ src/api/context.v     # HandlerCtx: shared model + resolved config
 tools/bench_kernels.v # host-only kernel benchmark (links real C file, embeds V refs)
 tools/forward_bench.v # host-only full-decode probe (real GGUF, best-of-N ms/token)
 tools/quality_gates.v # PPL/KLD/Same-top-p/maxdiff/VmHWM gate harness (baseline JSON)
+tools/pld_bench.v     # PLD accept-rate + wall-time probe (opt-in batch verifier)
 tools/infer_smoke.v   # host-only greedy smoke (also runs as /sbin/vllm in-guest; outputs must match)
 docs/                 # architecture/api/configuration/formats/building/development/security
 kernel/               # vinix-mini fork plan, mini.md spec, mini.ld, cmdline.txt, features.conf

@@ -80,6 +80,16 @@ void vllm_q2_0_matvec_f32(const unsigned char *data, const float *x, float *out,
 // x[i] = x[i] * w[i] / sqrt(mean(x^2) + eps), in place.
 void vllm_rmsnorm_f32(float *x, const float *w, int n, float eps);
 
+// Batched matmul for speculative verification: weights are dequantized once
+// per block and dotted against all k activation vectors. xs is [k][cols],
+// outs is [k][rows] (row-major, caller-owned).
+void vllm_q4_0_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
+	int rows, int cols);
+void vllm_q4_1_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
+	int rows, int cols);
+void vllm_q6_k_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
+	int rows, int cols);
+
 // Plain dot product over n elems.
 float vllm_dot_f32(const float *a, const float *b, int n);
 

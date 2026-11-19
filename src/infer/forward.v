@@ -241,6 +241,203 @@ pub fn f32_row(data []u8) []f32 {
 	return out
 }
 
+// --- Batched decode for speculative verification -------------------------
+//
+// BatchCtx owns k-wide scratch. decode_batch runs k tokens through the
+// weight-shared batched matmuls (each weight block dequantized once against
+// all k activations) and produces k logits rows — one per token position.
+// The caller verifies drafts against those logits and rolls the KV cache
+// back to the accepted prefix. All buffers are allocated once up front;
+// nothing allocates inside the verify loop.
+
+pub struct BatchCtx {
+pub:
+	k int
+mut:
+	hidden  []f32
+	normed  []f32
+	q       []f32
+	kk      []f32
+	vv      []f32
+	attn    []f32
+	proj    []f32
+	gate    []f32
+	up      []f32
+	down    []f32
+	probs   []f32
+	cos_sin []f32
+	logits  []f32
+}
+
+// new_batch_ctx allocates scratch for max_k simultaneous tokens. It rejects
+// weights the batched kernels do not cover, so the caller can fall back to
+// the serial verifier for other quant mixes.
+pub fn new_batch_ctx(cfg Qwen3Config, gguf GgufModel, max_k int) !BatchCtx {
+	if max_k < 1 {
+		return error('batch: max_k must be >= 1')
+	}
+	// Only the v1 Q4_0/Q4_1/Q6_K mix has batched kernels.
+	for l in 0 .. cfg.layers {
+		p := 'blk.${l}.'
+		for suffix in ['attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'attn_output.weight',
+			'ffn_gate.weight', 'ffn_up.weight'] {
+			info := gguf.find(p + suffix) or { return error('batch: missing ${p}${suffix}') }
+			if info.typ != .q4_0 {
+				return error('batch: unsupported quant ${info.typ} on ${suffix}')
+			}
+		}
+	}
+	emb_info := gguf.find('token_embd.weight') or {
+		return error('batch: missing token_embd.weight')
+	}
+	if emb_info.typ != .q6_k {
+		return error('batch: unsupported head quant ${emb_info.typ}')
+	}
+	vocab := vocab_size(gguf)
+	h := cfg.hidden
+	nh := cfg.heads_q
+	nkv := cfg.heads_kv
+	hd := cfg.head_dim
+	vd := cfg.v_dim
+	inter := cfg.intermediate
+	return BatchCtx{
+		k:       max_k
+		hidden:  []f32{len: max_k * h}
+		normed:  []f32{len: max_k * h}
+		q:       []f32{len: max_k * nh * hd}
+		kk:      []f32{len: max_k * nkv * hd}
+		vv:      []f32{len: max_k * nkv * vd}
+		attn:    []f32{len: max_k * nh * vd}
+		proj:    []f32{len: max_k * h}
+		gate:    []f32{len: max_k * inter}
+		up:      []f32{len: max_k * inter}
+		down:    []f32{len: max_k * h}
+		probs:   []f32{len: max_k * cfg.ctx_cap}
+		cos_sin: []f32{len: max_k * hd}
+		logits:  []f32{len: max_k * vocab}
+	}
+}
+
+// decode_batch runs tokens[0..k) at positions f.pos..f.pos+k-1 and leaves
+// f.logits at the distribution after the last token. The per-token logits
+// are in batch.logits rows [t][vocab]. KV caches gain k rows; callers that
+// reject a draft must truncate them via KVCache.truncate_to.
+pub fn (mut f ForwardCtx) decode_batch(mut b &BatchCtx, tokens []int) ! {
+	k := tokens.len
+	if k < 1 || k > b.k {
+		return error('batch: k=${k} outside 1..${b.k}')
+	}
+	h := f.cfg.hidden
+	nh := f.cfg.heads_q
+	nkv := f.cfg.heads_kv
+	hd := f.cfg.head_dim
+	vd := f.cfg.v_dim
+	inter := f.cfg.intermediate
+	q_rows := nh * hd
+	k_rows := nkv * hd
+	v_rows := nkv * vd
+	scale := f32(1.0 / math.sqrt(f64(hd)))
+	start_pos := f.pos
+	for t in 0 .. k {
+		embed_gather(f.blob, f.gguf, h, tokens[t], mut b.hidden[t * h..(t + 1) * h])!
+		rope_table(mut b.cos_sin[t * hd..(t + 1) * hd], start_pos + t, hd, f.cfg.rope_theta)
+	}
+	for l in 0 .. f.cfg.layers {
+		lt := f.layer_tensors(l)!
+		// attention block: norm -> batched q/k/v -> norm/RoPE -> KV append
+		// -> causal attention -> batched o-proj -> residual.
+		for t in 0 .. k {
+			for i in 0 .. h {
+				b.normed[t * h + i] = b.hidden[t * h + i]
+			}
+			rmsnorm_in_place(mut b.normed[t * h..(t + 1) * h], lt.an, f.cfg.rms_norm_eps)
+		}
+		q4_0_matmul_c(lt.q, b.normed, mut b.q, k, q_rows, h)
+		q4_0_matmul_c(lt.k, b.normed, mut b.kk, k, k_rows, h)
+		q4_0_matmul_c(lt.v, b.normed, mut b.vv, k, v_rows, h)
+		gqa := nh / nkv
+		for t in 0 .. k {
+			for qh in 0 .. nh {
+				rmsnorm_in_place(mut b.q[t * q_rows + qh * hd..t * q_rows + (qh + 1) * hd], lt.qn,
+					f.cfg.rms_norm_eps)
+			}
+			for kh in 0 .. nkv {
+				rmsnorm_in_place(mut b.kk[t * k_rows + kh * hd..t * k_rows + (kh + 1) * hd], lt.kn,
+					f.cfg.rms_norm_eps)
+			}
+			for kh in 0 .. nkv {
+				rope_in_place(mut b.q[t * q_rows + kh * gqa * hd..t * q_rows + (kh * gqa + 1) * hd], mut b.kk[
+					t * k_rows + kh * hd..t * k_rows + (kh + 1) * hd],
+					b.cos_sin[t * hd..(t + 1) * hd], hd)
+				for g in 1 .. gqa {
+					rope_q_in_place(mut b.q[t * q_rows + (kh * gqa + g) * hd..t * q_rows +
+						(kh * gqa + g + 1) * hd], b.cos_sin[t * hd..(t + 1) * hd], hd)
+				}
+			}
+			for kh in 0 .. nkv {
+				f.k_cache[l * nkv + kh].append(b.kk[t * k_rows + kh * hd..t * k_rows + (kh + 1) * hd])!
+				f.v_cache[l * nkv + kh].append(b.vv[t * v_rows + kh * vd..t * v_rows + (kh + 1) * vd])!
+			}
+		}
+		for t in 0 .. k {
+			n := start_pos + t + 1
+			for qh in 0 .. nh {
+				kh := qh / gqa
+				attention_prefix(b.q[t * q_rows + qh * hd..t * q_rows + (qh + 1) * hd], &f.k_cache[
+					l * nkv + kh], &f.v_cache[l * nkv + kh], scale, n, mut
+					b.probs[t * f.cfg.ctx_cap..], mut b.attn[t * nh * vd + qh * vd..t * nh * vd +
+					(qh + 1) * vd])!
+			}
+		}
+		q4_0_matmul_c(lt.o, b.attn, mut b.proj, k, h, nh * vd)
+		for t in 0 .. k {
+			for i in 0 .. h {
+				b.hidden[t * h + i] += b.proj[t * h + i]
+			}
+		}
+		// ffn block: norm -> batched gate/up -> SwiGLU -> batched down -> residual.
+		for t in 0 .. k {
+			for i in 0 .. h {
+				b.normed[t * h + i] = b.hidden[t * h + i]
+			}
+			rmsnorm_in_place(mut b.normed[t * h..(t + 1) * h], lt.fn_, f.cfg.rms_norm_eps)
+		}
+		q4_0_matmul_c(lt.gate, b.normed, mut b.gate, k, inter, h)
+		q4_0_matmul_c(lt.up, b.normed, mut b.up, k, inter, h)
+		for t in 0 .. k {
+			silu_in_place(mut b.gate[t * inter..(t + 1) * inter])
+			for i in 0 .. inter {
+				b.up[t * inter + i] *= b.gate[t * inter + i]
+			}
+		}
+		if lt.down_typ == .q4_1 {
+			q4_1_matmul_c(lt.down, b.up, mut b.down, k, h, inter)
+		} else {
+			q4_0_matmul_c(lt.down, b.up, mut b.down, k, h, inter)
+		}
+		for t in 0 .. k {
+			for i in 0 .. h {
+				b.hidden[t * h + i] += b.down[t * h + i]
+			}
+		}
+	}
+	// vocab head: final norm per token, then batched Q6_K projection.
+	onorm := f32_row(tensor_bytes(f.blob, f.gguf, 'output_norm.weight')!)
+	for t in 0 .. k {
+		for i in 0 .. h {
+			b.normed[t * h + i] = b.hidden[t * h + i]
+		}
+		rmsnorm_in_place(mut b.normed[t * h..(t + 1) * h], onorm, f.cfg.rms_norm_eps)
+	}
+	emb := tensor_bytes(f.blob, f.gguf, 'token_embd.weight')!
+	// rows is the fixed vocabulary (b.logits is sized for b.k, not k).
+	q6_k_matmul_c(emb, b.normed, mut b.logits, k, b.logits.len / b.k, h)
+	for i in 0 .. f.logits.len {
+		f.logits[i] = b.logits[(k - 1) * f.logits.len + i]
+	}
+	f.pos += k
+}
+
 // decode_step runs one full forward for the token already in hidden,
 // appends kv at pos, and leaves logits over the vocab. No allocation:
 // all temporaries are ForwardCtx scratch.

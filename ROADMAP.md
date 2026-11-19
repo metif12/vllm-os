@@ -362,12 +362,15 @@ argmax. Every emitted token is the model's argmax at its position, so output
 is bit-identical on/off (gated on real weights). `tools/forward_bench.v`
 with `VLLM_PLD=1` reports draft accept rate.
 
-The **wall-time half of the gate is deliberately unmet**: `decode_step` is
-single-token and greedy sampling is already just an argmax, so serial
-verification runs the same number of forwards as plain decode. A real speedup
-needs a batched verifier (multi-token matvec + batched causal attention),
-which is a separate engine change and the next Phase 8 step. EAGLE3/DFlash/
-DSpark/MTP stay out as planned.
+The **wall-time half of the gate is still unmet**. A shared-weight batched
+verifier was built (`vllm_q{4_0,4_1,6_k}_matmul_f32`, `decode_batch`, KV
+rollback on rejection, `tools/pld_bench.v`) but is **EXPERIMENTAL / opt-in**
+via `VLLM_PLD_BATCH=1`: its kernels do a horizontal sum per block per token,
+so on the probe they were ~2x slower than the row-vector single-token path,
+and their accumulation order can flip a near-tie argmax on accepted drafts.
+The default stays bit-exact serial verification. A real win needs a
+SIMD-across-k matmul (k register accumulators, one hsum per row) plus a
+batched Q6_K head — follow-up work. EAGLE3/DFlash/DSpark/MTP stay out.
 
 * Ship only PLD/ngram in `src/infer/sampler.v` (pure V,
   arena-allocated, opt-in flag + `VLLM_*` env in `src/cfg/config.v`).

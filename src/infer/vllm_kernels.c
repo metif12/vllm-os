@@ -836,6 +836,166 @@ static float vllm_expf_fast(float x) {
 	return z.f;
 }
 
+// --- Batched matmul for speculative verification -------------------------
+// Weight blocks are dequantized ONCE and dotted against all k activation
+// vectors, so weight traffic is amortized across the draft batch. outs and
+// xs are row-major [k][rows] / [k][cols]. The per-token accumulation order
+// matches the single-token kernels block-by-block; tiny f32 reassociation
+// drift is possible (the same class already documented for row-vector Q4).
+
+static void vllm_q4_0_unpack(const unsigned char *qs, float *vals) {
+	for (int i = 0; i < 16; i++) {
+		unsigned char b = qs[i];
+		vals[i] = (float)((int)(b & 0x0f) - 8);
+		vals[i + 16] = (float)((int)((b >> 4) & 0x0f) - 8);
+	}
+}
+
+void vllm_q4_0_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
+	int rows, int cols) {
+	int bpr = cols / 32;
+#if VLLM_HAVE_SIMD
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		vllm_f16_lut_init();
+		for (int r = 0; r < rows; r++) {
+			const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
+			for (int t = 0; t < k; t++) outs[(size_t)t * rows + r] = 0.0f;
+			for (int b = 0; b < bpr; b++) {
+				const unsigned char *blk = row + (size_t)b * 18;
+				float scale = vllm_f16_le_to_f32(blk);
+				for (int t = 0; t < k; t++) {
+					const float *x = xs + (size_t)t * cols + (size_t)b * 32;
+					// Same block dot as the single-token kernel -> bit-identical
+					// logits; weights stay cached across the k tokens.
+					outs[(size_t)t * rows + r] += q4_0_block_dot_avx2(blk + 2, x) * scale;
+				}
+			}
+		}
+		return;
+	}
+#endif
+	for (int r = 0; r < rows; r++) {
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 18;
+		for (int t = 0; t < k; t++) outs[(size_t)t * rows + r] = 0.0f;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 18;
+			float scale = vllm_f16_le_to_f32(blk);
+			for (int t = 0; t < k; t++) {
+				const float *x = xs + (size_t)t * cols + (size_t)b * 32;
+				float vals[32];
+				vllm_q4_0_unpack(blk + 2, vals);
+				outs[(size_t)t * rows + r] += vllm_dot_f32(vals, x, 32) * scale;
+			}
+		}
+	}
+}
+
+void vllm_q4_1_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
+	int rows, int cols) {
+	int bpr = cols / 32;
+#if VLLM_HAVE_SIMD
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		vllm_f16_lut_init();
+		for (int r = 0; r < rows; r++) {
+			const unsigned char *row = data + (size_t)r * (size_t)bpr * 20;
+			for (int t = 0; t < k; t++) outs[(size_t)t * rows + r] = 0.0f;
+			for (int b = 0; b < bpr; b++) {
+				const unsigned char *blk = row + (size_t)b * 20;
+				float scale = vllm_f16_le_to_f32(blk);
+				float min = vllm_f16_le_to_f32(blk + 2);
+				for (int t = 0; t < k; t++) {
+					const float *x = xs + (size_t)t * cols + (size_t)b * 32;
+					outs[(size_t)t * rows + r] += q4_1_block_dot_avx2(blk + 4, x, scale, min);
+				}
+			}
+		}
+		return;
+	}
+#endif
+	for (int r = 0; r < rows; r++) {
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 20;
+		for (int t = 0; t < k; t++) outs[(size_t)t * rows + r] = 0.0f;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 20;
+			float scale = vllm_f16_le_to_f32(blk);
+			float min = vllm_f16_le_to_f32(blk + 2);
+			for (int t = 0; t < k; t++) {
+				const float *x = xs + (size_t)t * cols + (size_t)b * 32;
+				float vals[32];
+				for (int i = 0; i < 16; i++) {
+					unsigned char q = blk[4 + i];
+					vals[i] = (float)(int)(q & 0x0f);
+					vals[i + 16] = (float)(int)((q >> 4) & 0x0f);
+				}
+				float dot = vllm_dot_f32(vals, x, 32);
+				float xsum = 0.0f;
+				for (int i = 0; i < 32; i++) xsum += x[i];
+				outs[(size_t)t * rows + r] += dot * scale + xsum * min;
+			}
+		}
+	}
+}
+
+void vllm_q6_k_matmul_f32(const unsigned char *data, const float *xs, float *outs, int k,
+	int rows, int cols) {
+	int bpr = cols / 256;
+#if VLLM_HAVE_SIMD
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		vllm_f16_lut_init();
+		for (int r = 0; r < rows; r++) {
+			const unsigned char *row = data + (size_t)r * (size_t)bpr * 210;
+			for (int t = 0; t < k; t++) outs[(size_t)t * rows + r] = 0.0f;
+			for (int b = 0; b < bpr; b++) {
+				const unsigned char *blk = row + (size_t)b * 210;
+				const signed char *sc = (const signed char *)(blk + 192);
+				float d = vllm_f16_lut_get(blk + 208);
+				for (int t = 0; t < k; t++) {
+					const float *x = xs + (size_t)t * cols + (size_t)b * 256;
+					float v = q6_k_half_dot_avx2(blk, blk + 128, sc, x) +
+						q6_k_half_dot_avx2(blk + 64, blk + 160, sc + 8, x + 128);
+					outs[(size_t)t * rows + r] += v * d;
+				}
+			}
+		}
+		return;
+	}
+#endif
+	for (int r = 0; r < rows; r++) {
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 210;
+		for (int t = 0; t < k; t++) outs[(size_t)t * rows + r] = 0.0f;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 210;
+			const unsigned char *ql = blk;
+			const unsigned char *qh = blk + 128;
+			const signed char *sc = (const signed char *)(blk + 192);
+			float d = vllm_f16_le_to_f32(blk + 208);
+			for (int t = 0; t < k; t++) {
+				const float *x = xs + (size_t)t * cols + (size_t)b * 256;
+				float vals[256];
+				for (int j = 0; j < 2; j++) {
+					for (int l = 0; l < 32; l++) {
+						unsigned char h = qh[j * 32 + l];
+						int f0 = (h & 3) << 4;
+						int f1 = ((h >> 2) & 3) << 4;
+						int f2 = ((h >> 4) & 3) << 4;
+						int f3 = ((h >> 6) & 3) << 4;
+						int p = j * 128 + l;
+						vals[p] = (float)(int)((ql[j * 64 + l] & 0x0f) | f0) - 32.0f;
+						vals[p + 32] = (float)(int)((ql[j * 64 + l + 32] & 0x0f) | f1) - 32.0f;
+						vals[p + 64] = (float)(int)((ql[j * 64 + l] >> 4) | f2) - 32.0f;
+						vals[p + 96] = (float)(int)((ql[j * 64 + l + 32] >> 4) | f3) - 32.0f;
+						for (int q = 0; q < 4; q++) {
+							int idx = p + q * 32;
+							vals[idx] *= (float)sc[idx / 16];
+						}
+					}
+				}
+				outs[(size_t)t * rows + r] += vllm_dot_f32(vals, x, 256) * d;
+			}
+		}
+	}
+}
+
 void vllm_softmax_scaled_fast_f32(float *xs, int n, float scale) {
 	float m = xs[0] * scale;
 	for (int i = 1; i < n; i++) {

@@ -72,6 +72,64 @@ pub fn (mut c KVCache) reset() {
 	c.len = 0
 }
 
+// truncate_to rolls the cache length back to n (n <= current len) without
+// freeing the arena. Batched draft verification uses this to discard the
+// tail when a draft is rejected.
+pub fn (mut c KVCache) truncate_to(n int) ! {
+	if n < 0 || n > c.len {
+		return error('kvcache: truncate_to ${n} out of 0..${c.len}')
+	}
+	c.len = n
+}
+
+// attention_prefix computes one query head against the first n KV rows
+// (causal prefix for batched draft positions). Identical math to
+// attention_step with the cache temporarily viewed at length n.
+@[direct_array_access]
+pub fn attention_prefix(q []f32, k &KVCache, v &KVCache, scale f32, n int, mut probs []f32, mut out []f32) ! {
+	if n < 1 || n > k.len() || v.len() < n || probs.len < n {
+		return error('attention_prefix: bad shape n=${n} k=${k.len()} v=${v.len()} probs=${probs.len}')
+	}
+	if q.len != k.dim || out.len != v.dim {
+		return error('attention_prefix: dim mismatch')
+	}
+	mut m := f32(-1e30)
+	kd := k.data
+	for i in 0 .. n {
+		base := i * k.dim
+		mut s := f32(0)
+		for d in 0 .. q.len {
+			s += q[d] * kd[base + d]
+		}
+		s *= scale
+		probs[i] = s
+		if s > m {
+			m = s
+		}
+	}
+	mut s := f32(0)
+	for i in 0 .. n {
+		e := f32(math.exp(f64(probs[i] - m)))
+		probs[i] = e
+		s += e
+	}
+	inv := f32(1.0 / f64(s))
+	for i in 0 .. n {
+		probs[i] *= inv
+	}
+	vd := v.data
+	for d in 0 .. out.len {
+		out[d] = 0
+	}
+	for i in 0 .. n {
+		base := i * v.dim
+		pi := probs[i]
+		for d in 0 .. out.len {
+			out[d] += pi * vd[base + d]
+		}
+	}
+}
+
 // attention_step computes one query head output against full caches:
 // scores = softmax(q.K^T * scale) into probs, out = Σ probs * V.
 // probs must hold ≥ k.len() elems; out must hold dim elems. Single head —

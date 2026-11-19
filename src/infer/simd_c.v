@@ -42,6 +42,9 @@ $if prod {
 	fn C.vllm_q2_0_dot_f32(qs &u8, x &f32, scale f32, n int) f32
 	fn C.vllm_q2_0_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_rmsnorm_f32(x &f32, w &f32, n int, eps f64)
+	fn C.vllm_q4_0_matmul_f32(data &u8, xs &f32, outs &f32, k int, rows int, cols int)
+	fn C.vllm_q4_1_matmul_f32(data &u8, xs &f32, outs &f32, k int, rows int, cols int)
+	fn C.vllm_q6_k_matmul_f32(data &u8, xs &f32, outs &f32, k int, rows int, cols int)
 	fn C.vllm_dot_f32(a &f32, b &f32, n int) f32
 	fn C.vllm_softmax_scaled_fast_f32(xs &f32, n int, scale f32)
 }
@@ -326,6 +329,56 @@ pub fn q2_0_r8_matvec_c(data []u8, rows int, cols int, x []f32, mut out []f32) {
 			s += q2_0_r8_dot_c(data, blk, x, b * qk2_0)
 		}
 		out[r] = s
+	}
+}
+
+// q4_0_matmul_c computes outs[t][r] = W[r,:] * xs[t,:] for all t in [0,k).
+// The C path dequantizes each weight block once against all k vectors; the
+// V fallback loops the existing single-vector kernel per t (same math).
+pub fn q4_0_matmul_c(data []u8, xs []f32, mut outs []f32, k int, rows int, cols int) {
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q4_0_matmul_f32(data.data, xs.data, outs.data, k, rows, cols)
+			}
+			return
+		}
+	}
+	for t in 0 .. k {
+		q4_0_matvec(data, rows, cols, xs[t * cols..(t + 1) * cols], mut
+			outs[t * rows..(t + 1) * rows])
+	}
+}
+
+// q4_1_matmul_c: batched Q4_1 form (same shape contract).
+pub fn q4_1_matmul_c(data []u8, xs []f32, mut outs []f32, k int, rows int, cols int) {
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q4_1_matmul_f32(data.data, xs.data, outs.data, k, rows, cols)
+			}
+			return
+		}
+	}
+	for t in 0 .. k {
+		q4_1_matvec(data, rows, cols, xs[t * cols..(t + 1) * cols], mut
+			outs[t * rows..(t + 1) * rows])
+	}
+}
+
+// q6_k_matmul_c: batched Q6_K form (same shape contract).
+pub fn q6_k_matmul_c(data []u8, xs []f32, mut outs []f32, k int, rows int, cols int) {
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q6_k_matmul_f32(data.data, xs.data, outs.data, k, rows, cols)
+			}
+			return
+		}
+	}
+	for t in 0 .. k {
+		q6_k_matvec(data, rows, cols, xs[t * cols..(t + 1) * cols], mut
+			outs[t * rows..(t + 1) * rows])
 	}
 }
 

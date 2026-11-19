@@ -71,8 +71,10 @@ Env: `VLLM_PRESET`, `VLLM_TEMP`, `VLLM_TOP_K`, `VLLM_TOP_P`,
 PLD is a correctness foundation: every emitted token is verified against
 the model's greedy argmax, so output is bit-identical on/off. Serial
 verification costs the same forwards as plain decode — there is no wall-time
-win until a batched verifier lands (see `docs/perf.md`). With `temp > 0` the
-setting is ignored and the normal sampling loop stays authoritative.
+win (see `docs/perf.md`). `VLLM_PLD_BATCH=1` opts into the EXPERIMENTAL
+shared-weight batch verifier; it is slower on the current kernels and can
+drift a near-tie argmax, so it is never the default. With `temp > 0` PLD is
+ignored and the normal sampling loop stays authoritative.
 
 Preset values: `deterministic` (temp 0), `precise` (0.3/20/0.9),
 `balanced` (0.7/40/0.9 = defaults), `creative` (1.1/100/0.95).

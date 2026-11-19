@@ -170,12 +170,17 @@ serial / **485 MB** threaded, well under the 4 GB guest budget. These are
 correctness/RSS gates, not a timing comparison; the harness accepts a
 trusted-engine baseline JSON for real cross-engine KLD/Same-top-p.
 
-PLD (phase 8 correctness foundation, `VLLM_PLD=1`) has **no timing row**:
-greedy sampling is already a plain argmax and `decode_step` is single-token,
-so verifying each draft runs the same forwards as plain decoding. The gate
-is bit-identical output plus draft accept rate from `tools/forward_bench.v`;
-a wall-time win needs a batched verifier (multi-token matvec + batched
-causal attention), tracked as the next Phase 8 engine step.
+PLD (phase 8, `VLLM_PLD=1`) has **no speed row**: greedy sampling is already
+a plain argmax and `decode_step` is single-token, so serial verification runs
+the same forwards as plain decoding. `tools/pld_bench.v` on the code-edit
+probe (Qwen3-0.6B-Q4_0, `VLLM_THREADS=1`, loaded host): plain 6496 ms vs PLD
+6591 ms with **identical text** — correctness gate green, no speedup.
+
+The shared-weight batched verifier (`VLLM_PLD_BATCH=1`) is experimental: its
+per-block horizontal sums made the same probe ~14166 ms (~2x slower) and a
+near-tie argmax flipped on accepted drafts (text diverged). It is opt-in and
+never the default. A real win needs a SIMD-across-k matmul (k register
+accumulators, one hsum per row) plus a batched Q6_K head; that work remains.
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
