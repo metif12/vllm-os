@@ -111,8 +111,13 @@ How the wins happened, in order:
     into accumulators with ONE hsum per row, and scales convert via an
     exact 64K-entry f16 LUT (zero numeric change for the conversion;
     last-ulp reassociation drift for the accumulation, inside the 1e-3
-    test band). Q6_K takes the LUT for its `d` scale (structure
-    deferred). No V changes — same ABI, scalar mirrors untouched.
+    test band). Q6_K takes the LUT for its `d` scale (exact, kept); the
+    Q6_K row-vector restructure was profile-gated OUT — the half-dot
+    already accumulates internally, so only 2 hsums/block were left to
+    remove (~5% of its body) while folding `d` in adds 4 fmas/block:
+    vocab microbench 91-94 ms vs 85-94 pre-change (overlapping, no win),
+    so the tree keeps the original structure. No V changes — same ABI,
+    scalar mirrors untouched.
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
@@ -481,12 +486,13 @@ same-model, same-box Python-side pair and the remaining V levers:
    binary row (~63 tok/s) is the stand-in until then.
 2. V levers: blocking/packing the weight layout at the layout level
    (win 12 took the per-block overhead inside the current layout),
-   Q6_K row-vector accumulation (same pattern as win 12, deferred),
-   attention-path work (SIMD score/softmax path for long ctx),
-   prefill batching (serve is prefill-bound). Fork-join, serve-path
-   caches, and Q4 row-vector kernels landed; host-side profiling
-   against the 16 ms/token llama line is the layer-split +
-   attention-scaling data above.
+   long-ctx attention-path work (SIMD score/softmax path),
+   prefill batching (serve is prefill-bound). Q6_K row-vector was
+   profile-gated OUT (bandwidth-bound head, hsum removal ~5% of its
+   body — measured no win). Fork-join, serve-path caches, and Q4
+   row-vector kernels landed; host-side profiling against the
+   16 ms/token llama line is the layer-split + attention-scaling
+   data above.
 3. Serve path: measured since the serve-path round (`chat8` wall 1.5 s
    post-win-12, prefill-bound; steady-state decode is the bench row).
    Remaining is prefill batching, not measurement.
