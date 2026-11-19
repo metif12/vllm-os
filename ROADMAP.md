@@ -7,7 +7,7 @@ Each phase has an exit gate. Do not start the next phase until the gate is green
 `v run src` serves OpenAI-compat stub on Windows/Linux.
 Gate: `/v1/models` + `/v1/chat/completions` return 200. Green.
 
-## Phase 1 — Host inference (core done ✅, forward pass = 1b ⏳)
+## Phase 1 — Host inference (done ✅)
 
 * ✅ GGUF KV + tensor table parser (`gguf.v`), alignment-aware.
 * ✅ Dequant kernels Q4_0/Q8_0/F16 (`quant.v`), RMSNorm/SwiGLU/RoPE/matvec (`nn.v`).
@@ -245,8 +245,7 @@ serial-log hygiene, prod checklist), `--auth-token`/`--rate-*` knobs in
 Architecture note: the gate runs in the single accept-loop thread before
 `spawn` — pinned V 0.5.2 miscompiles `spawn` with a shared `mut` ctx
 (handler threads died reading garbage; bisected), so ctx stays immutable
-and the bucket map needs no locks. Open: TLS termination at the edge,
-SMP-guest validation, 1.7B boot, first perf-CI numbers.
+and the bucket map needs no locks.
 
 Done 2026-11-18 (serve path): the model blob is cached at boot
 (`Model.blob`) instead of re-read per request, and KV arenas are sized
