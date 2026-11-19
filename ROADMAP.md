@@ -300,8 +300,29 @@ block sizing. The 16 int8 codebook values and split-half layout are pinned
 to the GGML primary source (`ggml-common.h` / `ggml-quants.c`); tests cover
 codebook identity, fused-vs-dequant, C-vs-V agreement, threaded agreement,
 and tail rows. No IQ4_NL weights ship with the v1 assets, so validation is
-synthetic — real-weight maxdiff / PPL awaits an IQ4_NL GGUF. `Q2_0` and the
-quality-gate harness stay next.
+synthetic — real-weight maxdiff / PPL awaits an IQ4_NL GGUF.
+
+Status 2026-11-19 (Q2_0): **landed** — GGML type 42, 18-byte/64-elem signed-
+scale block, pure-V dequant/fused dot/matvec/embed, AVX2 C matvec (local
+dequant scratch + FMA, scalar fallback), threaded + pooled head, dispatch
+and GGUF sizing. The **R8 repack** expands 2-bit codes to one signed byte
+each at load time so the dot reuses the existing int8/Q8 kernel — no second
+math path, host-side only, caller chooses which tensors to repack (the
+`ik -rtr` warning). Same synthetic-validation caveat as IQ4_NL: no Q2_0
+weight ships in v1.
+
+Status 2026-11-19 (quality gates): **landed** — `tools/quality_gates.v`
+runs a fixed in-tree `wiki-alt` probe through the real forward and reports
+PPL, KLD(ref||ours) over the reference top-k support, Same-top-p set
+agreement, max |Δp|, and VmHWM (Linux; current RSS on Windows), with
+`--max-kld` / `--max-topp-miss` / `--max-diff` / `--max-rss-mb` thresholds
+and exit codes 0/1/2. A baseline file is plain JSON of top-k distributions:
+from a trusted engine (llama.cpp) or from a serial run of this tool. Measured
+on Qwen3-0.6B-Q4_0 (loaded host): PPL 39.176 identical serial vs threaded,
+KLD 0 / Same-top-p 1.0 / maxdiff 0 threaded-vs-serial, VmHWM ~446 MB serial
+and ~485 MB threaded (both far under the 4 GB guest budget). cgroup
+`VmHWM` enforcement is CI-side (wrap the tool in a memory-limited cgroup);
+the tool reports and enforces the ceiling itself. Phase 7 complete.
 
 * Threads + pool. `threads = phys_cores - 1`, one core reserved for the
   accept loop (`src/api/server.v`), no oversubscription, no busy-poll;

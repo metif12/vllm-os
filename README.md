@@ -42,7 +42,7 @@ src/infer/model.v     # Qwen3 arch config + KV override + generate path
 src/infer/attention.v # phase-1b primitives: KVCache arena + attention_step
 src/infer/sampler.v   # presets, fused softmax-scale, min-p, heap top-k, zero-alloc top-k/top-p + xorshift RNG
 src/infer/tokenizer.v # Tokenizer iface (BPE loader + stub) + Qwen ChatML template
-src/infer/quant.v     # Q4_0/Q4_1/Q6_K/IQ4_NL/F16 dequant + fused dots (no materialize)
+src/infer/quant.v     # Q4_0/Q4_1/Q6_K/IQ4_NL/Q2_0(+R8)/F16 dequant + fused dots (no materialize)
 src/infer/nn.v        # rmsnorm/rope-tables/swiglu/unrolled+blocked matvec
 src/infer/backend.v   # Backend interface + registry (cpu/cpu-blocked/cpu-simd/cpu-parallel/auto)
 src/infer/parallel.v    # threaded row-block matvec (VLLM_THREADS, freestanding-safe fallback)
@@ -57,6 +57,7 @@ src/api/types.v       # OpenAI JSON shapes
 src/api/context.v     # HandlerCtx: shared model + resolved config
 tools/bench_kernels.v # host-only kernel benchmark (links real C file, embeds V refs)
 tools/forward_bench.v # host-only full-decode probe (real GGUF, best-of-N ms/token)
+tools/quality_gates.v # PPL/KLD/Same-top-p/maxdiff/VmHWM gate harness (baseline JSON)
 tools/infer_smoke.v   # host-only greedy smoke (also runs as /sbin/vllm in-guest; outputs must match)
 docs/                 # architecture/api/configuration/formats/building/development/security
 kernel/               # vinix-mini fork plan, mini.md spec, mini.ld, cmdline.txt, features.conf

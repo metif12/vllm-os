@@ -149,6 +149,26 @@ How the wins happened, in order:
     among the v1 assets, so only correctness is gated (codebook identity,
     fused-vs-dequant, C-vs-V, threaded agreement incl. tail rows), dev +
     `-prod`. Real-weight maxdiff/PPL and a tok/s row need an IQ4_NL file.
+15. **Q2_0 + R8 repack** (`quant.v` + `vllm_kernels.{h,c}`, 2026-11-19):
+    GGML type 42 — 18 bytes / 64 elements (f16 `d` + 16 two-bit bytes),
+    `(code-1)*d` signed-scale dequant, scalar fused dot, and an AVX2 matvec
+    that expands codes into a local stack scratch then FMAs the dot (no
+    caller-visible materialization). The R8 variant repacks those 2-bit
+    codes to one signed byte each **at load time**, so the dot reuses the
+    existing `vllm_q8_dot_f32` int8 kernel — the same math, not a second
+    kernel family; repack only tensors the CPU actually runs. Threaded +
+    pooled head, embedding dispatch, and exact 18-byte GGUF sizing included.
+    Same caveat as IQ4_NL: no Q2_0 GGUF in v1 assets, so gates are synthetic
+    (code mapping, fused-vs-dequant, matvec reference, C-vs-V, R8-vs-native,
+    threaded agreement with tail rows), dev + `-prod`; no timing row.
+
+`tools/quality_gates.v` (host-only, fixed 70-token `wiki-alt` probe on
+Qwen3-0.6B-Q4_0, loaded host): PPL **39.176** on both serial and threaded
+runs; threaded-vs-serial KLD **0**, Same-top-p **1.0**, max |Δp| **0**
+(bit-identical across the pool — the same-math gate). VmHWM **446 MB**
+serial / **485 MB** threaded, well under the 4 GB guest budget. These are
+correctness/RSS gates, not a timing comparison; the harness accepts a
+trusted-engine baseline JSON for real cross-engine KLD/Same-top-p.
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads

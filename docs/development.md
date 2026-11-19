@@ -100,6 +100,21 @@ owns them.
 full-decode tok/s, `infer_smoke.v` greedy host-vs-guest parity) are
 measured, not gated — boxes vary.
 
+### Quality gates (Phase 7)
+
+`tools/quality_gates.v` (host-only, real GGUF) runs a fixed `wiki-alt` probe
+through the forward pass and reports `PPL`, `KLD`, `SAME_TOP_P`, `MAXDIFF`
+and `VMHWM_KB`. Build it with
+`v -prod -cc gcc -path 'src|@vlib|@vmodules' -o qg tools/quality_gates.v`.
+Produce a baseline with `./qg model.gguf --baseline-out base.json` (use
+`VLLM_THREADS=1` for a serial baseline), then compare any later build with
+`./qg model.gguf base.json --max-kld 1e-3 --max-topp-miss 0 --max-diff 1e-3`.
+A baseline is just JSON of top-k distributions, so a trusted engine
+(llama.cpp) can supply one instead. Exit 0 = pass, 1 = metric fail,
+2 = RSS fail (`--max-rss-mb N`); CI wraps it in a memory-limited cgroup for
+the guest-budget check. KLD is over the reference top-k support (with a
+1e-9 floor outside it) — an approximation, not a full-vocabulary KL.
+
 Rules (house policy): every fix ships with a failing-first test where
 practical — break the line, watch it go red, restore it. A silent green
 proves nothing: confirm the new test names appear in output.
