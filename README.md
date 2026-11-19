@@ -41,6 +41,7 @@ src/infer/cfile.v     # tiny C file probe (header only, 1 GB-safe)
 src/infer/model.v     # Qwen3 arch config + KV override + generate path
 src/infer/attention.v # phase-1b primitives: KVCache arena + attention_step
 src/infer/sampler.v   # presets, fused softmax-scale, min-p, heap top-k, zero-alloc top-k/top-p + xorshift RNG
+src/infer/pld.v       # opt-in prompt-lookup drafts + greedy verification (bit-exact, phase 8)
 src/infer/tokenizer.v # Tokenizer iface (BPE loader + stub) + Qwen ChatML template
 src/infer/quant.v     # Q4_0/Q4_1/Q6_K/IQ4_NL/Q2_0(+R8)/F16 dequant + fused dots (no materialize)
 src/infer/nn.v        # rmsnorm/rope-tables/swiglu/unrolled+blocked matvec

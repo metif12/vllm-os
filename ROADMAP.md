@@ -354,6 +354,21 @@ Sources: modchip `Stockfish-PVS v2` / `RouteCrack ngram-simple`
 input-grounded tasks; now in HF transformers as
 `prompt_lookup_num_tokens` and vLLM as `speculative_model="[ngram]"`).
 
+Status 2026-11-19: **correctness foundation landed** (`src/infer/pld.v`).
+Opt-in PLD (`VLLM_PLD=1`, `pld_ngram`, `pld_continuation`, greedy only)
+finds the longest n-gram suffix match over prompt + own output, proposes up
+to 10 drafts, and verifies each with the real forward against the greedy
+argmax. Every emitted token is the model's argmax at its position, so output
+is bit-identical on/off (gated on real weights). `tools/forward_bench.v`
+with `VLLM_PLD=1` reports draft accept rate.
+
+The **wall-time half of the gate is deliberately unmet**: `decode_step` is
+single-token and greedy sampling is already just an argmax, so serial
+verification runs the same number of forwards as plain decode. A real speedup
+needs a batched verifier (multi-token matvec + batched causal attention),
+which is a separate engine change and the next Phase 8 step. EAGLE3/DFlash/
+DSpark/MTP stay out as planned.
+
 * Ship only PLD/ngram in `src/infer/sampler.v` (pure V,
   arena-allocated, opt-in flag + `VLLM_*` env in `src/cfg/config.v`).
   Start from validated hyperparams: `max_ngram_size = 3`, continuation

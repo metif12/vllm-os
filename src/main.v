@@ -125,6 +125,7 @@ fn main() {
 	// thread (VLLM_THREADS=1) or under -freestanding, so the guest stays
 	// single-threaded. generate_real_cached copies it into each ForwardCtx.
 	model.pool = infer.new_worker_pool(infer.parallel_threads())
+	model.pld = cc.pld_config()
 	eprintln('[vllm-os] boot ok: ${model.cfg.model_id} format=${model.format} tensors=${model.n_tensors()}')
 	api.serve(cc, &model) or {
 		eprintln('[vllm-os] serve failed: ${err}')

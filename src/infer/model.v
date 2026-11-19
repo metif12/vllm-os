@@ -49,6 +49,9 @@ pub mut:
 	// forward path stays single-threaded (guest parity). generate_* copies it
 	// into each ForwardCtx so decode_step needs no global state.
 	pool &WorkerPool = unsafe { nil }
+	// pld is the opt-in prompt-lookup speculation config (phase 8). Set once
+	// at boot from cfg; empty/disabled keeps the original generate path.
+	pld PldCfg
 }
 
 // n_tensors is the unified tensor count across containers.
@@ -230,6 +233,11 @@ pub fn (m Model) generate(prompt string, max_tokens int, sp SampleParams) string
 // generate_real (per-call blob load, kept for uncached Models); the cache
 // only removes the disk re-read, never the numerics.
 fn (m Model) generate_real_cached(ids []int, max_tokens int, sp SampleParams) !string {
+	// PLD is greedy-only: with temp > 0 drafts cannot be verified against a
+	// stochastic sample, so the original sampling path stays authoritative.
+	if m.pld.enabled && sp.temp <= 0.0 {
+		return m.generate_pld(ids, max_tokens, sp)
+	}
 	// Size arenas to the request, not the full ctx cap (see
 	// new_forward_ctx_cap): prompt + max_tokens is all pos can reach.
 	need := ids.len + max_tokens
@@ -270,6 +278,42 @@ fn (m Model) generate_real_cached(ids []int, max_tokens int, sp SampleParams) !s
 		}
 		embed_gather(m.blob, m.gguf, m.cfg.hidden, next, mut f.hidden)!
 		f.decode_step()!
+	}
+	return m.tok.decode(out)
+}
+
+// generate_pld runs the greedy generate loop through the PLD controller.
+// Every emitted token is the model's argmax at its position (drafts are
+// verified, never trusted), so output is bit-identical to the plain greedy
+// path. PLD on/off is a pure correctness switch; the serial verifier adds no
+// wall-time win (see ROADMAP phase 8 / docs/perf.md).
+fn (m Model) generate_pld(ids []int, max_tokens int, sp SampleParams) !string {
+	_ = sp // PLD is greedy-only; sampling params are resolved by the caller
+	need := ids.len + max_tokens
+	mut f := new_forward_ctx_cap(m.cfg, m.gguf, m.blob, need)!
+	// Prefill: feed the prompt, leaving f.logits at the first answer position.
+	for id in ids {
+		embed_gather(m.blob, m.gguf, m.cfg.hidden, id, mut f.hidden)!
+		f.decode_step()!
+	}
+	eos := m.gguf.kv['tokenizer.ggml.eos_token_id'].int()
+	mut out := []int{cap: max_tokens}
+	mut controller := new_pld_controller(m.pld, ids)
+	mut emitted := []int{len: m.pld.continuation + 1}
+	for out.len < max_tokens {
+		n := controller.next_tokens(mut f, m.blob, m.gguf, mut emitted)!
+		mut stop := false
+		for j := 0; j < n; j++ {
+			tok := emitted[j]
+			out << tok
+			if tok == eos || out.len >= max_tokens {
+				stop = true
+				break
+			}
+		}
+		if stop {
+			break
+		}
 	}
 	return m.tok.decode(out)
 }

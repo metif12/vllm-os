@@ -60,9 +60,19 @@ kernels at runtime. Introspect without serving:
 | `min_p` | `0.0` | [0, 1) | 0 = off; drop below `min_p × top-1` prob; top-1 survives |
 | `seed` | `0` | any u64 | 0 = per-request seed wins; request 0 + config 0 = time-based |
 | `fast` | `false` | bool | approx-exp fast path (sampling only, ~5x at vocab scale) |
+| `pld` | `false` | bool | prompt-lookup speculation (phase 8); greedy only, opt-in |
+| `pld_ngram` | `3` | 1–16 | longest n-gram suffix to match in prompt + own output |
+| `pld_continuation` | `10` | 1–64 | max draft tokens proposed per match |
 
 Env: `VLLM_PRESET`, `VLLM_TEMP`, `VLLM_TOP_K`, `VLLM_TOP_P`,
-`VLLM_MIN_P`, `VLLM_SEED`, `VLLM_FAST=1`.
+`VLLM_MIN_P`, `VLLM_SEED`, `VLLM_FAST=1`, `VLLM_PLD=1`,
+`VLLM_PLD_NGRAM`, `VLLM_PLD_CONTINUATION`.
+
+PLD is a correctness foundation: every emitted token is verified against
+the model's greedy argmax, so output is bit-identical on/off. Serial
+verification costs the same forwards as plain decode — there is no wall-time
+win until a batched verifier lands (see `docs/perf.md`). With `temp > 0` the
+setting is ignored and the normal sampling loop stays authoritative.
 
 Preset values: `deterministic` (temp 0), `precise` (0.3/20/0.9),
 `balanced` (0.7/40/0.9 = defaults), `creative` (1.1/100/0.95).

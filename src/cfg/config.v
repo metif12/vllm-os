@@ -39,6 +39,11 @@ pub mut:
 	min_p  f32    = 0.0 // 0 = disabled; else drop tokens below min_p * top-1 prob
 	seed   u64
 	fast   bool // approx-softmax fast path (sampling only)
+	// PLD / ngram speculation (phase 8): opt-in, greedy only. Serial verify
+	// foundation — bit-identical output, no wall-time win until batched verify.
+	pld              bool
+	pld_ngram        int = 3
+	pld_continuation int = 10
 }
 
 pub struct ApiCfg {
@@ -103,6 +108,12 @@ pub fn (mut c Config) normalize() {
 	if c.sampler.preset == '' {
 		c.sampler.preset = 'balanced'
 	}
+	if c.sampler.pld_ngram == 0 {
+		c.sampler.pld_ngram = 3
+	}
+	if c.sampler.pld_continuation == 0 {
+		c.sampler.pld_continuation = 10
+	}
 	if c.api.max_tokens == 0 {
 		c.api.max_tokens = 256
 	}
@@ -149,6 +160,12 @@ pub fn (c Config) validate() ! {
 	if c.sampler.min_p < 0.0 || c.sampler.min_p >= 1.0 {
 		return error('config: min_p out of range: ${c.sampler.min_p}')
 	}
+	if c.sampler.pld_ngram < 1 || c.sampler.pld_ngram > 16 {
+		return error('config: pld_ngram out of range: ${c.sampler.pld_ngram}')
+	}
+	if c.sampler.pld_continuation < 1 || c.sampler.pld_continuation > 64 {
+		return error('config: pld_continuation out of range: ${c.sampler.pld_continuation}')
+	}
 	if c.api.max_tokens < 1 || c.api.max_tokens > 32768 {
 		return error('config: max_tokens out of range: ${c.api.max_tokens}')
 	}
@@ -179,6 +196,15 @@ pub fn (c Config) sampler_params() infer.SampleParams {
 		p.fast = c.sampler.fast
 	}
 	return p
+}
+
+// pld_config resolves the opt-in PLD settings into the infer-layer config.
+pub fn (c Config) pld_config() infer.PldCfg {
+	return infer.PldCfg{
+		enabled:      c.sampler.pld
+		max_ngram:    c.sampler.pld_ngram
+		continuation: c.sampler.pld_continuation
+	}
 }
 
 // apply_env overrides fields from VLLM_* environment variables. Called
@@ -230,6 +256,15 @@ pub fn (mut c Config) apply_env() ! {
 	}
 	if v := os.getenv_opt('VLLM_FAST') {
 		c.sampler.fast = v == '1' || v.to_lower() == 'true'
+	}
+	if v := os.getenv_opt('VLLM_PLD') {
+		c.sampler.pld = v == '1' || v.to_lower() == 'true'
+	}
+	if v := os.getenv_opt('VLLM_PLD_NGRAM') {
+		c.sampler.pld_ngram = v.int()
+	}
+	if v := os.getenv_opt('VLLM_PLD_CONTINUATION') {
+		c.sampler.pld_continuation = v.int()
 	}
 	if v := os.getenv_opt('VLLM_MAX_TOKENS') {
 		c.api.max_tokens = v.int()

@@ -170,6 +170,13 @@ serial / **485 MB** threaded, well under the 4 GB guest budget. These are
 correctness/RSS gates, not a timing comparison; the harness accepts a
 trusted-engine baseline JSON for real cross-engine KLD/Same-top-p.
 
+PLD (phase 8 correctness foundation, `VLLM_PLD=1`) has **no timing row**:
+greedy sampling is already a plain argmax and `decode_step` is single-token,
+so verifying each draft runs the same forwards as plain decoding. The gate
+is bit-identical output plus draft accept rate from `tools/forward_bench.v`;
+a wall-time win needs a batched verifier (multi-token matvec + batched
+causal attention), tracked as the next Phase 8 engine step.
+
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
 multiplied available bandwidth up to the socket wall (~8 ms -> ~4 ms at
