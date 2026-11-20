@@ -491,6 +491,82 @@ ReLU-sparse-only models, distributed/RPC inference, multi-tenant mmap
 exposure. Supersedes the Phase 7 A–E / Phase 8 F–J / Phase 9 K–O
 itemization (same content, execution order).
 
+---
+
+## Phases 11–15 — from "works on 0.6B" to a usable appliance (2026-11-20)
+
+The v1 goal was never fully met: the target weights are **Qwen3-1.7B-Q4_K_M**,
+but the forward only handles Q4_0/Q4_1/Q6_K/IQ4_NL/Q2_0, so the target model
+cannot run at all. Every earlier measurement used Qwen3-0.6B-Q4_0. These
+phases close that gap first, then performance, then production-readiness.
+Ordering is load-bearing: benchmarking an unsupported target is meaningless.
+
+### Phase 11 — Q4_K_M target-model support (critical path, next up)
+
+Why first: without it the v1 deliverable is non-functional. Block spec from
+the GGML primary source (already fetched, no code copied):
+`block_q4_K` = 256 elems / 142 bytes = f16 `d` + f16 `dmin` + `scales[12]` +
+`qs[128]`; eight 32-elem sub-blocks with split-half nibbles; 6-bit
+scale/min via `get_scale_min_k4`; `out = d*sc*q - dmin*m`.
+
+* `gguf.v`: add `.q4_k` type and exact 142-byte / 256-elem sizing.
+* `quant.v`: `qk_k=256`, `q4_k_block_bytes=142`, `BlockQ4K`, `block_q4_k_at`,
+  `dequant_q4_k_row`, `q4_k_dot_row`, `q4_k_matvec`, `embed_gather_q4_k`.
+* `vllm_kernels.{h,c}`: `vllm_q4_k_matvec_f32` — AVX2 row-vector accumulation
+  with one horizontal sum per row (mirror the existing Q4 row-vector kernels),
+  scalar fallback.
+* `simd_c.v`, `parallel.v`, `worker_pool.v`, `forward.v`: bridge, range form,
+  threaded + pooled head, `.q4_k` dispatch for embedding and vocab head.
+* Gate: `q4_k_test.v` (code/dequant hand values, fused-vs-dequant, matvec
+  reference, C-vs-V, threaded/pool, tail rows) + real 1.7B golden table +
+  8-step greedy bit-identical to the reference and logit maxdiff < 1e-3.
+
+### Phase 12 — close the ~3x gap to llama.cpp
+
+* Proper SIMD-across-k matmul: k register accumulators, weight dequant shared
+  across drafts, one hsum per row per token; finish the batched Q6_K head.
+  Replace the current experimental `VLLM_PLD_BATCH=1` path.
+* Draft source: accept rate is 3/15 = 0.2 and independent of `max_ngram`;
+  literal-copy drafts diverge from the model's pattern generalisation. Try
+  fuzzy matching / multi-match voting / shorter k. If the gate still fails,
+  stop speculation and spend the time on the layout-level kernel work.
+* Load-time row-interleaved repack behind `Backend`, only tensors the CPU
+  really runs (the `ik -rtr` warning).
+* Gate: 1.7B tok/s measured on a quiet box; no timing row without one.
+
+### Phase 13 — real validation and CI
+
+* QEMU 1.7B gate on the Q4_K_M model, real chat asserts, artifacts kept.
+* Quiet Linux CI (VJOBS=2, no stray processes): run the three blocked A/Bs —
+  pool on/off, PLD on/off, quant parity. Fill `docs/perf.md` with 1.7B rows.
+* `quality_gates --max-rss-mb 4096` in CI (VmHWM ceiling).
+
+### Phase 14 — production readiness
+
+* SSE / cancellation / backpressure under load, request timeouts.
+* Structured observability: request id, prompt tokens, decode ms, cache hit,
+  accept rate in logs; `/health` with state.
+* Memory budget checks before allocation (weights + KV + arena <= 4 GB).
+* `--print-config` shows all new knobs; security log-hygiene review.
+
+### Phase 15 — long context and remaining experiments
+
+* SWA + sinks on a >=16 GB guest: PPL/VmHWM probe, then decide default.
+* Multi-entry LRU prefix cache with extend-on-hit (current single-entry cache
+  never grows on a hit).
+* Chunked prefill / host ISQ / THP/NTA stay dispositioned until the
+  thread-per-request model or a Linux measurement lane changes.
+
+### Gates summary
+
+| phase | exit gate | blocked by |
+|---|---|---|
+| 11 | 1.7B Q4_K_M greedy bit-identical + golden table | — |
+| 12 | 1.7B tok/s row on a quiet box | 11 |
+| 13 | three A/Bs green in CI | 12 + quiet host |
+| 14 | SSE/cancel/observability tested | 13 |
+| 15 | SWA gate on >=16 GB guest | 13 |
+
 ## Deferred (deliberately out of v1)
 
 GPU / NPU drivers, multi-tenant auth + rate limits, full 32k ctx,
