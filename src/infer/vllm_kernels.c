@@ -886,11 +886,12 @@ VLLM_AVX2_FN void vllm_q4_0_matmul_f32(const unsigned char *data, const float *x
 							_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))), eight), sc);
 					for (int i = 0; i < kk; i++) {
 						const float *x = xs + (size_t)(t0 + i) * cols + (size_t)b * 32;
-						__m256 p = _mm256_fmadd_ps(f0, _mm256_loadu_ps(x), _mm256_setzero_ps());
-						p = _mm256_fmadd_ps(f1, _mm256_loadu_ps(x + 8), p);
-						p = _mm256_fmadd_ps(f2, _mm256_loadu_ps(x + 16), p);
-						p = _mm256_fmadd_ps(f3, _mm256_loadu_ps(x + 24), p);
-						acc[i] = _mm256_add_ps(acc[i], p);
+						// FMA straight into the token accumulator: no per-block
+						// temporary and no extra add (one hsum per row/token).
+						acc[i] = _mm256_fmadd_ps(f0, _mm256_loadu_ps(x), acc[i]);
+						acc[i] = _mm256_fmadd_ps(f1, _mm256_loadu_ps(x + 8), acc[i]);
+						acc[i] = _mm256_fmadd_ps(f2, _mm256_loadu_ps(x + 16), acc[i]);
+						acc[i] = _mm256_fmadd_ps(f3, _mm256_loadu_ps(x + 24), acc[i]);
 					}
 				}
 				for (int i = 0; i < kk; i++) {
@@ -928,10 +929,8 @@ VLLM_AVX2_FN void vllm_q4_1_matmul_f32(const unsigned char *data, const float *x
 			int kk = k - t0 < 8 ? k - t0 : 8;
 			for (int r = 0; r < rows; r++) {
 				__m256 acc[8];
-				__m256 xacc[8];
 				for (int i = 0; i < kk; i++) {
 					acc[i] = _mm256_setzero_ps();
-					xacc[i] = _mm256_setzero_ps();
 				}
 				const unsigned char *row = data + (size_t)r * (size_t)bpr * 20;
 				for (int b = 0; b < bpr; b++) {
@@ -941,30 +940,29 @@ VLLM_AVX2_FN void vllm_q4_1_matmul_f32(const unsigned char *data, const float *x
 					__m128i q = _mm_loadu_si128((const __m128i *)(blk + 4));
 					__m128i lo = _mm_and_si128(q, m15);
 					__m128i hi = _mm_and_si128(_mm_srli_epi64(q, 4), m15);
-					__m256 f0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), sc);
-					__m256 f1 = _mm256_mul_ps(
-						_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))), sc);
-					__m256 f2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), sc);
-					__m256 f3 = _mm256_mul_ps(
-						_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))), sc);
+					// Fold sum(x)*min into the dequantized weight:
+					// dot(q,x)*scale + sum(x)*min == sum((q*scale+min)*x).
+					// Halves the accumulator count (no xacc[] -> no spills).
+					__m256 f0 = _mm256_add_ps(
+						_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), sc), mn);
+					__m256 f1 = _mm256_add_ps(
+						_mm256_mul_ps(
+							_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))), sc), mn);
+					__m256 f2 = _mm256_add_ps(
+						_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), sc), mn);
+					__m256 f3 = _mm256_add_ps(
+						_mm256_mul_ps(
+							_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))), sc), mn);
 					for (int i = 0; i < kk; i++) {
 						const float *x = xs + (size_t)(t0 + i) * cols + (size_t)b * 32;
-						__m256 x0 = _mm256_loadu_ps(x);
-						__m256 x1 = _mm256_loadu_ps(x + 8);
-						__m256 x2 = _mm256_loadu_ps(x + 16);
-						__m256 x3 = _mm256_loadu_ps(x + 24);
-						__m256 p = _mm256_fmadd_ps(f0, x0, _mm256_setzero_ps());
-						p = _mm256_fmadd_ps(f1, x1, p);
-						p = _mm256_fmadd_ps(f2, x2, p);
-						p = _mm256_fmadd_ps(f3, x3, p);
-						acc[i] = _mm256_add_ps(acc[i], p);
-						__m256 xs4 = _mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3));
-						xacc[i] = _mm256_fmadd_ps(xs4, mn, xacc[i]);
+						acc[i] = _mm256_fmadd_ps(f0, _mm256_loadu_ps(x), acc[i]);
+						acc[i] = _mm256_fmadd_ps(f1, _mm256_loadu_ps(x + 8), acc[i]);
+						acc[i] = _mm256_fmadd_ps(f2, _mm256_loadu_ps(x + 16), acc[i]);
+						acc[i] = _mm256_fmadd_ps(f3, _mm256_loadu_ps(x + 24), acc[i]);
 					}
 				}
 				for (int i = 0; i < kk; i++) {
-					outs[(size_t)(t0 + i) * rows + r] =
-						vllm_hsum_avx2(acc[i]) + vllm_hsum_avx2(xacc[i]);
+					outs[(size_t)(t0 + i) * rows + r] = vllm_hsum_avx2(acc[i]);
 				}
 			}
 		}
@@ -1198,4 +1196,6 @@ void vllm_softmax_scaled_fast_f32(float *xs, int n, float scale) {
 		xs[i] *= inv;
 	}
 }
+
+
 

@@ -170,6 +170,15 @@ serial / **485 MB** threaded, well under the 4 GB guest budget. These are
 correctness/RSS gates, not a timing comparison; the harness accepts a
 trusted-engine baseline JSON for real cross-engine KLD/Same-top-p.
 
+Batched kernel cleanup (phase 12): the Q4_0 batched loop now FMAs directly
+into each token's accumulator (dropping a per-block temporary and extra add),
+and Q4_1 folds `sum(x)*min` into the dequantized weight, halving live YMM
+accumulators from 16 to 8 to avoid spills. `batch_test.v` still passes the
+1e-3 agreement band. These are infrastructure improvements: the end-to-end
+PLD speed gate remains blocked by the measured 0.2 accept rate and by a
+host with too little free RAM for the 1.7B forward smoke (other processes
+own the memory; the Q4_K golden table gate does pass with the real file).
+
 Q4_K (phase 11, `tools/q4k_bench.v`, synthetic GGUF blocks, loaded host):
 the AVX2 row-vector matvec took **366 us** for 2048x1024 and **400 us** for
 1024x2048, versus **6791 / 6132 us** pure V (~18x), with max absolute output
