@@ -97,6 +97,7 @@ VLLM_PRESET=creative VLLM_PORT=9000 ./server --config vllm.json
 ./server --print-config              # dump effective config, exit
 ./server --list-backends              # compute backends, exit
 ./server --list-formats               # weight containers, exit
+./server --tune                       # host-tuned backend/threads/quant, exit
 ```
 
 Knobs: `server` (bind/port/limits), `model` (weights/format/ctx/backend),

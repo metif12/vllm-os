@@ -28,6 +28,8 @@ pub mut:
 	format  string = 'auto' // auto | gguf | safetensors
 	ctx_cap int    = 4096
 	backend string = 'cpu' // cpu | cpu-blocked | cpu-simd | auto
+	// prefix_cache reuses the previous prompt's KV across turns (phase 9).
+	prefix_cache bool
 }
 
 pub struct SamplerCfg {
@@ -235,6 +237,9 @@ pub fn (mut c Config) apply_env() ! {
 	}
 	if v := os.getenv_opt('VLLM_BACKEND') {
 		c.model.backend = v
+	}
+	if v := os.getenv_opt('VLLM_PREFIX_CACHE') {
+		c.model.prefix_cache = v == '1' || v.to_lower() == 'true'
 	}
 	if v := os.getenv_opt('VLLM_PRESET') {
 		c.sampler.preset = v

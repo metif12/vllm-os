@@ -4,7 +4,8 @@
     "weights": "models/qwen3-1.7b-q4_k_m.gguf",
     "format": "auto",
     "ctx_cap": 4096,
-    "backend": "cpu"
+    "backend": "cpu",
+    "prefix_cache": false
   },
   "sampler": {
     "preset": "balanced",

@@ -170,6 +170,13 @@ serial / **485 MB** threaded, well under the 4 GB guest budget. These are
 correctness/RSS gates, not a timing comparison; the harness accepts a
 trusted-engine baseline JSON for real cross-engine KLD/Same-top-p.
 
+Prefix caching (phase 9, `VLLM_PREFIX_CACHE=1`) on Qwen3-0.6B-Q4_0,
+`VLLM_THREADS=1`, loaded host: an 18-token shared prompt prefix took
+**3063 ms uncached vs 972 ms cached (~3x)** with bit-identical output; a
+2-token prefix was slower (944 vs 856 ms) because copying KV costs more
+than one prefill. The cache is therefore opt-in and sized to one entry.
+`./server --tune` reports the host-detected recommendation without serving.
+
 PLD (phase 8, `VLLM_PLD=1`) has **no speed row**: greedy sampling is already
 a plain argmax and `decode_step` is single-token, so serial verification runs
 the same forwards as plain decoding. `tools/pld_bench.v` on the code-edit

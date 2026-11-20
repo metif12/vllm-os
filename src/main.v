@@ -7,6 +7,29 @@ import infer
 import json
 import os
 import api
+import runtime
+
+// print_tune is a host-only introspection flag: detect CPU/RAM and print a
+// concrete backend/threads/quant recommendation. It never starts a server.
+fn print_tune() {
+	cpus := runtime.nr_cpus()
+	total_mb := runtime.total_memory() or { 0 } / (1024 * 1024)
+	free_mb := runtime.free_memory() or { 0 } / (1024 * 1024)
+	avx2 := infer.has_avx2()
+	// The measured default (docs/perf.md) saturates DRAM at four streaming
+	// workers; VLLM_THREADS overrides it per host.
+	threads := infer.parallel_threads()
+	backend := if avx2 { 'auto' } else { 'cpu-blocked' }
+	// Q4_0 is the quant with fused AVX2 kernels and measured tok/s in-tree.
+	quant := 'Q4_0'
+	// Keep a 4 GB guest budget: weights + KV + server.
+	ctx_cap := if total_mb > 0 && total_mb < 4096 { 2048 } else { 4096 }
+	eprintln('[vllm-os] tune cpus=${cpus} avx2=${avx2} total_mb=${total_mb} free_mb=${free_mb}')
+	println('backend=${backend}')
+	println('threads=${threads}')
+	println('quant=${quant}')
+	println('ctx_cap=${ctx_cap}')
+}
 
 // Boot entry: no shell, no REPL — load weights, serve the API.
 // Precedence: CLI flag (when != default) > VLLM_* env > --config file >
@@ -28,9 +51,14 @@ fn main() {
 	list_backends := fp.bool('list-backends', 0, false, 'print backend registry and exit')
 	list_formats := fp.bool('list-formats', 0, false, 'print weight-format handlers and exit')
 	print_config := fp.bool('print-config', 0, false, 'print effective config as JSON and exit')
+	tune := fp.bool('tune', 0, false, 'print host-tuned backend/threads/quant and exit')
 	fp.finalize() or {
 		eprintln(err)
 		exit(1)
+	}
+	if tune {
+		print_tune()
+		return
 	}
 	if list_backends {
 		for name in infer.list_backends() {
@@ -126,6 +154,9 @@ fn main() {
 	// single-threaded. generate_real_cached copies it into each ForwardCtx.
 	model.pool = infer.new_worker_pool(infer.parallel_threads())
 	model.pld = cc.pld_config()
+	if cc.model.prefix_cache {
+		model.prefix = infer.new_prefix_cache()
+	}
 	eprintln('[vllm-os] boot ok: ${model.cfg.model_id} format=${model.format} tensors=${model.n_tensors()}')
 	api.serve(cc, &model) or {
 		eprintln('[vllm-os] serve failed: ${err}')

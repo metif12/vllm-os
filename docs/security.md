@@ -30,6 +30,15 @@ regardless; that is out of scope until confidential-computing hardware).
   carries no token unless `--auth-token` built it in. Prefer injecting
   the token at deploy time (env `VLLM_API_KEY` → config render) over
   baking it into a shared ISO.
+* **mmap'd weights are single-tenant by design.** `Model.blob` is cached at
+  boot and tensor slices borrow directly from it (no per-request copy).
+  That is safe only because the appliance serves one tenant with one
+  trusted process: there is no way for an untrusted in-guest peer to ask
+  for arbitrary blob offsets. Multi-tenant serving would need a real
+  capability boundary around those views (and revoke the shared mmap),
+  which is explicitly out of scope for v1. The opt-in prefix KV cache
+  (`model.prefix_cache`) is likewise process-local and never shared
+  across tenants.
 
 ## What is deliberately NOT done in-server
 

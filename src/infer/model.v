@@ -52,6 +52,8 @@ pub mut:
 	// pld is the opt-in prompt-lookup speculation config (phase 8). Set once
 	// at boot from cfg; empty/disabled keeps the original generate path.
 	pld PldCfg
+	// prefix is the opt-in prompt-prefix KV cache (phase 9). nil = disabled.
+	prefix &PrefixCache = unsafe { nil }
 }
 
 // n_tensors is the unified tensor count across containers.
@@ -243,9 +245,26 @@ fn (m Model) generate_real_cached(ids []int, max_tokens int, sp SampleParams) !s
 	need := ids.len + max_tokens
 	mut f := new_forward_ctx_cap(m.cfg, m.gguf, m.blob, need)!
 	f.pool = m.pool
-	for id in ids {
-		embed_gather(m.blob, m.gguf, m.cfg.hidden, id, mut f.hidden)!
+	// Prefix cache: reuse the shared prompt prefix's KV when present, then
+	// prefill only the new suffix. Numerics are unchanged (same decode_step
+	// over the same KV rows), so greedy tokens stay identical.
+	mut cached := 0
+	if m.prefix != unsafe { nil } {
+		// Local mutable pointer: the cache owns its own Mutex, so the shared
+		// Model/handler ctx can stay immutable across request threads.
+		mut pc := m.prefix
+		cached = pc.match_len(ids)
+		if cached > 0 {
+			pc.copy_into(mut f, cached)!
+		}
+	}
+	for i in cached .. ids.len {
+		embed_gather(m.blob, m.gguf, m.cfg.hidden, ids[i], mut f.hidden)!
 		f.decode_step()!
+	}
+	if m.prefix != unsafe { nil } && cached == 0 {
+		mut pc := m.prefix
+		pc.store(ids, ids.len, &f)!
 	}
 	eos := m.gguf.kv['tokenizer.ggml.eos_token_id'].int()
 	mut out := []int{cap: max_tokens}

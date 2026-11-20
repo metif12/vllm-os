@@ -396,6 +396,19 @@ ISQ, hardware-aware `tune`), modchip (THP/NTA/`/dev/shm` snapshot),
 `intel/ipex-llm` mmap side-channel warning (ARCHIVED project — never a
 dependency).
 
+Status 2026-11-20: `--tune` landed (host CPU/RAM detection → backend/threads/
+quant/ctx_cap, prints and exits). **Prefix caching landed** as an opt-in
+(`model.prefix_cache` / `VLLM_PREFIX_CACHE=1`): one Mutex-protected entry
+holding the last prompt's token ids and KV, copied into the next request's
+ForwardCtx when its ids share that prefix; only the suffix is prefilled.
+Bit-identical output is gated on real weights (skip when absent). Measured on
+Qwen3-0.6B-Q4_0 with `VLLM_THREADS=1`: an 18-token shared prefix took
+3063 ms uncached vs 972 ms cached (~3x); a 2-token prefix is slower
+(copy overhead exceeds one prefill), so the cache is opt-in rather than
+always-on. Chunked prefill, host-side ISQ and the tools-only THP/NTA
+experiments remain; the security note on single-tenant mmap is in
+`docs/security.md`.
+
 * Prefix caching (reuse prompt KV across turns) + chunked prefill
   (bound per-request prefill work) in the serve path; ISQ (in-situ
   quantization on load) host-side only, e.g. in the
