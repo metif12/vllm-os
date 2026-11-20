@@ -426,6 +426,11 @@ fn ggml_tensor_bytes(t GgmlType, n u64) u64 {
 		blocks := (n + 255) / 256
 		return blocks * 210
 	}
+	if t == .q4_k {
+		// block_q4_K: 256 elems / 142 bytes (ggml-common.h).
+		blocks := (n + 255) / 256
+		return blocks * 142
+	}
 	if t == .q2_0 {
 		blocks := (n + 63) / 64
 		return blocks * 18

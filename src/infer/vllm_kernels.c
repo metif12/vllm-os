@@ -1055,6 +1055,130 @@ VLLM_AVX2_FN void vllm_q6_k_matmul_f32(const unsigned char *data, const float *x
 	}
 }
 
+// --- Q4_K super-block (phase 11, v1 target Q4_K_M) ----------------------
+// block_q4_K: 142 bytes / 256 values. f16 d + f16 dmin + 12 scale bytes
+// + 128 nibble bytes. Eight 32-elem sub-blocks, 6-bit scale/min packed
+// across the 12 scale bytes. Mirrors infer.q4_k_dot_block.
+
+static void vllm_q4_k_scale_min(const unsigned char *q, int j, float *d, float *m) {
+	if (j < 4) {
+		*d = (float)(q[j] & 63);
+		*m = (float)(q[j + 4] & 63);
+	} else {
+		*d = (float)((q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4));
+		*m = (float)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+	}
+}
+
+#if VLLM_HAVE_SIMD
+static VLLM_AVX2_FN void q4_k_matvec_rows_avx2(const unsigned char *data, const float *x,
+	float *out, int rows, int bpr) {
+	__m128i m15 = _mm_set1_epi8(0x0f);
+	for (int r = 0; r < rows; r++) {
+		__m256 acc0 = _mm256_setzero_ps();
+		__m256 acc1 = _mm256_setzero_ps();
+		__m256 acc2 = _mm256_setzero_ps();
+		__m256 acc3 = _mm256_setzero_ps();
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 142;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 142;
+			float d = vllm_f16_lut_get(blk);
+			float mn = vllm_f16_lut_get(blk + 2);
+			const unsigned char *sc = blk + 4;
+			const unsigned char *qs = blk + 16;
+			const float *xb = x + (size_t)b * 256;
+			__m256 d0v = _mm256_set1_ps(d);
+			__m256 m0v = _mm256_set1_ps(mn);
+			for (int g = 0; g < 4; g++) {
+				float s0, m0, s1, m1;
+				vllm_q4_k_scale_min(sc, g * 2, &s0, &m0);
+				vllm_q4_k_scale_min(sc, g * 2 + 1, &s1, &m1);
+				__m256 sc0 = _mm256_mul_ps(d0v, _mm256_set1_ps(s0));
+				__m256 mn0 = _mm256_mul_ps(m0v, _mm256_set1_ps(m0));
+				__m256 sc1 = _mm256_mul_ps(d0v, _mm256_set1_ps(s1));
+				__m256 mn1 = _mm256_mul_ps(m0v, _mm256_set1_ps(m1));
+				const unsigned char *qg = qs + g * 32;
+				__m128i q = _mm_loadu_si128((const __m128i *)qg);
+				__m128i lo = _mm_and_si128(q, m15);
+				__m128i hi = _mm_and_si128(_mm_srli_epi64(q, 4), m15);
+				// low nibbles (sub-block 0): positions g*64 + 0..31
+				// q*scale - min (NOT (q-min)*scale): matches the reference.
+				__m256 f0 = _mm256_sub_ps(
+					_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), sc0), mn0);
+				__m256 f1 = _mm256_sub_ps(
+					_mm256_mul_ps(
+						_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))), sc0), mn0);
+				__m256 f2 = _mm256_sub_ps(
+					_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), sc1), mn1);
+				__m256 f3 = _mm256_sub_ps(
+					_mm256_mul_ps(
+						_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))), sc1), mn1);
+				// byte l low -> x[g*64+l], high -> x[g*64+32+l]
+				const float *xg = xb + g * 64;
+				acc0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(xg), acc0);
+				acc0 = _mm256_fmadd_ps(f2, _mm256_loadu_ps(xg + 32), acc0);
+				acc1 = _mm256_fmadd_ps(f1, _mm256_loadu_ps(xg + 8), acc1);
+				acc1 = _mm256_fmadd_ps(f3, _mm256_loadu_ps(xg + 40), acc1);
+				// remaining 16 nibbles of the 32-byte group are in qg+16
+				__m128i q2 = _mm_loadu_si128((const __m128i *)(qg + 16));
+				__m128i lo2 = _mm_and_si128(q2, m15);
+				__m128i hi2 = _mm_and_si128(_mm_srli_epi64(q2, 4), m15);
+				__m256 f4 = _mm256_sub_ps(
+					_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo2)), sc0), mn0);
+				__m256 f5 = _mm256_sub_ps(
+					_mm256_mul_ps(
+						_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo2, 8))), sc0), mn0);
+				__m256 f6 = _mm256_sub_ps(
+					_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi2)), sc1), mn1);
+				__m256 f7 = _mm256_sub_ps(
+					_mm256_mul_ps(
+						_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi2, 8))), sc1), mn1);
+				acc2 = _mm256_fmadd_ps(f4, _mm256_loadu_ps(xg + 16), acc2);
+				acc2 = _mm256_fmadd_ps(f6, _mm256_loadu_ps(xg + 48), acc2);
+				acc3 = _mm256_fmadd_ps(f5, _mm256_loadu_ps(xg + 24), acc3);
+				acc3 = _mm256_fmadd_ps(f7, _mm256_loadu_ps(xg + 56), acc3);
+			}
+		}
+		__m256 s = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+		out[r] = vllm_hsum_avx2(s);
+	}
+}
+#endif
+
+VLLM_AVX2_FN void vllm_q4_k_matvec_f32(const unsigned char *data, const float *x, float *out,
+	int rows, int cols) {
+	int bpr = cols / 256;
+#if VLLM_HAVE_SIMD
+	if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+		vllm_f16_lut_init();
+		q4_k_matvec_rows_avx2(data, x, out, rows, bpr);
+		return;
+	}
+#endif
+	for (int r = 0; r < rows; r++) {
+		float s = 0.0f;
+		const unsigned char *row = data + (size_t)r * (size_t)bpr * 142;
+		for (int b = 0; b < bpr; b++) {
+			const unsigned char *blk = row + (size_t)b * 142;
+			float d = vllm_f16_le_to_f32(blk);
+			float mn = vllm_f16_le_to_f32(blk + 2);
+			const unsigned char *sc = blk + 4;
+			const unsigned char *qs = blk + 16;
+			for (int g = 0; g < 4; g++) {
+				float s0, m0, s1, m1;
+				vllm_q4_k_scale_min(sc, g * 2, &s0, &m0);
+				vllm_q4_k_scale_min(sc, g * 2 + 1, &s1, &m1);
+				const float *xb = x + (size_t)b * 256 + g * 64;
+				for (int l = 0; l < 32; l++) {
+					s += (d * s0 * (float)(int)(qs[g * 32 + l] & 0x0f) - mn * m0) * xb[l];
+					s += (d * s1 * (float)(int)(qs[g * 32 + l] >> 4) - mn * m1) * xb[32 + l];
+				}
+			}
+		}
+		out[r] = s;
+	}
+}
+
 void vllm_softmax_scaled_fast_f32(float *xs, int n, float scale) {
 	float m = xs[0] * scale;
 	for (int i = 1; i < n; i++) {

@@ -24,6 +24,25 @@ JSON index (capped at 256 MB); weight blobs are never pulled into RAM by
 the loader. The unified view is `ModelFile{tensors: []TensorMeta, meta}`
 with `find(name)`; `Model.n_tensors()` works across containers.
 
+## GGUF quant types with compute kernels
+
+The GGUF table parser indexes every dtype, but the forward has fused
+dequant/matvec kernels only for this set (all pure V + AVX2 dispatch):
+
+| type | block | kernel |
+|---|---|---|
+| Q4_0 | 32 elems / 18 B | `q4_0_dot_row`, row-vector C matvec |
+| Q4_1 | 32 elems / 20 B | `q4_1_dot_row`, row-vector C matvec |
+| Q4_K | 256 elems / 142 B | `q4_k_dot_block`, AVX2 row-vector matvec (Phase 11) |
+| Q6_K | 256 elems / 210 B | `q6_k_dot_block`, AVX2 matvec |
+| IQ4_NL | 32 elems / 18 B | non-linear 16-entry codebook, AVX2 `pshufb` |
+| Q2_0 (+ R8) | 64 elems / 18 B | signed-scale 2-bit; R8 repack reuses the int8 dot |
+
+Other GGUF dtypes parse and size correctly but fall back to the i8 path at
+compute time — do not assume they produce meaningful logits. Q4_K is the
+v1 target (`Qwen3-1.7B-Q4_K_M`); its real-weight golden gate needs that
+file in `models/`.
+
 ## Getting Qwen3-1.7B weights
 
 ```sh

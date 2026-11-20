@@ -32,6 +32,25 @@ asm in the vlang/v issue), AND the ISO must boot anywhere. SIMD comes
 from function-target attributes + runtime dispatch — see `docs/perf.md`
 flag hygiene.
 
+## Real-weight fixtures (golden gates)
+
+The GGUF fixtures are not committed and must be fetched on the host:
+
+```sh
+sh scripts/fetch_small_models.sh          # default: Q4_0 fixtures (0.6B + 1.7B)
+sh scripts/fetch_small_models.sh q4_k_m  # Phase 11 target only
+sh scripts/fetch_small_models.sh all     # both sets
+```
+
+`q4_k_m` downloads `models/Qwen3-1.7B-Q4_K_M.gguf` (exact size asserted:
+1107409472 bytes). It is needed for the Phase 11 real-weight gate —
+`test_gguf_golden_qwen_17b_q4_k_m` in `src/infer/gguf_golden_test.v`
+skips with `[skip] ... phase 11 real-weight gate pending` until that
+file is present. Fetches are size-asserted and skip files already present
+at the expected size; `http_proxy`/`https_proxy` are honoured by curl.
+Note the golden test resolves the exact case-sensitive filename
+`Qwen3-1.7B-Q4_K_M.gguf` (or set `VLLM_MODELS` to its directory).
+
 ## Host run (no weights needed)
 
 ```sh

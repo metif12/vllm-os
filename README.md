@@ -43,7 +43,7 @@ src/infer/attention.v # KVCache arena + full/windowed attention (opt-in sinks)
 src/infer/sampler.v   # presets, fused softmax-scale, min-p, heap top-k, zero-alloc top-k/top-p + xorshift RNG
 src/infer/pld.v       # opt-in prompt-lookup drafts + greedy verification (bit-exact, phase 8)
 src/infer/tokenizer.v # Tokenizer iface (BPE loader + stub) + Qwen ChatML template
-src/infer/quant.v     # Q4_0/Q4_1/Q6_K/IQ4_NL/Q2_0(+R8)/F16 dequant + fused dots (no materialize)
+src/infer/quant.v     # Q4_0/Q4_1/Q4_K/Q6_K/IQ4_NL/Q2_0(+R8)/F16 dequant + fused dots (no materialize)
 src/infer/nn.v        # rmsnorm/rope-tables/swiglu/unrolled+blocked matvec
 src/infer/backend.v   # Backend interface + registry (cpu/cpu-blocked/cpu-simd/cpu-parallel/auto)
 src/infer/parallel.v    # threaded row-block matvec (VLLM_THREADS, freestanding-safe fallback)

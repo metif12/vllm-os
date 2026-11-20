@@ -170,6 +170,13 @@ serial / **485 MB** threaded, well under the 4 GB guest budget. These are
 correctness/RSS gates, not a timing comparison; the harness accepts a
 trusted-engine baseline JSON for real cross-engine KLD/Same-top-p.
 
+Q4_K (phase 11, `tools/q4k_bench.v`, synthetic GGUF blocks, loaded host):
+the AVX2 row-vector matvec took **366 us** for 2048x1024 and **400 us** for
+1024x2048, versus **6791 / 6132 us** pure V (~18x), with max absolute output
+difference **~5e-4** (inside the 1e-3 band). Numbers are synthetic-shape
+kernel timings, not a 1.7B tok/s claim — the real Q4_K_M model is not yet
+in the checkout.
+
 Attention scaling (phase 10, `tools/attn_bench.v`, synthetic 128-dim head,
 host, 200 reps): full attention is **121.6 us/head-step at n=512** and
 **1057.8 us at n=4096**; a 256-token window with 4 sinks is **60.4 us** and

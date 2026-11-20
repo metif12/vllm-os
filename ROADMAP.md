@@ -521,6 +521,18 @@ scale/min via `get_scale_min_k4`; `out = d*sc*q - dmin*m`.
   reference, C-vs-V, threaded/pool, tail rows) + real 1.7B golden table +
   8-step greedy bit-identical to the reference and logit maxdiff < 1e-3.
 
+Status 2026-11-20: **core landed**. `quant.v` has the exact 142-byte/256-elem
+block layout, 6-bit scale/min decoder, dequant, fused dot, matvec and embed
+gather; `vllm_kernels.c` has `vllm_q4_k_matvec_f32` with AVX2 row-vector
+accumulation (one hsum per row) and a scalar fallback; the bridge, range
+form, threaded/pool head and `.q4_k` dispatch are wired. Gates in
+`q4_k_test.v` pass in `-prod`: hand-checked dequant, fused-vs-dequant,
+matvec reference, C-vs-V, threaded/pool and tail rows. A real-weight golden
+hook in `gguf_golden_test.v` skips until the file is present. **Pending**:
+`models/Qwen3-1.7B-Q4_K_M.gguf` is not in this checkout (the fetch script
+only pulls Q4_0), so the real 1.7B greedy/maxdiff gate is not yet run; that
+is the only remaining item before this phase is fully green.
+
 ### Phase 12 — close the ~3x gap to llama.cpp
 
 * Proper SIMD-across-k matmul: k register accumulators, weight dequant shared

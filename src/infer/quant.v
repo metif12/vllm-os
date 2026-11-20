@@ -10,6 +10,7 @@ pub const qk8_0 = 32
 pub const qk4_1 = 32
 pub const qk_k = 256
 pub const q6_k_block_bytes = 210
+pub const q4_k_block_bytes = 142
 
 pub struct BlockQ40 {
 pub:
@@ -570,5 +571,125 @@ pub fn q2_0_r8_matvec(data []u8, rows int, cols int, x []f32, mut out []f32) {
 			s += q2_0_r8_dot_block(data, base + b, x, b * qk2_0)
 		}
 		out[r] = s
+	}
+}
+
+// --- Q4_K: GGML 4-bit super-block (phase 11, v1 target Q4_K_M) -----------
+//
+// block_q4_K (ggml-common.h): f16 d + f16 dmin + 12 scale bytes + 128
+// nibble bytes = 142 bytes / 256 values. Eight 32-element sub-blocks use
+// 6-bit scale/min packed across the 12 scale bytes (get_scale_min_k4), and
+// split-half nibbles (byte l of the sub-block holds q[l] low, q[l+32] high).
+// Dequant: value = d*scale[sub]*q - dmin*min[sub]. Primary source already
+// fetched; no C copied.
+
+pub struct BlockQ4K {
+pub:
+	d      u16
+	dmin   u16
+	scales [12]u8
+	qs     [128]u8
+}
+
+@[direct_array_access]
+pub fn block_q4_k_at(data []u8, blk int) BlockQ4K {
+	off := blk * q4_k_block_bytes
+	mut scales := [12]u8{}
+	mut qs := [128]u8{}
+	for i in 0 .. 12 {
+		scales[i] = data[off + 4 + i]
+	}
+	for i in 0 .. 128 {
+		qs[i] = data[off + 16 + i]
+	}
+	return BlockQ4K{
+		d:      u16(data[off]) | (u16(data[off + 1]) << 8)
+		dmin:   u16(data[off + 2]) | (u16(data[off + 3]) << 8)
+		scales: scales
+		qs:     qs
+	}
+}
+
+// q4_k_scale_min decodes the 6-bit scale and min of sub-block j.
+fn q4_k_scale_min(scales []u8, j int) (int, int) {
+	if j < 4 {
+		return int(scales[j] & 63), int(scales[j + 4] & 63)
+	}
+	d := int((scales[j + 4] & 0x0f) | ((scales[j - 4] >> 6) << 4))
+	m := int((scales[j + 4] >> 4) | ((scales[j] >> 6) << 4))
+	return d, m
+}
+
+// dequant_q4_k_block decodes one 256-element super-block into out[0..256].
+@[direct_array_access]
+pub fn dequant_q4_k_block(block BlockQ4K, mut out []f32) {
+	d := f16bits_to_f32(block.d)
+	mn := f16bits_to_f32(block.dmin)
+	mut sidx := 0
+	mut q := 0
+	for j := 0; j < qk_k; j += 64 {
+		sc0, m0 := q4_k_scale_min(block.scales[0..], sidx)
+		sc1, m1 := q4_k_scale_min(block.scales[0..], sidx + 1)
+		d1 := d * f32(sc0)
+		min1 := mn * f32(m0)
+		d2 := d * f32(sc1)
+		min2 := mn * f32(m1)
+		for l := 0; l < 32; l++ {
+			out[j + l] = f32(int(block.qs[q + l] & 0x0f)) * d1 - min1
+			out[j + 32 + l] = f32(int(block.qs[q + l] >> 4)) * d2 - min2
+		}
+		q += 32
+		sidx += 2
+	}
+}
+
+// q4_k_dot_block fuses dot(dequant(super_block), x) without materializing.
+@[direct_array_access]
+pub fn q4_k_dot_block(block BlockQ4K, x []f32, x_off int) f32 {
+	d := f16bits_to_f32(block.d)
+	mn := f16bits_to_f32(block.dmin)
+	mut s := f32(0)
+	mut sidx := 0
+	mut q := 0
+	for j := 0; j < qk_k; j += 64 {
+		sc0, m0 := q4_k_scale_min(block.scales[0..], sidx)
+		sc1, m1 := q4_k_scale_min(block.scales[0..], sidx + 1)
+		d1 := d * f32(sc0)
+		min1 := mn * f32(m0)
+		d2 := d * f32(sc1)
+		min2 := mn * f32(m1)
+		for l := 0; l < 32; l++ {
+			s += (f32(int(block.qs[q + l] & 0x0f)) * d1 - min1) * x[x_off + j + l]
+			s += (f32(int(block.qs[q + l] >> 4)) * d2 - min2) * x[x_off + j + 32 + l]
+		}
+		q += 32
+		sidx += 2
+	}
+	return s
+}
+
+// q4_k_matvec computes out = W*x for a Q4_K row-major [rows x cols] matrix
+// (cols must divide 256).
+@[direct_array_access]
+pub fn q4_k_matvec(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	bpr := cols / qk_k
+	for r in 0 .. rows {
+		mut s := f32(0)
+		base := r * bpr
+		for b in 0 .. bpr {
+			s += q4_k_dot_block(block_q4_k_at(data, base + b), x, b * qk_k)
+		}
+		out[r] = s
+	}
+}
+
+// embed_gather_q4_k decodes row id of a Q4_K [vocab x dim] matrix into f32.
+@[direct_array_access]
+pub fn embed_gather_q4_k(data []u8, dim int, id int, mut out []f32) {
+	bpr := dim / qk_k
+	base := id * bpr
+	for b in 0 .. bpr {
+		mut seg := unsafe { out[b * qk_k..(b + 1) * qk_k] }
+		dequant_q4_k_block(block_q4_k_at(data, base + b), mut seg)
 	}
 }

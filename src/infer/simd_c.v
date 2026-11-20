@@ -37,6 +37,7 @@ $if prod {
 	fn C.vllm_q4_0_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_q4_1_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_q6_k_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
+	fn C.vllm_q4_k_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_iq4_nl_dot_f32(qs &u8, x &f32, scale f32, n int) f32
 	fn C.vllm_iq4_nl_matvec_f32(data &u8, x &f32, out &f32, rows int, cols int)
 	fn C.vllm_q2_0_dot_f32(qs &u8, x &f32, scale f32, n int) f32
@@ -330,6 +331,39 @@ pub fn q2_0_r8_matvec_c(data []u8, rows int, cols int, x []f32, mut out []f32) {
 		}
 		out[r] = s
 	}
+}
+
+// q4_k_matvec_c computes out = W*x for a Q4_K row-major matrix via the C
+// AVX2 row-vector kernel, or the pure-V kernel otherwise.
+@[direct_array_access]
+pub fn q4_k_matvec_c(data []u8, rows int, cols int, x []f32, mut out []f32) {
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q4_k_matvec_f32(data.data, x.data, out.data, rows, cols)
+			}
+			return
+		}
+	}
+	q4_k_matvec(data, rows, cols, x, mut out)
+}
+
+// q4_k_matvec_c_range computes out[r0..r0+n] on a Q4_K row block.
+@[direct_array_access]
+pub fn q4_k_matvec_c_range(data []u8, rows int, cols int, x []f32, r0 int, n int, mut out []f32) {
+	bpr := cols / qk_k
+	$if prod {
+		if has_avx2() {
+			unsafe {
+				C.vllm_q4_k_matvec_f32(&data[r0 * bpr * q4_k_block_bytes], x.data, &out[r0], n,
+					cols)
+			}
+			return
+		}
+	}
+	ds := data[r0 * bpr * q4_k_block_bytes..(r0 + n) * bpr * q4_k_block_bytes]
+	mut outs := unsafe { out[r0..r0 + n] }
+	q4_k_matvec(ds, n, cols, x, mut outs)
 }
 
 // q4_0_matmul_c computes outs[t][r] = W[r,:] * xs[t,:] for all t in [0,k).
