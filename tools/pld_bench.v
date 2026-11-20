@@ -33,6 +33,14 @@ fn main() {
 	if text == '' {
 		text = probe
 	}
+	mut ngram := 3
+	if v := os.getenv_opt('VLLM_PLD_NGRAM') {
+		ngram = v.int()
+	}
+	mut cont := 10
+	if v := os.getenv_opt('VLLM_PLD_CONTINUATION') {
+		cont = v.int()
+	}
 	// Warm up both paths once (page cache + code paths).
 	m.pld = infer.PldCfg{
 		enabled: false
@@ -54,9 +62,11 @@ fn main() {
 
 	m.pld = infer.PldCfg{
 		enabled:      os.getenv('VLLM_PLD_OFF') == ''
-		max_ngram:    3
-		continuation: 10
+		max_ngram:    ngram
+		continuation: cont
 	}
+	mut stats := infer.PldStats{}
+	m.pld_last = &stats
 	sw = time.new_stopwatch()
 	spec := m.generate(text, n, sp)
 	spec_ms := sw.elapsed().milliseconds()
@@ -69,6 +79,16 @@ fn main() {
 	println(spec_ms.str())
 	print('same_text=')
 	println((plain == spec).str())
+	print('ngram=')
+	println(ngram.str())
+	print('continuation=')
+	println(cont.str())
+	print('drafts=')
+	println(stats.drafts.str())
+	print('accepted=')
+	println(stats.accepted.str())
+	print('accept_rate=')
+	println(stats.accept_rate().str())
 	print('plain_head=')
 	println(plain)
 	print('pld_head=')

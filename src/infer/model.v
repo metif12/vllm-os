@@ -57,6 +57,9 @@ pub mut:
 	// phase 10 sliding-window attention (0 = exact full attention).
 	attn_window int
 	attn_sinks  int = 4
+	// pld_last receives the verify stats of the last generate_pld call when
+	// non-nil (diagnostics/tools; never read by the token loop).
+	pld_last &PldStats = unsafe { nil }
 }
 
 // n_tensors is the unified tensor count across containers.
@@ -351,6 +354,13 @@ fn (m Model) generate_pld(ids []int, max_tokens int, sp SampleParams) !string {
 		if stop {
 			break
 		}
+	}
+	if m.pld_last != unsafe { nil } {
+		mut dst := m.pld_last
+		st := controller.stats_snapshot()
+		dst.rounds = st.rounds
+		dst.drafts = st.drafts
+		dst.accepted = st.accepted
 	}
 	return m.tok.decode(out)
 }

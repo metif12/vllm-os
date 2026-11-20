@@ -371,10 +371,12 @@ and their accumulation order can flip a near-tie argmax on accepted drafts.
 The default stays bit-exact serial verification. A SIMD-across-k matmul
 (k register accumulators, one hsum per row) was then added; it improves the
 kernels but end-to-end batching remains slower on every tested prompt (see
-`docs/perf.md`) because the draft accept rate is low — a 10-token batch is
-usually discarded at the first rejection — and the Q6_K head is still
-per-block. A win needs a higher accept rate plus a fully batched head; both
-are follow-up work. EAGLE3/DFlash/DSpark/MTP stay out.
+`docs/perf.md`). `tools/pld_bench.v` measured the root cause: **accept rate
+is 3/15 = 0.2 on the code-edit probe and does not change with max_ngram**
+(2/3/5/8/16 all identical). At p=0.2 speculation cannot pay even with free
+verification, so a different draft source — not a better kernel — would be
+needed. The correctness foundation and accept-rate instrumentation are the
+deliverables; no speedup is claimed. EAGLE3/DFlash/DSpark/MTP stay out.
 
 * Ship only PLD/ngram in `src/infer/sampler.v` (pure V,
   arena-allocated, opt-in flag + `VLLM_*` env in `src/cfg/config.v`).

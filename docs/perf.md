@@ -198,11 +198,18 @@ never the default. A first version used a per-block horizontal sum per token
 accumulators, one hsum per row, chunked at 8) improved the kernels but the
 end-to-end path is still slower on every tested prompt: ~15815 ms on the
 code-edit probe and ~5792 ms on a deliberately repetitive "hello world"
-prompt (vs ~9458 / ~3396 ms plain). Two causes: draft accept rate is low, so
-a 10-token batch is usually thrown away after the first rejection, and the
-Q6_K head still uses per-block dots. Text can also diverge on accepted drafts
-from f32 reassociation. A win needs both a higher accept rate and a fully
-batched head; neither is claimed here.
+prompt (vs ~9458 / ~3396 ms plain). Text can also diverge on accepted drafts
+from f32 reassociation.
+
+`tools/pld_bench.v` now reports verify stats (exposed from `generate` via
+`Model.pld_last`). On the code-edit probe the accept rate is **3/15 = 0.2**
+and is **independent of `max_ngram`** (2, 3, 5, 8, 16 all gave 15 drafts /
+3 accepted). That is the root cause, not kernel efficiency: at p=0.2 the
+expected accepted prefix is ~1.25 tokens per four forwards, so even a free
+batch loses ~3x to plain decoding. The published ~2.4x PLD result depends
+on an input-grounded distribution with a much higher match rate than this
+model/prompt pair. No wall-time win is claimed; a different draft source
+would be needed, which is outside the current roadmap.
 
 The wide-matvec story is the memory wall, moved twice: first SIMD
 minimized per-byte cost (~11 ms -> ~8 ms single-threaded), then threads
