@@ -91,6 +91,17 @@ mirror element-for-element.
 * Full design numbers live in `kernel/mini.md` (boot order, memory budget,
   gates).
 
+## Paged attention (research note, not planned)
+
+Paged KV (block tables, demand-paged slots) is the standard answer to
+fragmentation at long context, but our KV store is a flat `[cap x dim]`
+arena whose cap is sized to the request (`new_forward_ctx_cap`) and whose
+cache lifetime is one request (plus the opt-in single-entry prefix cache).
+There is no long-lived pool of partially filled sequences to page, so a
+block table would add indirection in `attention_step` without recovering
+memory today. Revisit only when serving many concurrent long contexts from
+one shared KV pool.
+
 ## Engine boundaries (docs-only, Phase 10)
 
 These engines were evaluated and deliberately kept out of the guest; they

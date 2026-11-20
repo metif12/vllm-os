@@ -409,6 +409,25 @@ always-on. Chunked prefill, host-side ISQ and the tools-only THP/NTA
 experiments remain; the security note on single-tenant mmap is in
 `docs/security.md`.
 
+Dispositions for the rest of Phase 9 (2026-11-20):
+
+* **Chunked prefill — not applicable in v1.** Chunking only buys fairness
+  when many requests share one prefill/decode scheduler. Here the accept
+  loop spawns one handler thread per request (`server.max_conns` bounds
+  concurrency), so a long prompt blocks only its own thread — other
+  requests already proceed in parallel. Adding chunk boundaries without a
+  shared scheduler cannot reorder work and would just add bookkeeping.
+  Revisit only if the thread-per-request model is replaced.
+* **Host-side ISQ — deferred.** There is no in-tree quantizer/llama.cpp
+  conversion step to hook; `scripts/fetch_model.sh` downloads an already
+  quantized GGUF. Adding an ISQ stage needs a reference converter and a
+  real-weight quality gate first (the Phase 7 harness can supply the gate).
+* **Tools-only THP / NTA / `/dev/shm` snapshot — deferred.** All three are
+  Linux-specific (`madvise`, `_MM_HINT_NTA`, shm) and the current host is
+  Windows with no quiet measurement window; the pool A/B was already
+  BLOCKED on that basis. They belong in `tools/` behind a Linux CI lane
+  where VmHWM and page-fault counts can be measured, not in the guest.
+
 * Prefix caching (reuse prompt KV across turns) + chunked prefill
   (bound per-request prefill work) in the serve path; ISQ (in-situ
   quantization on load) host-side only, e.g. in the
