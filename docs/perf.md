@@ -170,6 +170,15 @@ serial / **485 MB** threaded, well under the 4 GB guest budget. These are
 correctness/RSS gates, not a timing comparison; the harness accepts a
 trusted-engine baseline JSON for real cross-engine KLD/Same-top-p.
 
+Attention scaling (phase 10, `tools/attn_bench.v`, synthetic 128-dim head,
+host, 200 reps): full attention is **121.6 us/head-step at n=512** and
+**1057.8 us at n=4096**; a 256-token window with 4 sinks is **60.4 us** and
+**74.8 us** respectively (~2x at 512, ~14x at 4096). This is why the 4k
+default is kept until a >=16 GB guest exists: windowing is opt-in
+(`VLLM_ATTN_WINDOW`), and at short context attention is already negligible
+next to the weight-bound decode. Head-step numbers are not an end-to-end
+tok/s claim.
+
 Prefix caching (phase 9, `VLLM_PREFIX_CACHE=1`) on Qwen3-0.6B-Q4_0,
 `VLLM_THREADS=1`, loaded host: an 18-token shared prompt prefix took
 **3063 ms uncached vs 972 ms cached (~3x)** with bit-identical output; a

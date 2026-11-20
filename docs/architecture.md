@@ -90,3 +90,25 @@ mirror element-for-element.
   ≥16 GB guests.
 * Full design numbers live in `kernel/mini.md` (boot order, memory budget,
   gates).
+
+## Engine boundaries (docs-only, Phase 10)
+
+These engines were evaluated and deliberately kept out of the guest; they
+are recorded here so the decision is not re-litigated:
+
+* **PowerInfer / PowerInfer-2.** Hot/cold weight partitioning needs
+  ReLU-sparse models to get its activated-neuron savings. Qwen3 uses dense
+  SwiGLU, so the sparsity premise does not hold; the same trick would only
+  pay on a different model family. Kept as the sub-2bpw reference point
+  alongside BitNet, not as a runtime path.
+* **KTransformers.** CPU+GPU offload requires GPU drivers vinix-mini does
+  not ship. The seam stays at `list_backends()` / `select_backend()`:
+  another backend can be added there without touching model or server code,
+  but there is no guest-side GPU to target.
+* **mlc-ai/mlc-llm.** TVM needs a compiler runtime (codegen, module loading)
+  that a freestanding `-gc none` guest cannot host. Rejected with that
+  reason, not for lack of kernels.
+* **BitNet.cpp.** 1.58-bit ternary needs weights trained with ternary
+  quantization; converting Q4 weights does not produce a valid model. It
+  remains the sub-2bpw reference for the Phase 7 quality gates, not a quant
+  type we can add to an existing GGUF.

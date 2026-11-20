@@ -130,6 +130,96 @@ pub fn attention_prefix(q []f32, k &KVCache, v &KVCache, scale f32, n int, mut p
 	}
 }
 
+// attention_step_window computes one head over a sliding window plus
+// attention sinks: the union of the first `sinks` positions and the last
+// `window` positions (deduplicated). Sinks preserve the start-of-stream
+// attention that sliding windows otherwise lose. No allocation: the two
+// ranges are walked directly and their scores packed into probs[0..cnt].
+// window <= 0 or window >= len means exact full attention (same as
+// attention_step), so the knob is a pure opt-in with no default change.
+@[direct_array_access]
+pub fn attention_step_window(q []f32, k &KVCache, v &KVCache, scale f32, window int, sinks int, mut probs []f32, mut out []f32) ! {
+	n := k.len()
+	if window <= 0 || window >= n {
+		return attention_step(q, k, v, scale, mut probs, mut out)
+	}
+	if q.len != k.dim || out.len != v.dim || v.len() != n {
+		return error('attention_window: dim/len mismatch')
+	}
+	mut ns := if sinks < n { sinks } else { n }
+	if ns < 0 {
+		ns = 0
+	}
+	mut wstart := n - window
+	if wstart < ns {
+		wstart = ns // dedupe sink positions from the window range
+	}
+	need := ns + (n - wstart)
+	if probs.len < need {
+		return error('attention_window: probs holds ${probs.len}, need ${need}')
+	}
+	kd := k.data
+	mut m := f32(-1e30)
+	mut cnt := 0
+	for i in 0 .. ns {
+		base := i * k.dim
+		mut score := f32(0)
+		for d in 0 .. q.len {
+			score += q[d] * kd[base + d]
+		}
+		score *= scale
+		probs[cnt] = score
+		if score > m {
+			m = score
+		}
+		cnt++
+	}
+	for i in wstart .. n {
+		base := i * k.dim
+		mut score := f32(0)
+		for d in 0 .. q.len {
+			score += q[d] * kd[base + d]
+		}
+		score *= scale
+		probs[cnt] = score
+		if score > m {
+			m = score
+		}
+		cnt++
+	}
+	mut s := f32(0)
+	for i in 0 .. cnt {
+		e := f32(math.exp(f64(probs[i] - m)))
+		probs[i] = e
+		s += e
+	}
+	inv := f32(1.0 / f64(s))
+	for i in 0 .. cnt {
+		probs[i] *= inv
+	}
+	vd := v.data
+	for d in 0 .. out.len {
+		out[d] = 0
+	}
+	mut p := 0
+	for i in 0 .. ns {
+		base := i * v.dim
+		pi := probs[p]
+		p++
+		for d in 0 .. out.len {
+			out[d] += pi * vd[base + d]
+		}
+	}
+	for i in wstart .. n {
+		base := i * v.dim
+		pi := probs[p]
+		p++
+		for d in 0 .. out.len {
+			out[d] += pi * vd[base + d]
+		}
+	}
+}
+
 // attention_step computes one query head output against full caches:
 // scores = softmax(q.K^T * scale) into probs, out = Σ probs * V.
 // probs must hold ≥ k.len() elems; out must hold dim elems. Single head —

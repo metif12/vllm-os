@@ -125,6 +125,9 @@ pub mut:
 	// VLLM_THREADS=1, where decode falls back to serial kernels). Copied from
 	// Model at request time so decode_step uses no global state.
 	pool &WorkerPool = unsafe { nil }
+	// phase 10 opt-in sliding-window attention (0 = exact full attention).
+	attn_window int
+	attn_sinks  int
 }
 
 // new_forward_ctx allocates arenas for ctx_cap tokens of KV per head.
@@ -487,8 +490,14 @@ pub fn (mut f ForwardCtx) decode_step() ! {
 		}
 		for qh in 0 .. nh {
 			kh := qh / gqa
-			attention_step(f.q[qh * hd..(qh + 1) * hd], &f.k_cache[l * nkv + kh], &f.v_cache[
-				l * nkv + kh], scale, mut f.probs, mut f.attn_out[qh * vd..(qh + 1) * vd])!
+			if f.attn_window > 0 {
+				attention_step_window(f.q[qh * hd..(qh + 1) * hd], &f.k_cache[l * nkv + kh], &f.v_cache[
+					l * nkv + kh], scale, f.attn_window, f.attn_sinks, mut f.probs, mut f.attn_out[qh * vd..(
+					qh + 1) * vd])!
+			} else {
+				attention_step(f.q[qh * hd..(qh + 1) * hd], &f.k_cache[l * nkv + kh], &f.v_cache[
+					l * nkv + kh], scale, mut f.probs, mut f.attn_out[qh * vd..(qh + 1) * vd])!
+			}
 		}
 		q4_0_matvec_c(lt.o, h, nh * vd, f.attn_out, mut f.proj)
 		for i in 0 .. h {

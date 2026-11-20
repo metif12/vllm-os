@@ -5,7 +5,9 @@
     "format": "auto",
     "ctx_cap": 4096,
     "backend": "cpu",
-    "prefix_cache": false
+    "prefix_cache": false,
+    "attn_window": 0,
+    "attn_sinks": 4
   },
   "sampler": {
     "preset": "balanced",

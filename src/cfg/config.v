@@ -30,6 +30,9 @@ pub mut:
 	backend string = 'cpu' // cpu | cpu-blocked | cpu-simd | auto
 	// prefix_cache reuses the previous prompt's KV across turns (phase 9).
 	prefix_cache bool
+	// phase 10 opt-in sliding-window attention (0 = exact full attention).
+	attn_window int
+	attn_sinks  int = 4
 }
 
 pub struct SamplerCfg {
@@ -116,6 +119,9 @@ pub fn (mut c Config) normalize() {
 	if c.sampler.pld_continuation == 0 {
 		c.sampler.pld_continuation = 10
 	}
+	if c.model.attn_sinks == 0 {
+		c.model.attn_sinks = 4
+	}
 	if c.api.max_tokens == 0 {
 		c.api.max_tokens = 256
 	}
@@ -146,6 +152,15 @@ pub fn (c Config) validate() ! {
 	}
 	if c.model.format !in ['auto', 'gguf', 'safetensors'] {
 		return error('config: unknown format: ${c.model.format}')
+	}
+	if c.model.attn_window < 0 || c.model.attn_window > 131072 {
+		return error('config: attn_window out of range: ${c.model.attn_window}')
+	}
+	if c.model.attn_window > 0 && c.model.attn_window < 32 {
+		return error('config: attn_window must be 0 or >= 32')
+	}
+	if c.model.attn_sinks < 0 || c.model.attn_sinks > 64 {
+		return error('config: attn_sinks out of range: ${c.model.attn_sinks}')
 	}
 	if c.sampler.preset !in infer.sampler_presets() {
 		return error('config: unknown sampler preset: ${c.sampler.preset}')
@@ -240,6 +255,12 @@ pub fn (mut c Config) apply_env() ! {
 	}
 	if v := os.getenv_opt('VLLM_PREFIX_CACHE') {
 		c.model.prefix_cache = v == '1' || v.to_lower() == 'true'
+	}
+	if v := os.getenv_opt('VLLM_ATTN_WINDOW') {
+		c.model.attn_window = v.int()
+	}
+	if v := os.getenv_opt('VLLM_ATTN_SINKS') {
+		c.model.attn_sinks = v.int()
 	}
 	if v := os.getenv_opt('VLLM_PRESET') {
 		c.sampler.preset = v

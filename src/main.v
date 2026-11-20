@@ -154,6 +154,8 @@ fn main() {
 	// single-threaded. generate_real_cached copies it into each ForwardCtx.
 	model.pool = infer.new_worker_pool(infer.parallel_threads())
 	model.pld = cc.pld_config()
+	model.attn_window = cc.model.attn_window
+	model.attn_sinks = cc.model.attn_sinks
 	if cc.model.prefix_cache {
 		model.prefix = infer.new_prefix_cache()
 	}

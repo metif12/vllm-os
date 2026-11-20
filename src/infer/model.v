@@ -54,6 +54,9 @@ pub mut:
 	pld PldCfg
 	// prefix is the opt-in prompt-prefix KV cache (phase 9). nil = disabled.
 	prefix &PrefixCache = unsafe { nil }
+	// phase 10 sliding-window attention (0 = exact full attention).
+	attn_window int
+	attn_sinks  int = 4
 }
 
 // n_tensors is the unified tensor count across containers.
@@ -245,6 +248,8 @@ fn (m Model) generate_real_cached(ids []int, max_tokens int, sp SampleParams) !s
 	need := ids.len + max_tokens
 	mut f := new_forward_ctx_cap(m.cfg, m.gguf, m.blob, need)!
 	f.pool = m.pool
+	f.attn_window = m.attn_window
+	f.attn_sinks = m.attn_sinks
 	// Prefix cache: reuse the shared prompt prefix's KV when present, then
 	// prefill only the new suffix. Numerics are unchanged (same decode_step
 	// over the same KV rows), so greedy tokens stay identical.
@@ -313,6 +318,8 @@ fn (m Model) generate_pld(ids []int, max_tokens int, sp SampleParams) !string {
 	// draft window. new_forward_ctx_cap clamps to cfg.ctx_cap.
 	need := ids.len + max_tokens + m.pld.continuation + 1
 	mut f := new_forward_ctx_cap(m.cfg, m.gguf, m.blob, need)!
+	f.attn_window = m.attn_window
+	f.attn_sinks = m.attn_sinks
 	// Prefill: feed the prompt, leaving f.logits at the first answer position.
 	for id in ids {
 		embed_gather(m.blob, m.gguf, m.cfg.hidden, id, mut f.hidden)!
@@ -357,6 +364,8 @@ fn (m Model) generate_real(ids []int, max_tokens int, sp SampleParams) !string {
 	need := ids.len + max_tokens
 	mut f := new_forward_ctx_cap(m.cfg, m.gguf, blob, need)!
 	f.pool = m.pool
+	f.attn_window = m.attn_window
+	f.attn_sinks = m.attn_sinks
 	for id in ids {
 		embed_gather(blob, m.gguf, m.cfg.hidden, id, mut f.hidden)!
 		f.decode_step()!

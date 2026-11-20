@@ -442,6 +442,19 @@ compiler runtime no freestanding guest can host — rejected with reason),
 `microsoft/BitNet.cpp` (1.58-bit needs trained ternary weights; keep as
 the sub-2bpw reference for the Phase 7 quality gates).
 
+Status 2026-11-20: **landed**. `attention_step_window` attends to the union
+of the first `attn_sinks` positions and the last `attn_window` positions,
+deduplicated and allocation-free; `window <= 0` (the default) delegates to
+exact full attention. Knobs `model.attn_window` / `model.attn_sinks` plus
+`VLLM_ATTN_WINDOW` / `VLLM_ATTN_SINKS`, validation, and ForwardCtx wiring
+are in place. Gates: exact fallback equality, agreement with a naive
+index-list reference, and config defaults/env/validation. The
+`tools/attn_bench.v` scaling probe measured full 121.6 us/head-step at
+n=512 vs 1057.8 us at n=4096, and windowed 60.4 / 74.8 us (~2x / ~14x)
+— recorded in `docs/perf.md`. The 4k default is unchanged until a >=16 GB
+guest exists. Docs-only boundaries are written up in
+`docs/architecture.md`.
+
 * Code: opt-in sliding-window attention + sinks
   (`LLAMA_ATTN_WINDOW`-style knob in `src/cfg/config.v` +
   `src/infer/attention.v`, default exact full attention).

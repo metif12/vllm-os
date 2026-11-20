@@ -39,7 +39,7 @@ src/formats/          # weight containers: registry (ContainerHandler) + SafeTen
 src/infer/gguf.v      # GGUF header + KV + tensor table (no blob load)
 src/infer/cfile.v     # tiny C file probe (header only, 1 GB-safe)
 src/infer/model.v     # Qwen3 arch config + KV override + generate path
-src/infer/attention.v # phase-1b primitives: KVCache arena + attention_step
+src/infer/attention.v # KVCache arena + full/windowed attention (opt-in sinks)
 src/infer/sampler.v   # presets, fused softmax-scale, min-p, heap top-k, zero-alloc top-k/top-p + xorshift RNG
 src/infer/pld.v       # opt-in prompt-lookup drafts + greedy verification (bit-exact, phase 8)
 src/infer/tokenizer.v # Tokenizer iface (BPE loader + stub) + Qwen ChatML template
@@ -60,6 +60,7 @@ tools/bench_kernels.v # host-only kernel benchmark (links real C file, embeds V 
 tools/forward_bench.v # host-only full-decode probe (real GGUF, best-of-N ms/token)
 tools/quality_gates.v # PPL/KLD/Same-top-p/maxdiff/VmHWM gate harness (baseline JSON)
 tools/pld_bench.v     # PLD accept-rate + wall-time probe (opt-in batch verifier)
+tools/attn_bench.v    # full vs windowed attention head-step scaling probe
 tools/infer_smoke.v   # host-only greedy smoke (also runs as /sbin/vllm in-guest; outputs must match)
 docs/                 # architecture/api/configuration/formats/building/development/security
 kernel/               # vinix-mini fork plan, mini.md spec, mini.ld, cmdline.txt, features.conf

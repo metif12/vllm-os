@@ -39,10 +39,12 @@ Env: `VLLM_HOST`, `VLLM_PORT`, `VLLM_MAX_CONNS`, `VLLM_MAX_BODY`,
 | `ctx_cap` | `4096` | 128–131072 | KV arena sizing; 4k fits the 4 GB guest (see `kernel/mini.md`) |
 | `backend` | `cpu` | `cpu\|cpu-blocked\|cpu-simd\|cpu-parallel\|auto` | `cpu-simd` = C AVX2 (runtime-degrades without AVX2); `cpu-parallel` = threads + SIMD for big layers (tune with `VLLM_THREADS`, validate with `=1` for serial); `auto` picks by shape; phase-1b forward calls per layer |
 | `prefix_cache` | `false` | bool | reuse the last prompt's KV across turns (phase 9); bit-identical output, ~3x faster on a long shared prefix; one entry, Mutex-protected, host-side |
+| `attn_window` | `0` | 0 or 32–131072 | opt-in sliding-window attention (phase 10); 0 = exact full attention; window counts recent positions |
+| `attn_sinks` | `4` | 0–64 | first positions kept alongside the window (attention sinks); ignored when `attn_window=0` |
 
 CLI: `--model`, `--ctx`, `--backend` (same override rule as `--port`).
 Env: `VLLM_MODEL`, `VLLM_FORMAT`, `VLLM_CTX`, `VLLM_BACKEND`,
-`VLLM_PREFIX_CACHE=1`.
+`VLLM_PREFIX_CACHE=1`, `VLLM_ATTN_WINDOW`, `VLLM_ATTN_SINKS`.
 `VLLM_THREADS` (1–64, default 4) sizes the `cpu-parallel` worker pool;
 `VLLM_NO_SIMD=1` forces pure-V kernels at runtime.
 
